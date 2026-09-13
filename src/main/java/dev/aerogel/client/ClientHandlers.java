@@ -107,7 +107,7 @@ public final class ClientHandlers {
                 for (int d = 0; d <= radius && count < RECONCILE_REQUEST_CAP; d++) {
                     for (int dx = -d; dx <= d && count < RECONCILE_REQUEST_CAP; dx++) {
                         boolean onXEdge = dx == -d || dx == d;
-                        for (int dz = -d; dz <= d; dz++) {
+                        for (int dz = -d; dz <= d && count < RECONCILE_REQUEST_CAP; dz++) {
                             if (!onXEdge && dz != -d && dz != d) {
                                 continue; // interior of the ring: already covered by a smaller ring
                             }
