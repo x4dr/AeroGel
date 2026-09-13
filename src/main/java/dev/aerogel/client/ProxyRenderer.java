@@ -241,33 +241,39 @@ public final class ProxyRenderer {
             // defensive: some mappings return null for an out-of-range id (NeoForge maps it to air)
             state = Blocks.GRASS_BLOCK.defaultBlockState();
         }
-        return spriteCache.computeIfAbsent(state, s -> {
-            Minecraft mc = Minecraft.getInstance();
-            BakedModel model = mc.getModelManager().getBlockModelShaper().getBlockModel(s);
-            List<BakedQuad> quads = model.getQuads(s, Direction.UP, RandomSource.create(42L));
-            TextureAtlasSprite sprite = quads.isEmpty() ? model.getParticleIcon() : quads.get(0).getSprite();
-            if (sprite == null) {
-                sprite = mc.getModelManager().getMissingModel().getParticleIcon();
+        return spriteCache.computeIfAbsent(state, ProxyRenderer::resolveSprite);
+    }
+
+    /** uncached sprite resolution; never recurses through the cache (see the leaf fallback). */
+    private static TextureAtlasSprite resolveSprite(BlockState state) {
+        Minecraft mc = Minecraft.getInstance();
+        BakedModel model = mc.getModelManager().getBlockModelShaper().getBlockModel(state);
+        List<BakedQuad> quads = model.getQuads(state, Direction.UP, RandomSource.create(42L));
+        TextureAtlasSprite sprite = quads.isEmpty() ? model.getParticleIcon() : quads.get(0).getSprite();
+        if (sprite == null) {
+            sprite = mc.getModelManager().getMissingModel().getParticleIcon();
+        }
+        // diagnostics for the "black mesh" reports: a missing sprite samples black
+        if (sprite == null) {
+            LOGGER.warn("mesh texture: {} resolved to a null sprite -> will render black", state);
+        } else if (sprite.contents().name().getPath().contains("missingno")) {
+            LOGGER.warn("mesh texture: {} resolved to the MISSING sprite ({}) -> will render black",
+                state, sprite.contents().name());
+        } else {
+            LOGGER.info("mesh texture: {} -> {}", state, sprite.contents().name());
+        }
+        if (sprite != null && BiomeColors.isLeaves(Block.getId(state))) {
+            // Prefer the opaque composite (leaf pixels over grass in the cutout holes). If the composite
+            // atlas source is not present, fall back to the opaque grass-top sprite: rendering the raw leaf
+            // cutout shows sky/void through the holes.
+            ResourceLocation composite = LeafCompositeSource.compositeId(sprite.contents().name());
+            TextureAtlasSprite opaque = mc.getTextureAtlas(TextureAtlas.LOCATION_BLOCKS).apply(composite);
+            if (opaque != null && composite.equals(opaque.contents().name())) {
+                return opaque;
             }
-            // diagnostics for the "black mesh" reports: a missing sprite samples black
-            if (sprite == null) {
-                LOGGER.warn("mesh texture: {} resolved to a null sprite -> will render black", s);
-            } else if (sprite.contents().name().getPath().contains("missingno")) {
-                LOGGER.warn("mesh texture: {} resolved to the MISSING sprite ({}) -> will render black",
-                    s, sprite.contents().name());
-            } else {
-                LOGGER.info("mesh texture: {} -> {}", s, sprite.contents().name());
-            }
-            // leaves: use the opaque composite (grass in the cutout holes) so no underlay is needed
-            if (sprite != null && BiomeColors.isLeaves(blockId)) {
-                ResourceLocation composite = LeafCompositeSource.compositeId(sprite.contents().name());
-                TextureAtlasSprite opaque = mc.getTextureAtlas(TextureAtlas.LOCATION_BLOCKS).apply(composite);
-                if (opaque != null && composite.equals(opaque.contents().name())) {
-                    return opaque;
-                }
-            }
-            return sprite;
-        });
+            return resolveSprite(Blocks.GRASS_BLOCK.defaultBlockState());
+        }
+        return sprite;
     }
 
     private static TextureAtlasSprite waterSprite() {
@@ -329,7 +335,8 @@ public final class ProxyRenderer {
         waterEnabled = overworld;
         waterTint = 0x3F76E4;
         seaLevel = overworld ? Math.min(63, maxY) : Integer.MIN_VALUE;
-        voidPlaneEnabled = minY < 0;
+        // The flat y=0 void-filler quad showed up as a "floor under the map"; disabled everywhere.
+        voidPlaneEnabled = false;
         voidPlaneY = 0.0f;
     }
 

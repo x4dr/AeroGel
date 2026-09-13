@@ -86,8 +86,8 @@ public final class PromotionManager {
     private static final int QUEUE_SWEEP_INTERVAL = 20;
     /** a promotion whose completion never fires is reclaimed after this many ticks (15 s). */
     private static final int IN_FLIGHT_TIMEOUT_TICKS = 300;
-    /** cap on queue entries examined per {@link #pickNext} non-urgent scan (urgent work is scanned fully). */
-    private static final int PICK_SCAN_CAP = 512;
+    /** if no promotion has started for this many ticks, start one even under budget/hard-gate pressure. */
+    private static final int FORCE_START_TICKS = 200;
     private static final int MIN_QUEUE_CAP = 256;
     private static final int MAX_QUEUE_CAP = 4096;
 
@@ -133,6 +133,8 @@ public final class PromotionManager {
         int urgentCount;
         /** effective queue cap for this level, refreshed each tick. */
         int queueCap = MIN_QUEUE_CAP;
+        /** tick the last promotion started; drives the progress guarantee (see FORCE_START_TICKS). */
+        int lastStartTick;
 
         /** generation-time budget in ms (may go negative when immediate work overspends it). */
         double budgetMs;
@@ -700,19 +702,22 @@ public final class PromotionManager {
         if (promotion == null) {
             return; // nothing with a loaded holder; try again next tick
         }
-        if (promotion.urgent) {
-            // immediate work ignores the budget and the hard gate, but still debits the bucket so ordinary
-            // linger promotion is slowed down by it.
-            state.budgetMs -= chunkCostMs;
-        } else {
-            if (hardGateMs > 0.0 && tickMs >= hardGateMs) {
-                return; // server already over budget: queue, do not start ordinary work
+        // The budget is charged the *measured* main-thread cost of finishing a promotion (push + replay +
+        // resend), so an idle server starts as fast as the concurrency cap allows while a lagging one backs
+        // off. A long dry spell forces one start anyway, so queued chunks always eventually generate.
+        double cost = Math.clamp(ProxyChunkGate.postCostMs(state.level), 2.0, 2000.0);
+        if (!promotion.urgent) {
+            boolean starved = state.tickCounter - state.lastStartTick >= FORCE_START_TICKS;
+            if (!starved) {
+                if (hardGateMs > 0.0 && tickMs >= hardGateMs) {
+                    return; // server already over budget: queue, do not start ordinary work
+                }
+                if (state.budgetMs < cost) {
+                    return; // no generation time left this window
+                }
             }
-            if (state.budgetMs < chunkCostMs) {
-                return; // no generation time left this window
-            }
-            state.budgetMs -= chunkCostMs;
         }
+        state.budgetMs -= cost;
         long pos = promotion.pos;
         removeQueued(state, promotion);
         state.inFlight.add(pos);
@@ -727,61 +732,43 @@ public final class PromotionManager {
         if (!started) {
             state.inFlight.remove(pos);
             state.inFlightSince.remove(pos);
-            state.budgetMs += chunkCostMs; // the promotion never ran: refund the budget
+            state.budgetMs += cost; // the promotion never ran: refund the budget
             enqueue(state, pos, promotion.urgent, true);
+        } else {
+            state.lastStartTick = state.tickCounter;
         }
     }
 
     /**
-     * Immediate first, then nearest-to-a-player within a bounded FIFO window. Urgent work (touch / write /
-     * opt-out) is scanned in full because it is rare and must not be starved; non-urgent work is scanned up
-     * to {@link #PICK_SCAN_CAP} entries from the front of the FIFO. The tradeoff: this is not a strict
-     * global-nearest pick, but FIFO order already approximates near-first (closer chunks have a lower linger
-     * threshold and enqueue earlier), and the bound keeps a large queue from costing a full scan every tick.
-     * A non-urgent chunk beyond the window is simply considered on a later tick.
+     * Immediate (touch / write / opt-out) first, then <b>strictly nearest</b> to a player. The queue is
+     * bounded by {@link #queueCap}, so the full scan is cheap; urgent work is never starved. A chunk whose
+     * holder is not loaded is skipped (left queued) so we do not stall on it.
      */
     private static Promotion pickNext(State state, List<ServerPlayer> players) {
         ChunkMap chunkMap = state.level.getChunkSource().chunkMap;
-        if (state.urgentCount > 0) {
-            Promotion best = null;
-            int bestDist = Integer.MAX_VALUE;
-            for (Promotion promotion : state.order) {
-                if (promotion.removed || !promotion.urgent) {
-                    continue;
-                }
-                if (chunkMap.getVisibleChunkIfPresent(promotion.pos) == null) {
-                    continue; // holder not loaded yet; leave it queued
-                }
-                int distance = nearestDistance(promotion.pos, players);
-                if (best == null || distance < bestDist) {
-                    best = promotion;
-                    bestDist = distance;
-                }
-            }
-            if (best != null) {
-                return best;
-            }
-        }
-        Promotion best = null;
-        int bestDist = Integer.MAX_VALUE;
-        int scanned = 0;
+        Promotion bestUrgent = null;
+        int bestUrgentDist = Integer.MAX_VALUE;
+        Promotion bestNormal = null;
+        int bestNormalDist = Integer.MAX_VALUE;
         for (Promotion promotion : state.order) {
-            if (promotion.removed || promotion.urgent) {
+            if (promotion.removed) {
                 continue;
-            }
-            if (++scanned > PICK_SCAN_CAP) {
-                break;
             }
             if (chunkMap.getVisibleChunkIfPresent(promotion.pos) == null) {
                 continue; // holder not loaded yet; leave it queued
             }
             int distance = nearestDistance(promotion.pos, players);
-            if (best == null || distance < bestDist) {
-                best = promotion;
-                bestDist = distance;
+            if (promotion.urgent) {
+                if (distance < bestUrgentDist) {
+                    bestUrgent = promotion;
+                    bestUrgentDist = distance;
+                }
+            } else if (distance < bestNormalDist) {
+                bestNormal = promotion;
+                bestNormalDist = distance;
             }
         }
-        return best;
+        return bestUrgent != null ? bestUrgent : bestNormal;
     }
 
     private static int nearestDistance(long pos, List<ServerPlayer> players) {

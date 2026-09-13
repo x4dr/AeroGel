@@ -132,6 +132,8 @@ public final class ProxyChunkGate {
         boolean adaptiveEnabled = true;
 
         int pruneTicks;
+        /** EMA of the main-thread post-promotion work per chunk (ns); drives the promotion budget. */
+        long postCostEmaNanos = 5_000_000L;
 
         State(ServerLevel level) {
             this.level = level;
@@ -327,6 +329,12 @@ public final class ProxyChunkGate {
         return loadedNow(state(lvl), pos);
     }
 
+    /** EMA of the main-thread cost of finishing one promotion (push + replay + resend), in ms. */
+    public static double postCostMs(ServerLevel lvl) {
+        State state = state(lvl);
+        return state == null ? 5.0 : state.postCostEmaNanos / 1_000_000.0;
+    }
+
     // ---- classification ----
 
     /** called at {@code ChunkHolder.updateFutures} HEAD on the server thread. */
@@ -499,10 +507,9 @@ public final class ProxyChunkGate {
             LOGGER.warn("proxy chunk {} promoted but is no longer loaded", pos);
             return;
         }
-        for (int sectionY = chunk.getMinSection(); sectionY < chunk.getMaxSection(); sectionY++) {
-            lvl.getLightEngine().updateSectionStatus(net.minecraft.core.SectionPos.of(pos, sectionY), false);
-        }
-        lvl.getLightEngine().propagateLightSources(pos);
+        // Light was computed by the vanilla generation pipeline, so the packet can be built directly from
+        // the light engine. Re-running updateSectionStatus + propagateLightSources here was the dominant
+        // cost of the promotion stall (hundreds of ms for a freshly generated chunk).
         net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket packet =
             new net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket(chunk, lvl.getLightEngine(), null, null);
         for (ServerPlayer player : lvl.getChunkSource().chunkMap.getPlayers(pos, false)) {
@@ -589,7 +596,9 @@ public final class ProxyChunkGate {
         for (State state : STATES.values()) {
             ChunkPos pos;
             while ((pos = state.resendQueue.poll()) != null) {
+                long t0 = System.nanoTime();
                 resend(state.level, pos);
+                state.postCostEmaNanos = ema(state.postCostEmaNanos, System.nanoTime() - t0);
                 ran = true;
                 if (System.nanoTime() >= deadline) {
                     break;
@@ -610,6 +619,7 @@ public final class ProxyChunkGate {
         for (State state : STATES.values()) {
             Completed completed;
             while ((completed = state.completedQueue.poll()) != null) {
+                long t0 = System.nanoTime();
                 try {
                     if (completed.push()) {
                         pushOutOfTerrain(state.level, completed.pos());
@@ -623,9 +633,14 @@ public final class ProxyChunkGate {
                     if (completed.onComplete() != null) {
                         completed.onComplete().run();
                     }
+                    state.postCostEmaNanos = ema(state.postCostEmaNanos, System.nanoTime() - t0);
                 }
             }
         }
+    }
+
+    private static long ema(long current, long sample) {
+        return (current * 7 + sample * 3) / 10;
     }
 
     private static void prunePlaceholders(MinecraftServer srv, State state) {
