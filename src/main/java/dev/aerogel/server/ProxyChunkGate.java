@@ -114,6 +114,13 @@ public final class ProxyChunkGate {
         final ConcurrentLinkedQueue<Runnable> deferred = new ConcurrentLinkedQueue<>();
         /** promoted chunks whose client resend is deferred off the promotion callback. */
         final ArrayDeque<ChunkPos> resendQueue = new ArrayDeque<>();
+        /**
+         * promoted chunks whose post-promotion work (push-out-of-terrain, deferred-write replay, resend) is
+         * deferred to the tick. It must never run inside the chunk-task completion callback:
+         * {@code noCollision}/{@code setBlock} force-load neighbour chunks via {@code managedBlock}, which
+         * deadlocks the very task queue it is running on.
+         */
+        final ArrayDeque<Completed> completedQueue = new ArrayDeque<>();
         /** cheap fast-bail flag: true once any position in this level was classified a proxy. */
         volatile boolean anyProxy;
 
@@ -130,6 +137,10 @@ public final class ProxyChunkGate {
             this.level = level;
             this.chunkMap = level.getChunkSource().chunkMap;
         }
+    }
+
+    /** a promotion that finished on the chunk-task thread; its main-thread work runs on the next tick. */
+    private record Completed(ChunkPos pos, boolean push, Runnable onComplete) {
     }
 
     /** installs the gate for one level (called from {@link ProxyStreamer#init} for every noise-based level). */
@@ -420,25 +431,15 @@ public final class ProxyChunkGate {
         }
         forcePrepare(holder, state.chunkMap);
         holder.getFullChunkFuture().whenComplete((result, error) -> server.execute(() -> {
-            try {
-                if (error != null) {
-                    LOGGER.error("proxy chunk {} promotion failed", pos, error);
-                    return;
-                }
-                pushOutOfTerrain(lvl, pos);
-                if (resendEnabled) {
-                    // deferred: building the full chunk packet + propagating light is unbudgeted work and
-                    // must not run inside the promotion callback (see ProxyChunkGate.tick).
-                    state.resendQueue.add(pos);
-                }
+            // This runs inline on the chunk-task completion (main thread). Do NOT read/collide/load chunks
+            // here: Level.getChunk would managedBlock the task queue it is running on (watchdog deadlock).
+            // Only enqueue the post-promotion work; ProxyChunkGate.tick runs it as a normal tick task.
+            if (error != null) {
+                LOGGER.error("proxy chunk {} promotion failed", pos, error);
+            } else {
                 LOGGER.info("promoted proxy chunk {} to real terrain (vanilla pipeline)", pos);
-            } catch (Throwable t) {
-                LOGGER.error("proxy chunk {} promotion callback failed", pos, t);
-            } finally {
-                if (onComplete != null) {
-                    onComplete.run();
-                }
             }
+            state.completedQueue.add(new Completed(pos, error == null, onComplete));
         }));
         return true;
     }
@@ -457,6 +458,9 @@ public final class ProxyChunkGate {
                 continue;
             }
             AABB box = entity.getBoundingBox();
+            if (!chunksLoaded(lvl, box)) {
+                continue; // never force-load a neighbour chunk on the main thread (deadlocks the task queue)
+            }
             if (lvl.noCollision(entity, box)) {
                 continue;
             }
@@ -471,6 +475,22 @@ public final class ProxyChunkGate {
             LOGGER.info("pushed {} out of freshly generated terrain at {} to y={}",
                 entity.getName().getString(), pos, String.format("%.1f", y));
         }
+    }
+
+    /** true when every chunk overlapping {@code box} (plus a 1-block margin) is already loaded. */
+    private static boolean chunksLoaded(ServerLevel lvl, AABB box) {
+        int minX = (int) Math.floor(box.minX) - 1;
+        int maxX = (int) Math.floor(box.maxX) + 1;
+        int minZ = (int) Math.floor(box.minZ) - 1;
+        int maxZ = (int) Math.floor(box.maxZ) + 1;
+        for (int cx = minX >> 4; cx <= (maxX >> 4); cx++) {
+            for (int cz = minZ >> 4; cz <= (maxZ >> 4); cz++) {
+                if (lvl.getChunkSource().getChunkNow(cx, cz) == null) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private static void resend(ServerLevel lvl, ChunkPos pos) {
@@ -523,6 +543,7 @@ public final class ProxyChunkGate {
             return;
         }
         drainDeferred(srv);
+        drainCompletions(srv);
         drainResends(srv);
         for (State state : STATES.values()) {
             if (++state.pruneTicks % PRUNE_INTERVAL_TICKS == 0) {
@@ -576,6 +597,33 @@ public final class ProxyChunkGate {
             }
             if (ran && System.nanoTime() >= deadline) {
                 break;
+            }
+        }
+    }
+
+    /**
+     * Drain finished promotions on the server tick (a normal main-thread task, not nested inside
+     * chunk-task processing): push entities out of the new terrain, replay deferred writes, queue the
+     * client resend. {@link #pushOutOfTerrain} additionally guards against unloaded neighbour chunks.
+     */
+    private static void drainCompletions(MinecraftServer srv) {
+        for (State state : STATES.values()) {
+            Completed completed;
+            while ((completed = state.completedQueue.poll()) != null) {
+                try {
+                    if (completed.push()) {
+                        pushOutOfTerrain(state.level, completed.pos());
+                        if (resendEnabled) {
+                            state.resendQueue.add(completed.pos());
+                        }
+                    }
+                } catch (Throwable t) {
+                    LOGGER.error("post-promotion work failed for {}", completed.pos(), t);
+                } finally {
+                    if (completed.onComplete() != null) {
+                        completed.onComplete().run();
+                    }
+                }
             }
         }
     }
