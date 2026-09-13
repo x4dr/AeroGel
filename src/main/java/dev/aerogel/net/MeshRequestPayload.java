@@ -1,6 +1,7 @@
 package dev.aerogel.net;
 
 import dev.aerogel.AeroGel;
+import io.netty.handler.codec.DecoderException;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
@@ -18,6 +19,9 @@ public record MeshRequestPayload(long[] chunkPos) implements CustomPacketPayload
     public static final StreamCodec<RegistryFriendlyByteBuf, MeshRequestPayload> STREAM_CODEC = StreamCodec.ofMember(
         MeshRequestPayload::write, MeshRequestPayload::read);
 
+    /** Upper bound on chunks per request, so a desynced/malicious client cannot force a huge allocation. */
+    private static final int MAX_CHUNKS = 256;
+
     private static void write(MeshRequestPayload payload, RegistryFriendlyByteBuf buf) {
         buf.writeVarInt(payload.chunkPos().length);
         for (long pos : payload.chunkPos()) {
@@ -27,6 +31,9 @@ public record MeshRequestPayload(long[] chunkPos) implements CustomPacketPayload
 
     private static MeshRequestPayload read(RegistryFriendlyByteBuf buf) {
         int count = buf.readVarInt();
+        if (count < 0 || count > MAX_CHUNKS) {
+            throw new DecoderException("aerogel: mesh request count " + count + " out of range [0, " + MAX_CHUNKS + "]");
+        }
         long[] pos = new long[count];
         for (int i = 0; i < count; i++) {
             pos[i] = buf.readLong();

@@ -52,7 +52,7 @@ public final class AeroGelClientConfig {
             .define("clamp", true);
         reconcile = b.comment("The per-second missing-mesh reconciliation requests.")
             .define("reconcile", true);
-        wireframe = b.comment("Debug wireframe over the sampled lattice.")
+        wireframe = b.comment("Debug wireframe over the proxy top quads (toggled via the shared client-switch payload).")
             .define("wireframe", false);
         neighbors = b.comment("Count a proxy neighbour as an existing chunk for vanilla's render visibility graph.")
             .define("neighbors", true);

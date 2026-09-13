@@ -2,6 +2,7 @@ package dev.aerogel.net;
 
 import dev.aerogel.AeroGel;
 import dev.aerogel.common.ProxyTopology;
+import io.netty.handler.codec.DecoderException;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
@@ -24,6 +25,9 @@ public record MeshBatchPayload(byte topology, long[] chunkPos, short[] heights, 
 
     public static final StreamCodec<RegistryFriendlyByteBuf, MeshBatchPayload> STREAM_CODEC = StreamCodec.ofMember(
         MeshBatchPayload::write, MeshBatchPayload::read);
+
+    /** Upper bound on chunks per batch, so a malicious/buggy peer cannot force a huge allocation. */
+    private static final int MAX_CHUNKS = 4096;
 
     public int heightsPerChunk() {
         return ProxyTopology.count(topology);
@@ -48,7 +52,15 @@ public record MeshBatchPayload(byte topology, long[] chunkPos, short[] heights, 
 
     private static MeshBatchPayload read(RegistryFriendlyByteBuf buf) {
         byte topology = buf.readByte();
+        if (!ProxyTopology.valid(topology)) {
+            // Reject before count*count(topology) is used to size anything. The network layer turns this
+            // into a peer disconnect, which is preferable to an OOM or an out-of-range grid index later.
+            throw new DecoderException("aerogel: invalid mesh topology " + topology);
+        }
         int count = buf.readVarInt();
+        if (count < 0 || count > MAX_CHUNKS) {
+            throw new DecoderException("aerogel: mesh batch count " + count + " out of range [0, " + MAX_CHUNKS + "]");
+        }
         long[] pos = new long[count];
         for (int i = 0; i < count; i++) {
             pos[i] = buf.readLong();

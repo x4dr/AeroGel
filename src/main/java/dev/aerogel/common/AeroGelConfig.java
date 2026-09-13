@@ -9,10 +9,11 @@ import org.apache.commons.lang3.tuple.Pair;
  * compiled-in default plus a {@code /aerogel} command lives here so it survives a restart; the commands
  * write the new value back and call {@link ModConfigSpec#save()}.
  *
- * <p>Two subsections matter most: {@code promotion}, which controls when a coarse proxy chunk is replaced
- * by real terrain (a cumulative linger counter whose threshold interpolates with distance), and
- * {@code adaptive}, which decides when the gate is enforced at all (server backlog / tick time, plus a
- * per-player opt-in). See the generated TOML comments for each key.</p>
+ * <p>The sections mirror the pipeline: {@code promotion} controls when a coarse proxy chunk is replaced
+ * by real terrain (a cumulative linger counter whose threshold interpolates with distance), {@code rate}
+ * and {@code load} fund and brake that generation, {@code adaptive} decides when the gate is enforced at
+ * all (server backlog / tick time, plus a per-player opt-in), {@code stream} tunes sampling/streaming,
+ * and {@code gate} is the virtual-proxy gate itself. See the generated TOML comments for each key.</p>
  */
 public final class AeroGelConfig {
     public static final AeroGelConfig CFG;
@@ -117,7 +118,7 @@ public final class AeroGelConfig {
             .comment("high tick time) and off again once the backlog has drained and no linger counters remain, so it")
             .comment("is invisible when idle. When not enforcing, players may opt in per-player to proxy travel.")
             .push("adaptive");
-        adaptiveEnabled = b.comment("Enable adaptive enforcement (off = the gate is always on, today's behaviour).")
+        adaptiveEnabled = b.comment("Enable adaptive enforcement (off = the gate is always on, the legacy behaviour).")
             .define("enabled", true);
         adaptiveActivateTickMs = b.comment("Enforce when smoothed tick time reaches this many ms (20 TPS = 50 ms).")
             .defineInRange("activateTickMs", 35.0, 1.0, 200.0);
@@ -134,7 +135,8 @@ public final class AeroGelConfig {
             .push("stream");
         streamEnabled = b.comment("Sample/send proxy meshes (off = the gate still runs but nothing is streamed).")
             .define("enabled", true);
-        streamRadius = b.comment("Proxy view radius in chunks.")
+        streamRadius = b.comment("Proxy view radius in chunks (the client's render distance is the other cap;")
+            .comment("the client keeps its mesh store out to a larger fixed radius so re-approaching does not hole).")
             .defineInRange("radius", 20, 4, 1000);
         nearTier = b.comment("Fine detail tier used within `nearDistance`: 5, 9, 25 or 81.")
             .defineInList("nearTier", 9, Arrays.asList(5, 9, 25, 81));

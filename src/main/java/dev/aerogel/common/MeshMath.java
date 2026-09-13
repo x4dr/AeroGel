@@ -5,13 +5,15 @@ import net.minecraft.world.level.ChunkPos;
 /**
  * Shared mesh math (server clamp, client clamp, renderer all use the same surface definition).
  *
- * <p>Two topologies (see {@link ProxyTopology}):
+ * <p>Two layouts (see {@link ProxyTopology}):
  * <ul>
- *   <li>{@link ProxyTopology#NINE} — a 3x3 grid at 8-block spacing, bilinear between points.</li>
  *   <li>{@link ProxyTopology#FIVE} — 4 corners + centre, four triangles fanning from the centre.</li>
+ *   <li>Every square-grid tier ({@link ProxyTopology#NINE} and the finer 25/81) — a
+ *       {@code side x side} lattice bilinearly interpolated using the tier's own side, so the
+ *       spacing is taken from the topology rather than hardcoded to NINE.</li>
  * </ul>
  * (x,z) outside the chunk is clamped to the border — good enough for the clamp, the renderer never
- * interpolates cross-chunk.</p>
+ * interpolates cross-chunk. Dimension-independent: only chunk-local coordinates are used.</p>
  */
 public final class MeshMath {
     private MeshMath() {
@@ -22,18 +24,30 @@ public final class MeshMath {
         int z0 = ChunkPos.getZ(chunkPos) << 4;
         double lx = clamp(x - x0, 0.0, 16.0);
         double lz = clamp(z - z0, 0.0, 16.0);
-        return topology == ProxyTopology.FIVE ? fan(lx, lz, grid) : grid3(lx, lz, grid);
+        if (topology == ProxyTopology.FIVE) {
+            return fan(lx, lz, grid);
+        }
+        if (!ProxyTopology.valid(topology)) {
+            // Only FIVE and the square-grid tiers have a defined layout here. Fail loudly instead of
+            // guessing (the old code silently ran the NINE path for any other byte).
+            throw new IllegalArgumentException("MeshMath.surfaceAt: unsupported topology " + topology);
+        }
+        // Explicit square-grid dispatch: NINE (3x3) and the finer tiers use their real side, so a 25/81
+        // grid is not read through the hardcoded NINE window.
+        return gridN(lx, lz, grid, ProxyTopology.side(topology));
     }
 
-    private static double grid3(double lx, double lz, short[] h) {
-        int i = Math.min((int) (lx / 8.0), 1);
-        int k = Math.min((int) (lz / 8.0), 1);
-        double fx = (lx - i * 8.0) / 8.0;
-        double fz = (lz - k * 8.0) / 8.0;
-        double h00 = h[i * 3 + k];
-        double h10 = h[(i + 1) * 3 + k];
-        double h01 = h[i * 3 + k + 1];
-        double h11 = h[(i + 1) * 3 + k + 1];
+    /** Bilinear sample of a {@code side x side} lattice, point index {@code xIndex * side + zIndex}. */
+    private static double gridN(double lx, double lz, short[] h, int side) {
+        double cell = 16.0 / (side - 1);
+        int i = Math.min((int) (lx / cell), side - 2);
+        int k = Math.min((int) (lz / cell), side - 2);
+        double fx = (lx - i * cell) / cell;
+        double fz = (lz - k * cell) / cell;
+        double h00 = h[i * side + k];
+        double h10 = h[(i + 1) * side + k];
+        double h01 = h[i * side + k + 1];
+        double h11 = h[(i + 1) * side + k + 1];
         double a = h00 + (h10 - h00) * fx;
         double b = h01 + (h11 - h01) * fx;
         return a + (b - a) * fz;
