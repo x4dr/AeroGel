@@ -58,12 +58,16 @@ public final class BiomeColors {
     }
 
     public static boolean isLeaves(int blockId) {
-        return blockId > 0 && Block.stateById(blockId).is(BlockTags.LEAVES);
+        if (blockId <= 0) {
+            return false;
+        }
+        var state = Block.stateById(blockId);
+        return state != null && state.is(BlockTags.LEAVES);
     }
 
     private static Biome biome(ClientLevel level, int biomeId) {
         if (biomeId < 0) {
-            return null; // /aerogel switch colors off
+            return null; // /aerogel switch colors off, or a clamped invalid wire id
         }
         return CACHE.computeIfAbsent(biomeId,
             id -> level.registryAccess().registryOrThrow(Registries.BIOME).byId(id));

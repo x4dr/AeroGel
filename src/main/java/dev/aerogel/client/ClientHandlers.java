@@ -5,11 +5,7 @@ import dev.aerogel.common.ProxyChunkUtil;
 import dev.aerogel.net.ClientSettingPayload;
 import dev.aerogel.net.ClientSwitchPayload;
 import dev.aerogel.net.MeshRequestPayload;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.Arrays;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.resources.ResourceKey;
@@ -31,9 +27,18 @@ import org.slf4j.LoggerFactory;
  */
 public final class ClientHandlers {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.client");
+    /** reconciliation request cap per second (the server front-queues these). */
+    private static final int RECONCILE_REQUEST_CAP = 128;
+    /** reconciliation scan radius cap (chunks); keeps the per-second scan bounded on huge draw radii. */
+    private static final int RECONCILE_RADIUS_CAP = 48;
+    /** reused nearest-first request buffer; no per-second allocation. */
+    private static final long[] reconcileBuffer = new long[RECONCILE_REQUEST_CAP];
     private static ResourceKey<Level> currentDimension;
     private static int diagTicks;
     private static int reconcileTicks;
+    /** center of the last reconciliation scan + whether it found anything missing (for the dormant early-out). */
+    private static long reconcileCenter = Long.MIN_VALUE;
+    private static boolean reconcileFound;
     private static boolean configLoaded;
     private static boolean syncedToServer;
 
@@ -71,6 +76,8 @@ public final class ClientHandlers {
             BiomeColors.clear();
             ProxyRenderer.clear();
             currentDimension = mc.level.dimension();
+            reconcileCenter = Long.MIN_VALUE;
+            reconcileFound = false;
         }
         LocalPlayer player = mc.player;
         if (player == null || player.isSpectator()) {
@@ -83,38 +90,44 @@ public final class ClientHandlers {
             }
         }
         // reconciliation: ask the server for meshes we are missing (heals join drops / reconnects / races).
-        // Nearest-first so the chunk we are standing in is always in the first batch.
+        // Nearest-first (Chebyshev rings) so the chunk we are standing in is always in the first batch.
+        // The whole scan is skipped while the store is empty, the last scan found nothing, the player has not
+        // changed chunk and travel is off: that is the dormant vanilla case (the server pushes its own window
+        // on login and chunk-cross), and re-running the O(r^2) scan every second would only allocate + call
+        // isAirStub. A client that opted into travel always keeps reconciling.
         if (ClientFeatures.proxy && ClientFeatures.reconcile && ++reconcileTicks % 20 == 0) {
             ChunkPos center = player.chunkPosition();
-            Map<Long, Integer> missing = new HashMap<>();
-            int radius = Math.min(ProxyRenderer.drawRadius(), 48);
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    int cx = center.x + dx;
-                    int cz = center.z + dz;
-                    long pos = ChunkPos.asLong(cx, cz);
-                    if (ClientMeshStore.has(pos)) {
-                        continue;
+            boolean moved = center.toLong() != reconcileCenter;
+            boolean dormant = ClientMeshStore.size() == 0 && !reconcileFound && !moved && !ClientFeatures.travel;
+            if (!dormant) {
+                reconcileCenter = center.toLong();
+                reconcileFound = false;
+                int radius = Math.min(ProxyRenderer.drawRadius(), RECONCILE_RADIUS_CAP);
+                int count = 0;
+                for (int d = 0; d <= radius && count < RECONCILE_REQUEST_CAP; d++) {
+                    for (int dx = -d; dx <= d && count < RECONCILE_REQUEST_CAP; dx++) {
+                        boolean onXEdge = dx == -d || dx == d;
+                        for (int dz = -d; dz <= d; dz++) {
+                            if (!onXEdge && dz != -d && dz != d) {
+                                continue; // interior of the ring: already covered by a smaller ring
+                            }
+                            long pos = ChunkPos.asLong(center.x + dx, center.z + dz);
+                            if (ClientMeshStore.has(pos)) {
+                                continue;
+                            }
+                            // a real chunk that is actually drawn renders itself; if it is present but not
+                            // rendered (uncompiled or culled) the proxy must cover it, so still request it
+                            if (ProxyRenderer.isRendered(mc.level, pos)) {
+                                continue;
+                            }
+                            reconcileBuffer[count++] = pos;
+                        }
                     }
-                    // a real chunk that is actually drawn renders itself; if it is present but not rendered
-                    // (uncompiled or culled) the proxy must cover it, so still request the mesh
-                    if (ProxyRenderer.isRendered(mc.level, pos)) {
-                        continue;
-                    }
-                    missing.put(pos, dx * dx + dz * dz);
                 }
-            }
-            if (!missing.isEmpty()) {
-                List<Long> sorted = new ArrayList<>(missing.keySet());
-                sorted.sort(Comparator.comparingInt(missing::get));
-                if (sorted.size() > 128) {
-                    sorted = sorted.subList(0, 128);
+                if (count > 0) {
+                    reconcileFound = true;
+                    PacketDistributor.sendToServer(new MeshRequestPayload(Arrays.copyOf(reconcileBuffer, count)));
                 }
-                long[] array = new long[sorted.size()];
-                for (int i = 0; i < array.length; i++) {
-                    array[i] = sorted.get(i);
-                }
-                PacketDistributor.sendToServer(new MeshRequestPayload(array));
             }
         }
         long chunkPos = player.chunkPosition().toLong();

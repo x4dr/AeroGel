@@ -7,6 +7,7 @@ import com.mojang.blaze3d.vertex.MeshData;
 import com.mojang.blaze3d.vertex.Tesselator;
 import com.mojang.blaze3d.vertex.VertexBuffer;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
@@ -20,12 +21,9 @@ import org.joml.Matrix4f;
 import dev.aerogel.common.ProxyChunkUtil;
 import dev.aerogel.common.ProxyTopology;
 import dev.aerogel.mixin.LevelRendererAccessor;
-import dev.aerogel.mixin.ViewAreaInvoker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GameRenderer;
-import net.minecraft.client.renderer.LevelRenderer;
-import net.minecraft.client.renderer.ViewArea;
 import net.minecraft.client.renderer.block.model.BakedQuad;
 import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
 import net.minecraft.client.renderer.texture.TextureAtlas;
@@ -38,12 +36,11 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.Mth;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
-import net.minecraft.world.level.chunk.status.ChunkStatus;
-import net.minecraft.world.phys.AABB;
 import net.neoforged.neoforge.client.event.RenderLevelStageEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -88,11 +85,27 @@ public final class ProxyRenderer {
      * getChunkNow each — the join hitch and the reason for the radius cap.)
      */
     private static final int VOID_MIN_SIZE = 1024;
-    private static final int MIN_Y = -64;
-    private static final int SEA_LEVEL = 63;
     /** water proxy top sits this far below sea level (real surface is at seaLevel-0.125) so it does not
      *  z-fight the real water surface. */
     private static final float WATER_SINK = 0.15f;
+
+    // ---- per-dimension geometry constants ------------------------------------------------------------
+    // Refreshed from the current ClientLevel every frame (refreshDimension). ClientHandlers clears the mesh
+    // store and calls ProxyRenderer.clear() on a dimension change, so geometry baked under one dimension's
+    // constants can never be drawn under another's; these plain static fields are therefore safe.
+    /** wall bottoms: the level's min build height (overworld -64, nether/end 0). */
+    private static int minY = -64;
+    /** the level's max build height, used to clamp the sea level into the build range. */
+    private static int maxY = 320;
+    /** water classification threshold; only meaningful while {@link #waterEnabled}. */
+    private static int seaLevel = 63;
+    /** overworld water tint; unused where water is disabled. */
+    private static int waterTint = 0x3F76E4;
+    /** overworld only: classify cells at/below sea level as water (else render the representative block). */
+    private static boolean waterEnabled = true;
+    /** the single void-filler quad is only useful where there is void below y=0 (a negative min height). */
+    private static boolean voidPlaneEnabled = true;
+    private static float voidPlaneY = 0.0f;
     /**
      * Proxy draw radius (chunks). Default 0 = the vanilla render-distance option; a larger value lets the
      * proxy draw its coarse far band beyond the vanilla chunk range ({@code /aerogel detail draw <n>}).
@@ -132,6 +145,8 @@ public final class ProxyRenderer {
         short[] renderGrid;
         /** bitmask of which seam walls are baked in (see WALL_*). */
         int wallMask;
+        /** the atlas generation the buffer's sprite UVs were baked against (see {@link #spriteGeneration}). */
+        int spriteGen;
         /** when the rise started (ms); 0 until first drawn. */
         long riseStart;
         /** when the sink started (ms); 0 while not being removed. */
@@ -143,8 +158,13 @@ public final class ProxyRenderer {
     /** block state -> top-face sprite (found once from the baked model, then reused). */
     private static final Map<BlockState, TextureAtlasSprite> spriteCache = new IdentityHashMap<>();
     private static TextureAtlasSprite waterSprite;
-    /** default water tint when a land chunk has a sub-sea-level cell (vanilla overworld default). */
-    private static final int WATER_TINT = 0x3F76E4;
+    /**
+     * Bumped on every client resource reload. A buffer whose generation is stale is re-baked on the next
+     * sync so its atlas UVs follow a resource-pack change (the block atlas is rebuilt on F3+T).
+     */
+    private static int spriteGeneration;
+    /** per-sync memo of "is a real (non-air-stub) client chunk here" (0 = unknown, 1 = real, 2 = not). */
+    private static final Long2ByteOpenHashMap realCache = new Long2ByteOpenHashMap();
     private static boolean uploadBacklog;
     private static long lastStatusCheck;
     /** the player's chunk at the last sync; a change forces a sync so newly-in-range meshes upload at once. */
@@ -217,6 +237,10 @@ public final class ProxyRenderer {
     /** resolve a block state's top-face sprite (falling back to its particle icon), cached. */
     private static TextureAtlasSprite spriteFor(int blockId) {
         BlockState state = blockId > 0 ? Block.stateById(blockId) : Blocks.GRASS_BLOCK.defaultBlockState();
+        if (state == null) {
+            // defensive: some mappings return null for an out-of-range id (NeoForge maps it to air)
+            state = Blocks.GRASS_BLOCK.defaultBlockState();
+        }
         return spriteCache.computeIfAbsent(state, s -> {
             Minecraft mc = Minecraft.getInstance();
             BakedModel model = mc.getModelManager().getBlockModelShaper().getBlockModel(s);
@@ -277,6 +301,38 @@ public final class ProxyRenderer {
         lastStatusCheck = 0L;
     }
 
+    /**
+     * Client resource-reload hook (registered in {@code ClientSetup}). The block atlas is rebuilt on F3+T
+     * or a pack change, so every cached {@link TextureAtlasSprite} is stale; drop them and bump the
+     * generation so the next sync re-bakes each proxy buffer's UVs against the new atlas. The leaf
+     * composite atlas is rebuilt by {@code LeafCompositeSource}'s own listener, so nothing else is needed.
+     */
+    public static void clearSpriteCaches() {
+        spriteCache.clear();
+        waterSprite = null;
+        spriteGeneration++;
+    }
+
+    /**
+     * Derive the per-dimension geometry constants from the current level. Overworld: sea level 63, water
+     * classification + the overworld water tint, void plane at y=0. Any other dimension (nether, end,
+     * modded): water classification is disabled — cells render with the server's representative block
+     * texture/tint, never the overworld blue — and the void plane is only kept where the dimension has a
+     * negative min build height (i.e. actual void below y=0). Walls always bottom out at the level's min
+     * build height. The client clears meshes + the renderer on a dimension change, so geometry baked here
+     * is never drawn under another dimension's constants.
+     */
+    private static void refreshDimension(ClientLevel level) {
+        minY = level.getMinBuildHeight();
+        maxY = level.getMaxBuildHeight();
+        boolean overworld = level.dimension() == Level.OVERWORLD;
+        waterEnabled = overworld;
+        waterTint = 0x3F76E4;
+        seaLevel = overworld ? Math.min(63, maxY) : Integer.MIN_VALUE;
+        voidPlaneEnabled = minY < 0;
+        voidPlaneY = 0.0f;
+    }
+
     public static void render(RenderLevelStageEvent event) {
         if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS) {
             return;
@@ -313,6 +369,7 @@ public final class ProxyRenderer {
             if (level == null || mc.player == null) {
                 return;
             }
+            refreshDimension(level);
             long now = System.currentTimeMillis();
             ChunkPos center = mc.player.chunkPosition();
             // uploads must be immediate so a fresh mesh rises on arrival; the periodic pass just catches
@@ -340,7 +397,7 @@ public final class ProxyRenderer {
                 }
                 lastWireframe = wireframe;
             }
-            if (voidQuad == null) {
+            if (voidPlaneEnabled && voidQuad == null) {
                 long t0 = System.nanoTime();
                 ensureVoidQuad(drawRadius());
                 lastVoidBuildNanos = System.nanoTime() - t0;
@@ -357,54 +414,62 @@ public final class ProxyRenderer {
             var camPos = event.getCamera().getPosition();
             Matrix4f base = new Matrix4f(event.getModelViewMatrix())
                 .translate((float) -camPos.x, (float) -camPos.y, (float) -camPos.z);
-            RenderSystem.setShader(GameRenderer::getPositionColorShader);
-            RenderSystem.disableCull();
-            RenderSystem.disableBlend();
-            if (ClientFeatures.voidQuad && voidQuad != null) {
-                scratch.set(base);
-                scratch.translate((float) camPos.x, 0.0f, (float) camPos.z);
-                voidQuad.bind();
-                voidQuad.drawWithShader(scratch, event.getProjectionMatrix(), GameRenderer.getPositionColorShader());
-            }
-            // proxy chunks are textured: bind the block atlas and use the position_tex_color shader
-            RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
-            // proxy terrain is lit by sky light 15 only (no block light): multiply the baked biome tint by the
-            // current day/night sky brightness. ClientLevel.getSkyDarken is the brightness factor (1 day,
-            // ~0.2 night). Applied per frame so it tracks the sun.
-            float sky = Math.clamp(level.getSkyDarken(1.0f), 0.2f, 1.0f);
-            RenderSystem.setShaderColor(sky, sky, sky, 1.0f);
-            int activeAnims = 0;
-            for (Long2ObjectMap.Entry<ChunkGpu> entry : gpu.long2ObjectEntrySet()) {
-                ChunkGpu g = entry.getValue();
-                if (g.buffer == null) {
-                    continue;
+            // All GL state below is restored in the finally: an exception mid-draw (bad buffer, driver
+            // reset, an exception in the vanilla draw path) must not leave cull/blend/shader corrupted for
+            // the rest of the frame.
+            try {
+                RenderSystem.setShader(GameRenderer::getPositionColorShader);
+                RenderSystem.disableCull();
+                RenderSystem.disableBlend();
+                if (ClientFeatures.voidQuad && voidQuad != null) {
+                    scratch.set(base);
+                    scratch.translate((float) camPos.x, voidPlaneY, (float) camPos.z);
+                    voidQuad.bind();
+                    voidQuad.drawWithShader(scratch, event.getProjectionMatrix(), GameRenderer.getPositionColorShader());
                 }
-                float off = ClientFeatures.anim ? offset(g, now) : 0.0f;
-                if (off != 0.0f) {
-                    activeAnims++;
+                // proxy chunks are textured: bind the block atlas and use the position_tex_color shader
+                RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
+                // proxy terrain is lit by sky light 15 only (no block light): multiply the baked biome tint by
+                // the current day/night sky brightness. ClientLevel.getSkyDarken is the brightness factor (1
+                // day, ~0.2 night). Applied per frame so it tracks the sun. Dimensions without a sky (nether,
+                // end) have no day/night cycle, so they stay at full brightness instead of the 0.2 floor.
+                float sky = level.dimensionType().hasSkyLight()
+                    ? Math.clamp(level.getSkyDarken(1.0f), 0.2f, 1.0f) : 1.0f;
+                RenderSystem.setShaderColor(sky, sky, sky, 1.0f);
+                int activeAnims = 0;
+                for (Long2ObjectMap.Entry<ChunkGpu> entry : gpu.long2ObjectEntrySet()) {
+                    ChunkGpu g = entry.getValue();
+                    if (g.buffer == null) {
+                        continue;
+                    }
+                    float off = ClientFeatures.anim ? offset(g, now) : 0.0f;
+                    if (off != 0.0f) {
+                        activeAnims++;
+                    }
+                    scratch.set(base);
+                    if (off != 0.0f) {
+                        scratch.translate(0.0f, off, 0.0f);
+                    }
+                    g.buffer.bind();
+                    g.buffer.drawWithShader(scratch, event.getProjectionMatrix(), GameRenderer.getPositionTexColorShader());
+                    perfDraws++;
                 }
-                scratch.set(base);
-                if (off != 0.0f) {
-                    scratch.translate(0.0f, off, 0.0f);
+                lastActiveAnims = activeAnims;
+                perfAnimSum += activeAnims;
+                if (activeAnims > 0) {
+                    perfAnimFrames++;
                 }
-                g.buffer.bind();
-                g.buffer.drawWithShader(scratch, event.getProjectionMatrix(), GameRenderer.getPositionTexColorShader());
-                perfDraws++;
+                if (wireframe && edgeBuffer != null && edgeSegments > 0) {
+                    RenderSystem.lineWidth(2.0f);
+                    edgeBuffer.bind();
+                    edgeBuffer.drawWithShader(base, event.getProjectionMatrix(), GameRenderer.getPositionColorShader());
+                }
+            } finally {
+                RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, 1.0f);
+                VertexBuffer.unbind();
+                RenderSystem.enableCull();
+                RenderSystem.enableBlend();
             }
-            RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, 1.0f);
-            lastActiveAnims = activeAnims;
-            perfAnimSum += activeAnims;
-            if (activeAnims > 0) {
-                perfAnimFrames++;
-            }
-            if (wireframe && edgeBuffer != null && edgeSegments > 0) {
-                RenderSystem.lineWidth(2.0f);
-                edgeBuffer.bind();
-                edgeBuffer.drawWithShader(base, event.getProjectionMatrix(), GameRenderer.getPositionColorShader());
-            }
-            VertexBuffer.unbind();
-            RenderSystem.enableCull();
-            RenderSystem.enableBlend();
         } finally {
             perfRenderNanos += System.nanoTime() - renderStart;
             if (perfFrames >= PERF_FRAMES) {
@@ -465,6 +530,10 @@ public final class ProxyRenderer {
         // around the player ("chunks generate ahead but not around me"). GPU buffers are still freed at the
         // draw radius below; this only keeps the cheap height grids for when the chunk scrolls back into view.
         rebuildVisibleChunks();
+        // per-sync memo: isReal runs getChunkNow + a ~24-section isAirStub scan; without this every mesh is
+        // rescanned on every sync (up to 4x/sec while moving). Cleared each sync so a chunk that loads or
+        // unloads mid-sync is not misclassified.
+        realCache.clear();
         ClientMeshStore.prune(center, Math.max(radius + 2, STORE_RADIUS));
         uploadBacklog = false;
         long uploadStart = System.nanoTime();
@@ -489,7 +558,7 @@ public final class ProxyRenderer {
             }
             ClientMeshStore.Mesh mesh = e.getValue();
             ChunkGpu g = gpu.get(pos);
-            if (isRendered(level, pos) && dist(center, pos) <= renderDistance) {
+            if (isRenderedCached(level, pos) && dist(center, pos) <= renderDistance) {
                 // a real chunk took over -> sink/hide the proxy, but KEEP the mesh in the store: the real
                 // chunk only covers the client render distance, so at the border of a generated patch it
                 // leaves view again and the proxy must be drawable. The server will not resend a chunk it
@@ -523,7 +592,8 @@ public final class ProxyRenderer {
                 uploads++;
             } else {
                 int mask = wallMask(level, pos);
-                if (g.grid != mesh.grid() || g.biome != mesh.biome() || g.block != mesh.block() || g.wallMask != mask) {
+                if (g.grid != mesh.grid() || g.biome != mesh.biome() || g.block != mesh.block()
+                    || g.wallMask != mask || g.spriteGen != spriteGeneration) {
                     if (overUploadBudget(uploads, uploadStart)) {
                         uploadBacklog = true;
                         continue;
@@ -606,6 +676,7 @@ public final class ProxyRenderer {
         g.sourceTier = mesh.topology();
         g.renderGrid = renderGrid;
         g.wallMask = wallMask;
+        g.spriteGen = spriteGeneration;
         lastUploadNanos = System.nanoTime() - t0;
         perfUploads++;
         perfUploadNanos += lastUploadNanos;
@@ -703,11 +774,17 @@ public final class ProxyRenderer {
         return chunk != null && !ProxyChunkUtil.isAirStub(chunk);
     }
 
-    /**
-     * True when a real client chunk is actually compiled by the vanilla renderer. The proxy must not hide
-     * merely because the chunk arrived: between arrival and the async section compile there is no drawn
-     * terrain, so hiding on arrival leaves a gap at the real/proxy boundary.
-     */
+    /** {@link #isReal} memoised for one sync (see {@link #realCache}); only valid during syncChunks. */
+    private static boolean isRealCached(ClientLevel level, long pos) {
+        byte v = realCache.get(pos);
+        if (v != 0) {
+            return v == 1;
+        }
+        boolean real = isReal(level, pos);
+        realCache.put(pos, real ? (byte) 1 : (byte) 2);
+        return real;
+    }
+
     /**
      * True when the vanilla renderer is actually drawing this chunk this frame. A chunk can be real and
      * compiled yet still be culled (frustum or occlusion), so the only accurate signal is the renderer's
@@ -715,6 +792,11 @@ public final class ProxyRenderer {
      */
     static boolean isRendered(ClientLevel level, long pos) {
         return isReal(level, pos) && visibleChunks.contains(pos);
+    }
+
+    /** sync-loop variant of {@link #isRendered}: memoises the expensive {@code isAirStub} scan per chunk. */
+    private static boolean isRenderedCached(ClientLevel level, long pos) {
+        return isRealCached(level, pos) && visibleChunks.contains(pos);
     }
 
     /** chunk positions with at least one section in the renderer's drawn set; rebuilt each sync. */
@@ -846,13 +928,13 @@ public final class ProxyRenderer {
             tg = ((color >> 8) & 0xFF) / 255.0f;
             tb = (color & 0xFF) / 255.0f;
         }
-        TextureAtlasSprite water = waterSprite();
-        float wr = ((WATER_TINT >> 16) & 0xFF) / 255.0f;
-        float wg = ((WATER_TINT >> 8) & 0xFF) / 255.0f;
-        float wb = (WATER_TINT & 0xFF) / 255.0f;
+        TextureAtlasSprite water = waterEnabled ? waterSprite() : null;
+        float wr = ((waterTint >> 16) & 0xFF) / 255.0f;
+        float wg = ((waterTint >> 8) & 0xFF) / 255.0f;
+        float wb = (waterTint & 0xFF) / 255.0f;
         int[][] tris = { { 0, 2, 4 }, { 2, 3, 4 }, { 3, 1, 4 }, { 1, 0, 4 } };
         for (int[] t : tris) {
-            boolean isWater = Math.min(Math.min(grid[t[0]], grid[t[1]]), grid[t[2]]) <= SEA_LEVEL;
+            boolean isWater = waterEnabled && Math.min(Math.min(grid[t[0]], grid[t[1]]), grid[t[2]]) <= seaLevel;
             float bright = isWater ? 1.0f : triBright(grid, t);
             float r = (isWater ? wr : tr) * bright;
             float g = (isWater ? wg : tg) * bright;
@@ -886,7 +968,7 @@ public final class ProxyRenderer {
      * shore.
      */
     private static float waterY(float h) {
-        return h - (h <= SEA_LEVEL ? WATER_SINK : 0.0f);
+        return waterEnabled && h <= seaLevel ? h - WATER_SINK : h;
     }
 
     /** per-triangle slope shading for the FIVE fan (normal from the three lattice points). */
@@ -932,17 +1014,17 @@ public final class ProxyRenderer {
             tg = ((color >> 8) & 0xFF) / 255.0f;
             tb = (color & 0xFF) / 255.0f;
         }
-        TextureAtlasSprite water = waterSprite();
-        float wr = ((WATER_TINT >> 16) & 0xFF) / 255.0f;
-        float wg = ((WATER_TINT >> 8) & 0xFF) / 255.0f;
-        float wb = (WATER_TINT & 0xFF) / 255.0f;
+        TextureAtlasSprite water = waterEnabled ? waterSprite() : null;
+        float wr = ((waterTint >> 16) & 0xFF) / 255.0f;
+        float wg = ((waterTint >> 8) & 0xFF) / 255.0f;
+        float wb = (waterTint & 0xFF) / 255.0f;
         for (int i = 0; i < side - 1; i++) {
             for (int k = 0; k < side - 1; k++) {
                 float h00 = grid[i * side + k];
                 float h10 = grid[(i + 1) * side + k];
                 float h11 = grid[(i + 1) * side + k + 1];
                 float h01 = grid[i * side + k + 1];
-                boolean isWater = Math.min(Math.min(h00, h10), Math.min(h01, h11)) <= SEA_LEVEL;
+                boolean isWater = waterEnabled && Math.min(Math.min(h00, h10), Math.min(h01, h11)) <= seaLevel;
                 float bright = isWater ? 1.0f : slopeBright(h00, h10, h01, h11, spacing);
                 float r = (isWater ? wr : tr) * bright;
                 float g = (isWater ? wg : tg) * bright;
@@ -1021,7 +1103,7 @@ public final class ProxyRenderer {
         float r;
         float g;
         float b;
-        if (Math.min(hA, hB) <= SEA_LEVEL) {
+        if (waterEnabled && Math.min(hA, hB) <= seaLevel) {
             r = 0.22f * bright;
             g = 0.31f * bright;
             b = 0.38f * bright;
@@ -1036,8 +1118,8 @@ public final class ProxyRenderer {
         float v1 = s.getV1();
         buf.addVertex(x, hA, zA).setUv(u0, v0).setColor(r, g, b, 1.0f);
         buf.addVertex(x, hB, zB).setUv(u1, v0).setColor(r, g, b, 1.0f);
-        buf.addVertex(x, MIN_Y, zB).setUv(u1, v1).setColor(r, g, b, 1.0f);
-        buf.addVertex(x, MIN_Y, zA).setUv(u0, v1).setColor(r, g, b, 1.0f);
+        buf.addVertex(x, minY, zB).setUv(u1, v1).setColor(r, g, b, 1.0f);
+        buf.addVertex(x, minY, zA).setUv(u0, v1).setColor(r, g, b, 1.0f);
     }
 
     /** wall at fixed z, spanning x from xA to xB, top edge from height hA (at xA) to hB (at xB) */
@@ -1046,7 +1128,7 @@ public final class ProxyRenderer {
         float r;
         float g;
         float b;
-        if (Math.min(hA, hB) <= SEA_LEVEL) {
+        if (waterEnabled && Math.min(hA, hB) <= seaLevel) {
             r = 0.22f * bright;
             g = 0.31f * bright;
             b = 0.38f * bright;
@@ -1061,8 +1143,8 @@ public final class ProxyRenderer {
         float v1 = s.getV1();
         buf.addVertex(xA, hA, z).setUv(u0, v0).setColor(r, g, b, 1.0f);
         buf.addVertex(xB, hB, z).setUv(u1, v0).setColor(r, g, b, 1.0f);
-        buf.addVertex(xB, MIN_Y, z).setUv(u1, v1).setColor(r, g, b, 1.0f);
-        buf.addVertex(xA, MIN_Y, z).setUv(u0, v1).setColor(r, g, b, 1.0f);
+        buf.addVertex(xB, minY, z).setUv(u1, v1).setColor(r, g, b, 1.0f);
+        buf.addVertex(xA, minY, z).setUv(u0, v1).setColor(r, g, b, 1.0f);
     }
 
     private static String ms(long nanos) {
