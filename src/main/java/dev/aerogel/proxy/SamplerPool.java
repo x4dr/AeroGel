@@ -24,9 +24,11 @@ public final class SamplerPool implements AutoCloseable {
     public SamplerPool(List<RandomState> states, NoiseGeneratorSettings settings, BiomeSource biomeSource,
             net.minecraft.core.Registry<net.minecraft.world.level.biome.Biome> biomeRegistry, int threads) {
         int n = Math.max(1, Math.min(threads, states.size()));
+        // one shared entry budget split across the pool, so more workers cannot grow total cache RAM
+        int maxCache = PointSurfaceSampler.workerCacheCap(n);
         workers = new OffThreadSampler[n];
         for (int i = 0; i < n; i++) {
-            workers[i] = new OffThreadSampler(states.get(i), settings, biomeSource, biomeRegistry);
+            workers[i] = new OffThreadSampler(states.get(i), settings, biomeSource, biomeRegistry, maxCache);
         }
     }
 

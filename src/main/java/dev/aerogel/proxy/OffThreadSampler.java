@@ -46,8 +46,8 @@ public final class OffThreadSampler implements AutoCloseable {
     private final AtomicLong sampledNanos = new AtomicLong();
 
     public OffThreadSampler(RandomState state, NoiseGeneratorSettings settings, BiomeSource biomeSource,
-            net.minecraft.core.Registry<net.minecraft.world.level.biome.Biome> biomeRegistry) {
-        this.sampler = new PointSurfaceSampler(state, settings);
+            net.minecraft.core.Registry<net.minecraft.world.level.biome.Biome> biomeRegistry, int maxCache) {
+        this.sampler = new PointSurfaceSampler(state, settings, maxCache);
         this.seaLevel = settings.seaLevel();
         // the biome probe always runs: it supplies the representative block (texture) and the biome id (the
         // client computes the tint, since the colormaps only exist client-side). The streamer decides whether
@@ -127,9 +127,11 @@ public final class OffThreadSampler implements AutoCloseable {
                     biome = probe.biomeId();
                     block = probe.blockId();
                 }
-            } catch (Throwable t) {
+            } catch (Exception e) {
+                // Catch Exception, not Throwable: an OutOfMemoryError/LinkageError must kill the worker
+                // loudly rather than be swallowed and leave the thread limping with bogus sea-level grids.
                 LOGGER.error("sampling failed for chunk ({},{}); substituting sea level",
-                    ChunkPos.getX(pos), ChunkPos.getZ(pos), t);
+                    ChunkPos.getX(pos), ChunkPos.getZ(pos), e);
                 grid = new short[ProxyTopology.count(topo)];
                 Arrays.fill(grid, SEA_LEVEL);
             }

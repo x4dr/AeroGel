@@ -57,7 +57,9 @@ public final class BiomeTint {
             ? Blocks.WATER.defaultBlockState()
             : blockCache.computeIfAbsent(biome, b -> blockFor(holder, b));
         int biomeId = biomeRegistry.getId(biome);
-        DIAG.put(biome, describe(holder, state, biome.getBaseTemperature()));
+        // Build the diagnostic string once per Biome, not once per sampled chunk: computeIfAbsent keeps
+        // the String.format/unwrapKey work off the hot path (biomes are few and stable for a session).
+        DIAG.computeIfAbsent(biome, b -> describe(holder, state, b.getBaseTemperature()));
         return new Probe(biomeId, Block.getId(state));
     }
 
