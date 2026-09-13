@@ -1,0 +1,161 @@
+package dev.aerogel.common;
+
+import java.util.Arrays;
+import net.neoforged.neoforge.common.ModConfigSpec;
+import org.apache.commons.lang3.tuple.Pair;
+
+/**
+ * Server/shared configuration ({@code config/aerogel-common.toml}). Every tunable that used to be a
+ * compiled-in default plus a {@code /aerogel} command lives here so it survives a restart; the commands
+ * write the new value back and call {@link ModConfigSpec#save()}.
+ *
+ * <p>Two subsections matter most: {@code promotion}, which controls when a coarse proxy chunk is replaced
+ * by real terrain (a cumulative linger counter whose threshold interpolates with distance), and
+ * {@code adaptive}, which decides when the gate is enforced at all (server backlog / tick time, plus a
+ * per-player opt-in). See the generated TOML comments for each key.</p>
+ */
+public final class AeroGelConfig {
+    public static final AeroGelConfig CFG;
+    public static final ModConfigSpec SPEC;
+
+    // promotion
+    public final ModConfigSpec.BooleanValue promotionEnabled;
+    public final ModConfigSpec.DoubleValue landingMargin;
+    public final ModConfigSpec.IntValue maxRange;
+    public final ModConfigSpec.IntValue lingerMinIdleSeconds;
+    public final ModConfigSpec.IntValue lingerMinBusySeconds;
+    public final ModConfigSpec.IntValue lingerMaxIdleSeconds;
+    public final ModConfigSpec.IntValue lingerMaxBusySeconds;
+    public final ModConfigSpec.IntValue maxInFlight;
+    public final ModConfigSpec.DoubleValue maxGenFraction;
+    public final ModConfigSpec.DoubleValue chunkCostMs;
+    public final ModConfigSpec.DoubleValue burstMs;
+    public final ModConfigSpec.DoubleValue hardGateMs;
+    public final ModConfigSpec.DoubleValue idleTickMs;
+    public final ModConfigSpec.DoubleValue busyTickMs;
+
+    // adaptive
+    public final ModConfigSpec.BooleanValue adaptiveEnabled;
+    public final ModConfigSpec.DoubleValue adaptiveActivateTickMs;
+    public final ModConfigSpec.DoubleValue adaptiveDeactivateTickMs;
+    public final ModConfigSpec.IntValue adaptiveBacklogActivate;
+    public final ModConfigSpec.IntValue adaptiveBacklogDeactivate;
+
+    // stream
+    public final ModConfigSpec.BooleanValue streamEnabled;
+    public final ModConfigSpec.IntValue streamRadius;
+    public final ModConfigSpec.ConfigValue<Integer> nearTier;
+    public final ModConfigSpec.ConfigValue<Integer> farTier;
+    public final ModConfigSpec.IntValue nearDistance;
+    public final ModConfigSpec.BooleanValue biomeColors;
+    public final ModConfigSpec.IntValue samplerThreads;
+    public final ModConfigSpec.BooleanValue bypassMoveCheck;
+
+    // gate
+    public final ModConfigSpec.BooleanValue gateEnabled;
+    public final ModConfigSpec.BooleanValue resendEnabled;
+
+    static {
+        Pair<AeroGelConfig, ModConfigSpec> pair = new ModConfigSpec.Builder().configure(AeroGelConfig::new);
+        CFG = pair.getLeft();
+        SPEC = pair.getRight();
+    }
+
+    private AeroGelConfig(ModConfigSpec.Builder b) {
+        b.comment("Automatic promotion of proxy chunks to real terrain (see plans/proxy-chunk-state-machine.md).")
+            .push("promotion");
+        promotionEnabled = b.comment("Master switch for automatic promotion.")
+            .define("enabled", true);
+        landingMargin = b.comment("Touched/landing trigger: generate immediately when a descending player is within")
+            .comment("this many blocks above the sampled proxy surface.")
+            .defineInRange("landingMargin", 8.0, 0.0, 64.0);
+        maxRange = b.comment("How far out (chunks) a proxy can be linger-promoted. -1 = auto: server view-distance + 2,")
+            .comment("the radius at which vanilla actually generates FULL chunks.")
+            .defineInRange("maxRange", -1, -1, 64);
+
+        b.comment("Linger time by distance: a proxy chunk accrues one tick per tick a player is within maxRange,")
+            .comment("and is promoted once the counter reaches t(d) = min + (d/maxRange)*(max - min), where d is the")
+            .comment("Chebyshev distance to the nearest player. Both endpoints are interpolated between idle and busy")
+            .comment("server load.")
+            .push("linger");
+        lingerMinIdleSeconds = b.comment("Minimum (distance 0) linger at idle load.")
+            .defineInRange("minSecondsIdle", 10, 1, 600);
+        lingerMinBusySeconds = b.comment("Minimum (distance 0) linger at heavy load.")
+            .defineInRange("minSecondsBusy", 20, 1, 600);
+        lingerMaxIdleSeconds = b.comment("Maximum (distance maxRange) linger at idle load.")
+            .defineInRange("maxSecondsIdle", 30, 1, 600);
+        lingerMaxBusySeconds = b.comment("Maximum (distance maxRange) linger at heavy load.")
+            .defineInRange("maxSecondsBusy", 60, 1, 600);
+        b.pop();
+
+        b.comment("Generation-time budget. A token bucket refilled at maxGenFraction ms/ms is charged chunkCostMs")
+            .comment("per promotion. Touched/write promotions bypass the budget but still debit it, slowing ordinary")
+            .comment("linger promotion down.")
+            .push("rate");
+        maxInFlight = b.comment("Maximum promotion regenerations in flight at once (burst cap; applies to all).")
+            .defineInRange("maxInFlight", 2, 1, 16);
+        maxGenFraction = b.comment("Fraction of wall time the budget may fund (0.5 = at most half).")
+            .defineInRange("maxGenFraction", 0.5, 0.05, 1.0);
+        chunkCostMs = b.comment("Budget cost charged per promotion, in ms (chunk generation is ~100 ms).")
+            .defineInRange("chunkCostMs", 100.0, 1.0, 5000.0);
+        burstMs = b.comment("Maximum banked budget (a burst of back-to-back promotions).")
+            .defineInRange("burstMs", 200.0, 0.0, 10000.0);
+        hardGateMs = b.comment("No ordinary linger promotion starts while smoothed tick time is at or above this (0 = off).")
+            .defineInRange("hardGateMs", 60.0, 0.0, 1000.0);
+        b.pop();
+
+        b.comment("How server load is measured for the load-adaptive linger endpoints.")
+            .push("load");
+        idleTickMs = b.comment("Smoothed tick time treated as idle (load factor 0).")
+            .defineInRange("idleTickMs", 10.0, 1.0, 100.0);
+        busyTickMs = b.comment("Smoothed tick time treated as fully loaded (load factor 1).")
+            .defineInRange("busyTickMs", 45.0, 1.0, 200.0);
+        b.pop();
+        b.pop();
+
+        b.comment("Adaptive enforcement. The server turns the gate on when it is struggling (chunk-task backlog or")
+            .comment("high tick time) and off again once the backlog has drained and no linger counters remain, so it")
+            .comment("is invisible when idle. When not enforcing, players may opt in per-player to proxy travel.")
+            .push("adaptive");
+        adaptiveEnabled = b.comment("Enable adaptive enforcement (off = the gate is always on, today's behaviour).")
+            .define("enabled", true);
+        adaptiveActivateTickMs = b.comment("Enforce when smoothed tick time reaches this many ms (20 TPS = 50 ms).")
+            .defineInRange("activateTickMs", 35.0, 1.0, 200.0);
+        adaptiveDeactivateTickMs = b.comment("Stop enforcing once tick time falls back to this (must be below the activate value).")
+            .defineInRange("deactivateTickMs", 22.0, 1.0, 200.0);
+        adaptiveBacklogActivate = b.comment("Enforce when the main-thread chunk-task backlog reaches this many tasks.")
+            .defineInRange("backlogActivate", 64, 1, 100000);
+        adaptiveBacklogDeactivate = b.comment("Stop enforcing once the backlog falls back to this.")
+            .defineInRange("backlogDeactivate", 16, 0, 100000);
+        b.pop();
+
+        b.comment("Proxy mesh sampling and streaming. Streaming is per-player: a player receives proxies only while")
+            .comment("their client 'proxy' switch is on.")
+            .push("stream");
+        streamEnabled = b.comment("Sample/send proxy meshes (off = the gate still runs but nothing is streamed).")
+            .define("enabled", true);
+        streamRadius = b.comment("Proxy view radius in chunks.")
+            .defineInRange("radius", 20, 4, 1000);
+        nearTier = b.comment("Fine detail tier used within `nearDistance`: 5, 9, 25 or 81.")
+            .defineInList("nearTier", 9, Arrays.asList(5, 9, 25, 81));
+        farTier = b.comment("Coarse detail tier used beyond `nearDistance`: 5, 9, 25 or 81.")
+            .defineInList("farTier", 5, Arrays.asList(5, 9, 25, 81));
+        nearDistance = b.comment("Near-tier band in chunks.")
+            .defineInRange("nearDistance", 32, 1, 1000);
+        biomeColors = b.comment("Send biome tint on the wire (the block texture is always sent).")
+            .define("biomeColors", true);
+        samplerThreads = b.comment("Off-thread sampler worker count.")
+            .defineInRange("threads", 1, 1, 64);
+        bypassMoveCheck = b.comment("Exempt fast creative flight / elytra from vanilla's 'moved too quickly' rubber-band.")
+            .define("bypassMoveCheck", true);
+        b.pop();
+
+        b.comment("The virtual-proxy chunk gate.")
+            .push("gate");
+        gateEnabled = b.comment("Gate a never-generated chunk's own FULL task (off = chunks generate vanilla).")
+            .define("enabled", true);
+        resendEnabled = b.comment("Resend the chunk packet when a proxy is promoted.")
+            .define("resend", true);
+        b.pop();
+    }
+}

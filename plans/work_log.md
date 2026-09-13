@@ -1,0 +1,277 @@
+# AeroGel — Work Log
+
+Chronological record of what was built, measured and fixed, newest first. **Current state lives in
+[`../AGENTS.md`](../AGENTS.md) and the other `plans/` docs; this file is history and rationale only.**
+Measurements that are still live are in `measurements.md` (v4 onward).
+
+---
+
+## 2026-09-13 (later-2) — adaptive enforcement, smooth linger, per-player streaming
+
+Made AeroGel inert when it is not needed, per the "invisible mod" goal. Compiles; `aerogel.probe` and
+`aerogel.promote` PASS; jar built + deployed.
+
+- **`server/AdaptiveMode`** — the server enforces the gate globally only while the main-thread chunk-task
+  backlog (`ServerChunkCache.getPendingTasksCount()`) is ≥ `backlogActivate` (64) or smoothed tick time ≥
+  `activateTickMs` (35 ms); it stops once both fall back below the deactivate values (16 / 22 ms) **and no
+  linger counters remain**, so flipping to vanilla cannot burst instant generation. While not enforcing, a
+  player whose client `travel` switch is on is gated in their zone; an opted-out player forces vanilla locally
+  (their leftovers are queued immediate); opt-out wins when the two overlap. `ProxyChunkGate.isEngaged` is the
+  zone test, `isGated`/`isProxy` layer classification on top, and `isProxy` now also returns false when the
+  chunk is actually loaded (so a vanilla-generating chunk is never mistaken for a proxy). The placeholder read
+  intercept now keys on `isProxy`.
+- **Smooth linger** replaces the near/far bands: `t(d) = min + (d/maxRange)*(max - min)`, endpoints
+  load-adaptive (idle 10..30 s, busy 20..60 s), `maxRange` auto view-distance+2. Touching/landing and block
+  writes stay immediate; a player's own chunk while flying uses `min`.
+- **Per-player streaming** — the streamer skips players whose client `proxy` switch is off, and skips chunks
+  that are already real (the client gets them from vanilla). Sampling stays globally shared. Fast flight now
+  uses the incremental `rebuildWanted` path; only a >16-chunk single-tick jump (teleport) does the full O(r²)
+  rebuild.
+- **Client rename** `render` → `proxy` (the master gates draw + clamp + reconcile + neighbour override, not
+  just drawing); new `travel` per-player request, default off. Client config + switches persist.
+- **Gotchas:** the headless probes run with no players, so `AdaptiveMode.debugAlwaysOn()` (non-persisting) is
+  called when a probe flag is present. `AdaptiveMode.debugAlwaysOn` must push to `ProxyChunkGate` immediately,
+  not wait for the next tick, or the probe's first `getChunk` generates vanilla and blocks.
+
+---
+
+## 2026-09-13 (later) — promotion bands, generation budget, persistent config
+
+Reworked automatic promotion and added the mod's first real config. Compiles; headless `aerogel.promote` and
+`aerogel.promotestress` probes PASS; jar built + deployed.
+
+- **Two-band linger.** `PromotionManager` now accumulates one cumulative counter per proxy chunk over the
+  *far* band (default `view-distance + 2`, the true FULL range) and picks the threshold by the band the chunk
+  is in: near (`nearRadius`, default 3 ch) 10..30 s, far 30..60 s, both load-interpolated. Walking a
+  far-banked chunk into the near band promotes it immediately (cumulative counter ≥ the shorter threshold).
+  Replaces the old single `lingerRange` (default 2, way inside the generation range) + `lingerMin/Max`.
+- **Generation-time budget.** The old `maxInFlight=1` + load-scaled cooldown + `HARD_GATE_MS` was replaced by
+  a token bucket refilled at `maxGenFraction` ms/ms (default 0.5 = half the wall time) charged `chunkCostMs`
+  (100) per promotion, capped at `burstMs`. Ordinary far-band promotions need budget and respect `hardGateMs`;
+  urgent (near band / block write / landing) bypass both but still debit the bucket, so they slow far-band
+  promotion. `maxInFlight` (default 2) bounds concurrency for all classes. `pickNext` is urgent-first then
+  nearest.
+- **Config.** `AeroGelConfig` (COMMON, `config/aerogel-common.toml`) + `AeroGelClientConfig` (CLIENT,
+  `config/aerogel-client.toml`); commands call `ModConfigSpec.save()`, so tuning persists. The client syncs its
+  persisted switches to the server on join via a now-bidirectional `ClientSwitchPayload`, so bare toggles flip
+  correctly. **Gotcha:** `defineInList` with `List.of(...)` NPEs during config correction (immutable lists are
+  null-hostile) — use `Arrays.asList`.
+- New `/aerogel promote` args: `near`, `nearLinger <min> <max>`, `far <-1..32>` (-1 = auto), `farLinger
+  <min> <max>`, `budget <fraction>`, `cost <ms>`, `hardgate <ms>`; `concurrency` range widened to 16.
+
+
+
+The `ProxyChunkGenerator` / `ChunkRegenerator` backwards-reset design, the save guards, the `nogen` test
+scaffolding and the `WorldGenRegion` write guard were **deleted**. `server/ProxyChunkGate` gates
+`ChunkHolder.updateFutures` so a proxy never builds its own FULL task, classifies disk-FULL vs proxy with a
+cheap EMPTY probe, serves reads from an `EmptyLevelChunk` placeholder, and promotes by adding to an allow-list
+and forcing the FULL future (forward generation, no reset). `LevelWriteGuardMixin`, `FlowingFluidMixin`,
+`PromotionManager`, `ChunkHolderAccessor` and the fast-flight move check are kept. `common/ProxyChunkUtil` is
+client-side — kept. Full mechanism and verified vanilla signatures: `proxy-chunk-state-machine.md`.
+
+Client render integration: vanilla's chunk renderer assumes contiguous client chunks; proxies are not client
+chunks, so three separate vanilla behaviours broke. All patched client-side under the `neighbors` switch:
+`RenderSectionNeighborsMixin` counts a proxy position as an existing chunk and reports a proxy section as
+`CompiledSection.EMPTY`; proxy hide is exact (only when the real chunk is in `LevelRenderer.visibleSections`);
+client reconciliation requests a proxy mesh whenever `isRendered` is false. Proxy water at sea level is sunk
+`WATER_SINK=0.15` (the real surface is at `seaLevel-0.125`) so it sits just below the real water.
+
+**Why the old design was debt**
+
+- A player-ticketed chunk **self-progresses to FULL**: `ChunkLevel.generationStatus(level <= 33) == FULL`, and
+  `GenerationChunkHolder.updateHighestAllowedStatus` reschedules a FULL generation task from the ticket alone —
+  independent of any `getChunk` read. The proxy generator made that FULL pass cheap by no-op'ing every step, so
+  the chunk landed as an all-air `LevelChunk` **stub**.
+- Making a stub real meant pushing its status **backwards** (`ChunkRegenerator`), which vanilla never does. A
+  neighbouring `ChunkGenerationTask` that already resolved the stub as a satisfied dependency then read it at
+  EMPTY and vanilla threw `Requested chunk unavailable during world generation` (hard crash). The
+  `canResetSafely` gate was synchronisation for this self-inflicted invariant break — real debt.
+- The stub also broke cross-border features: a tree in a promoted chunk writes leaves into a neighbour, the
+  `WorldGenRegionWriteGuardMixin` cancelled the write because the neighbour was a stub, and the neighbour never
+  regenerated them.
+
+**What the experiments proved**
+
+- With **all** generation frozen (`/aerogel switch nogen`) and a central `ServerChunkCache.getChunk` intercept
+  returning an in-memory placeholder, the server and client ran fine over a long flight (no watchdog, no
+  crash). The player kept moving (packet-driven `handleMovePlayer`).
+- Every blocking path — `Level.getBlockState`, `Level.getChunkForCollisions`, `Entity.setPosRaw`'s "ensure
+  loaded" — funnels through `ServerChunkCache.getChunk`, which unconditionally `managedBlock`s on the
+  generation future. **One intercept covers all of them.**
+- `EmptyLevelChunk` (void-air `LevelChunk`, no storage, reports FULL) is a valid placeholder. It costs ~8 KB
+  (4 heightmaps + tick containers + section array); a custom read-only placeholder would be lighter.
+
+---
+
+## 2026-09-12 (late-5) — fast-flight "missing row orthogonal to travel"
+
+The incremental leading-edge enqueue only queued the single final column/row at `center ± radius`, but a full
+rebuild only fires when the per-tick jump exceeds 2 chunks, so a 2-chunk jump left one intermediate row
+unqueued (healed ~1 s later by the client `mesh_request` reconciliation). It now enqueues the whole swept band
+(`ProxyStreamer.rebuildWanted`), still O(r·|delta|).
+
+## 2026-09-12 (late-4) — automatic promotion + block-write guard
+
+Compiles; the headless `aerogel.promote` probe passed (write deferred then replayed, chunk regenerated via the
+vanilla pipeline). Not yet verified in-game at the time.
+
+- **PromotionManager** — a chunk accrues one linger tick per tick a player is within `lingerRange` (Chebyshev,
+  default 2 → 5x5) and decays when unoccupied; past a load-adaptive threshold (default **10 s idle .. 40 s
+  loaded**, interpolated by the server's smoothed tick time) it is queued. **Landing** (player within
+  `landing` blocks above the sampled surface, descending) and **block writes** queue immediately. The queue is
+  drained nearest-to-player first under a never-lag budget: `concurrency` regenerations in flight (default 1),
+  a cooldown that grows with load, and no new start once tick time is near the 20 TPS budget
+  (`HARD_GATE_MS=60`). Negative feedback: promotion raises tick time → longer linger → fewer promotions.
+- **Block write = promotion** — `LevelWriteGuardMixin` intercepts `Level.setBlock`; for a stub it cancels the
+  write, records it, and queues the chunk, then `PromotionManager.replayWrites` re-applies it onto the real
+  terrain after regeneration. Returning true preserves the client's prediction.
+  `WorldGenRegionWriteGuardMixin` cancelled *worldgen* writes into stubs; fluid stayed cancelled by
+  `FlowingFluidMixin` (fluid does not promote). Bounded write log (`MAX_WRITE_LOG=256`).
+- **Reset safety gate** — `ChunkRegenerator.canResetSafely` refused to reset unless no holder within
+  `ChunkStatus.MAX_STRUCTURE_DISTANCE` (8) had an active generation task. Deleted 2026-09-13 with the
+  backwards-reset design.
+
+## 2026-09-12 (late-2/3) — detail tiers, biome textures, sampler worker pool
+
+Compiles; headless probe + bench passed. Fixed the black-biome / leaf-hole / water-on-mountain / missing-row
+bugs.
+
+- **Sampler worker pool** — `SamplerPool` owns N `OffThreadSampler`s, each with its own `RandomState`,
+  `PointSurfaceSampler` and `BiomeTint`. Chunks routed by an 8x8-chunk region so neighbours share the corner
+  cache; `poll()` round-robins so no worker starves. This is the radius >~32 lever; it does **not** help r≥200
+  (renderer-bound). At radius 20 one thread runs ~0.11 ms/chunk with a near-empty backlog.
+- **Biome textures** — one `BiomeSource.getNoiseBiome` probe per chunk at the centre surface y. The server
+  caches `Biome -> representative BlockState` (snowy→snow, badlands→red sand, beach/desert→sand,
+  jungle/forest/taiga→the matching **leaves**, windswept hills & mountains→**stone**, ocean/river→**sand** as
+  their land fallback, else grass) and sends the **biome registry id + block-state id** per chunk. **The tint
+  is computed client-side** (`BiomeColors`): `GrassColor`/`FoliageColor` read a pixel array only filled by the
+  client's colormap reload listener, so on a dedicated server `Biome.getGrassColor` returns **0 (black)** — the
+  "black biome" bug. The renderer draws the block's **top sprite** (block atlas, cached per `BlockState`),
+  tinted by the client colour; leaf chunks get an opaque grass underlay 0.05 below the top so the cutout holes
+  show grass, not the void.
+- **Detail tiers** — `ProxyTopology` is a nested family: **5** (corners+centre), **9** (3x3), **25** (5x5),
+  **81** (9x9); ids equal sample counts, coarser tiers are subsets of finer ones. The server samples `nearTier`
+  within `nearDistance` (default 32) and `farTier` (default 5) beyond; a 20-tick promotion sweep re-samples and
+  re-sends chunks entering the near band. The client bakes each chunk at **exactly the tier the server sent**,
+  so the debug wireframe matches the textured geometry; a promotion is a pop.
+- **Client streaming** — the mesh store is pruned only at `STORE_RADIUS=256` chunks (not the draw radius), and
+  a chunk-cross forces a sync, so leading-edge meshes survive until the player reaches them. This fixed the
+  transient rows perpendicular to travel; GPU buffers are still freed at the draw radius.
+
+## 2026-09-12 (pm) — client flight path
+
+- **The old renderer was the fast-flight hitch.** A single giant `VertexBuffer` was re-emitted + re-uploaded
+  every frame while any morph played. Measured ~1400 chunks, ~37k quads, 1.5 ms avg with **49 ms spikes**.
+  Fixed by one static `VertexBuffer` per chunk, uploaded once; the rise/sink is now a per-chunk **draw-matrix
+  offset**, so geometry never changes for animation. Steady-state `render()` dropped to **0.05–0.9 ms**.
+- **The void filler was a second stall.** A per-chunk flat mesh out to 2× render distance, rebuilt every
+  500 ms, called `getChunkNow` per cell — measured **1427 ms avg** at join at render distance 32. Replaced by
+  **one quad** moved under the camera by its matrix.
+- **The remaining flight stall is NOT the proxy layer** — with `/aerogel switch render off` the hitch
+  persisted; `aerogel.perf` showed the render thread stalling (vanilla chunk-mesh compilation, `after_sky`).
+- **The "invisible wall every chunk" was vanilla anti-cheat.** `ServerGamePacketListenerImpl.handleMovePlayer`
+  rejects moves with `d10 - d9 > 100` (≈10 blocks/packet) and teleports the player back, exempting only the
+  singleplayer owner. Exempted fast creative flight / elytra via `ServerGamePacketListenerImplMixin`
+  (`/aerogel switch movecheck`).
+- **Skipping empty stub chunk sends did not help** and left skipped chunks permanently unsent; the
+  `PlayerChunkSenderMixin` / `/aerogel stubs` / `ProxyStreamer.skipStubSends` feature was deleted.
+- Also fixed: `/aerogel generate` server crash — `ChunkHolder.updateFutures`'s ENTITY_TICKING branch
+  identity-checks `entityTickingChunkFuture` against the unloaded sentinel; the cached futures must be reset to
+  that **exact** object before forcing re-promotion, and the completion callback must not swallow a throw.
+
+## 2026-09-12 (late) — sparse sampler + persistence hole
+
+- Replaced the batched sampler with the sparse `PointSurfaceSampler` (5/9-point, ~7–14 evals/chunk,
+  ~0.1–0.2 ms; measurements v4). The old sampler needed ~8 threads to keep up; the sparse one keeps up on
+  one.
+- **Persistence hole found by the probe (and fixed).** A `getChunk(FULL)` pulled in a ~22×22 neighbourhood of
+  dependency chunks that only reached `structure_starts`/`biomes`; the old `ProxyChunkGenerator` only tagged
+  stubs in `fillFromNoise`, so those dependencies were serialized as empty chunks (~500 per region). Both save
+  guards were changed to refuse **any all-air chunk while the proxy is active** (content-based, immune to tag
+  pruning). Superseded by the 2026-09-13 gate design, which removed the save guards entirely.
+- **Throughput / range.** The old `MAX_SUBMIT_PER_TICK=64` (=1280/s) was below the ~2000/s a radius-12 sweep
+  demands — that was the "sometimes lagging behind" (not the sampler). Raised to 512/tick, 4096 pending,
+  1024 drain. `rebuildWanted` queues only the leading edge (O(r)/cross) instead of sorting the whole window.
+- **Client initial-fill trickle.** The client uploaded only 64 chunk buffers per sync; changed to a
+  **wall-time budget (2 ms, hard cap 512) per sync** so a login burst fills as fast as the machine allows.
+
+## 2026-09-12 — proxies are RAM-only; manual regeneration works
+
+In-game verified: proxy terrain renders correctly (slope follows worldgen), `/aerogel generate` produces a real
+chunk, the lattice dump works, the wireframe toggle works.
+
+1. **Batched-sampler x-axis bug.** `BatchedSurfaceSampler` never called `chunk.swapSlices()`. `NoiseChunk`
+   interpolates x between two noise slices and vanilla swaps them once per cell-X; without it slice0 stayed on
+   cell 0 and every interior sample read the first x column. Symptom: one sloped quad then three flat ones,
+   repeating. Fixed (and later made moot by the sparse sampler).
+2. **Proxy chunks never persist** (old design) — `ChunkMapSaveMixin` + `ChunkSerializerGuardMixin`.
+3. **`/aerogel generate`** — `ChunkRegenerator` allow-listed the chunk, seeded a fresh `ProtoChunk` at EMPTY,
+   reset `startedWork`/`task`, then scheduled FULL; vanilla ran its own generation pyramid. On completion it
+   forced `updateFutures` and pushed entities/players out of the new geometry.
+4. **Commands/diagnostics** — `/aerogel grid`, `/aerogel wireframe`, `/aerogel flyspeed`.
+5. **Renderer gotcha.** `Tesselator.begin` returns a `BufferBuilder` sharing one `ByteBufferBuilder`; two live
+   builders corrupt each other. Build the edge wireframe in a separate pass.
+6. **Headless tool** — `touch run/server/aerogel.regen` → `RegenProbe` (later merged into `aerogel.promote`).
+
+## 2026-09-08 (2nd) — demo playable, user-verified
+
+In-game verified: interception, streaming, mesh rendering (slope shading + directional walls), walking clamp,
+Create flight, water guard.
+
+1. **Fluid dirty-stub bug (root cause of "permanent holes")** — water flowing from real chunks wrote blocks
+   into air stubs → stub counted as real → mesh skipped. `FlowingFluidMixin` cancels `FlowingFluid.spreadTo`
+   when the target chunk is an air stub. Other block-writing paths were not guarded at the time.
+2. **Packet-loss holes** — client→server reconciliation (`MeshRequestPayload`, nearest-first missing meshes
+   every 1 s). Self-heals drops/reconnects within ~1–2 s.
+3. **Walking feel** — server clamp is a through-floor net only (deadzone 2.0, skipped over REAL chunks); client
+   clamp owns standing. Per-tick server teleports caused rubber-banding — don't reintroduce.
+4. **Renderer transform** — NeoForge passes a NULL PoseStack at AFTER_TRANSLUCENT_BLOCKS; draw with
+   `new Matrix4f(event.getModelViewMatrix()).translate(-cam)`.
+5. **Perf numbers (under load, upper bounds)** — sampling ~15–16 ms/chunk with the old lattice sampler (THE
+   bottleneck then); client mesh rebuild ≤1.1 ms for ~1000 chunks.
+
+## 2026-09-08 (1st) — interception implemented + server-verified
+
+All built; interception verified headless (`touch run/server/aerogel.probe`): control chunk from disk = real
+terrain; fresh chunk = instant all-air stub (7 ms vs ~500 ms real gen). Server boots clean to Done with
+Create+Aeronautics+Sable.
+
+1. **`LevelChunk.isEmpty()` is hardcoded `return false` in 1.21.1** — used `ProxyChunkUtil.isAirStub`
+   (scans `LevelChunkSection.hasOnlyAir()`) instead.
+2. **mods.toml mixin declaration** must be a list of TABLES, not strings.
+3. **NeoForge bus registration is per-bus strict** — `AeroGel` (mod bus) + `ServerHandlers` (game bus,
+   static) + `ClientHandlers` (game bus, static, client dist only).
+4. Console commands via stdin FIFO do NOT pass through gradle JavaExec → use the flag-file probe pattern
+   (self-halts via `server.halt(false)`).
+5. The proxy no-op'd all generation steps: createBiomes, fillFromNoise, buildSurface, applyCarvers,
+   applyBiomeDecoration, createStructures, createReferences, spawnOriginalMobs.
+
+## Early PoC — surface sampling (measurements v1–v3, superseded)
+
+Kept for the reasoning that produced the production sampler.
+
+- **v1 (naive per-column scan, superseded).** Density eval ~6–18 µs under load; per-column coarse scan
+  ~80–420 µs. 16×16 pts/chunk ≈ 30–70 ms/chunk — too slow. No pointwise 2D caching (`cache2d`/`cacheOnce`
+  are built for `fillArray` traversal, not pointwise `compute`).
+- **v2 (vanilla-style cell lattice).** Sampling on the density cell lattice (cellWidth 4 × cellHeight 8,
+  ~1225 evals/chunk) and trilinearly interpolating matches real terrain: rugged-chunk avg error 12.3 → 2.0,
+  worst 7–9 (features). ~16.5 ms/chunk full grid, ~2.7 ms for 4 corners, and corners are shared across
+  chunks.
+- **v3 (client flight path).** See 2026-09-12 (pm). The old single giant `VertexBuffer`, the per-chunk void
+  mesh, and the vanilla anti-cheat move check were the culprits, not the proxy layer.
+
+---
+
+## Pitfalls / gotchas learned (operational)
+
+- SLF4J has NO printf specifiers — `{}` only; pre-format via `String.format`.
+- The flag files (`run/server/aerogel.*`) trigger self-halting headless probes; delete them before a normal
+  run.
+- `rm -rf run/server/world` resets the world — only for timing baselines / after water-damaged stubs, never
+  for a demo run.
+- Machine-under-load inflates all timings ~2–3×; treat timings as upper bounds, relative comparisons matter.
+- NeoForge mixin runtime = Mojmap names (no refmap needed).
+- `ChunkGenerator.createState`/`randomState` are built from the ORIGINAL generator at `ChunkMap` construction;
+  do not try to rebuild them.
+- Dev world was wiped 2026-09-08 (water-damaged stubs) and again 2026-09-12 (headless tests); the fresh spawn
+  circle is the baseline.

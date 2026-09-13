@@ -1,0 +1,134 @@
+plugins {
+    id 'net.neoforged.moddev' version '2.0.140'
+}
+
+base {
+    archivesName = "${mod_id}-${minecraft_version}"
+}
+
+version = mod_version
+group = 'dev.aerogel'
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(java_version)
+}
+
+neoForge {
+    version = neoforge_version
+
+    parchment {
+        minecraftVersion = parchment_minecraft
+        mappingsVersion = parchment_version
+    }
+
+    runs {
+        configureEach {
+            systemProperty('neoforge.enabledGameTestNamespaces', mod_id)
+            ideName = "AeroGel ${it.name.capitalize()}"
+        }
+        client {
+            client()
+            gameDirectory = this.mkdir(file('run/client'))
+        }
+        server {
+            server()
+            gameDirectory = this.mkdir(file('run/server'))
+        }
+        data {
+            clientData()
+            gameDirectory = this.mkdir(file('run/data'))
+            programArguments.addAll '--mod', mod_id, '--all', '--output', file('src/generated/resources/').getAbsolutePath(), '--existing', file('src/main/resources/').getAbsolutePath()
+        }
+    }
+
+    mods {
+        "${mod_id}" {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+sourceSets.main.resources { srcDir 'src/generated/resources' }
+
+// Build + copy the mod jar into the AeroGelDemo Prism instance's mods folder.
+tasks.register('deployDemo', Copy) {
+    dependsOn tasks.named('assemble')
+    from(layout.buildDirectory.dir('libs')) {
+        include "aerogel-${minecraft_version}-${mod_version}.jar"
+    }
+    into "${System.getProperty('user.home')}/.local/share/PrismLauncher/instances/AeroGelDemo/.minecraft/mods"
+}
+
+repositories {
+    mavenCentral()
+    // Create, Ponder, Flywheel
+    maven { url = "https://maven.createmod.net" }
+    // Create Aeronautics / Sable physics
+    maven { url = "https://maven.ryanhcode.dev/releases" }
+    // Modrinth
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = "Modrinth"
+                url = "https://api.modrinth.com/maven"
+            }
+        }
+        filter { includeGroup "maven.modrinth" }
+    }
+}
+
+dependencies {
+    // ---- Compile + dev-run against the exact jars staged from the kitchen-sink instance (see libs/) ----
+    // The real dev maven coordinates (used by the Create Aeronautics team) are:
+    //   com.simibubi.create:create-1.21.1:<create_version>-280
+    //   dev.ryanhcode.sable:sable-neoforge-1.21.1:<sable_version>
+    // Aeronautics/Simulated/Offroad are ONLY distributed via the bundled jar, so we compile against the
+    // unpacked jarjar children staged in libs/.
+    compileOnly fileTree(dir: 'libs', include: '*.jar')
+    // At dev-run time (runClient/runServer) NeoForge picks mods up off the runtime classpath, exactly like
+    // the real Create Aeronautics dev setup does with its own build.
+    runtimeOnly fileTree(dir: 'libs', include: '*.jar')
+}
+
+processResources {
+    var expandProps = [
+            'version'                      : project.version,
+            'group'                        : project.group,
+            'minecraft_version'            : minecraft_version,
+            'minecraft_version_range'      : minecraft_version_range,
+            'mod_name'                     : mod_name,
+            'mod_author'                   : mod_author,
+            'mod_id'                       : mod_id,
+            'license'                      : mod_license,
+            'description'                  : mod_description,
+            'neoforge_version'             : neoforge_version,
+            'neoforge_loader_version_range': neoforge_loader_version_range,
+            'create_version'               : create_version,
+            'aeronautics_version'          : aeronautics_version,
+            'sable_version'                : sable_version,
+            'java_version'                 : java_version,
+    ]
+    filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
+        expand expandProps
+    }
+    inputs.properties(expandProps)
+}
+
+jar {
+    manifest {
+        attributes([
+                'Specification-Title'   : mod_name,
+                'Specification-Vendor'  : mod_author,
+                'Specification-Version' : project.jar.archiveVersion,
+                'Implementation-Title'  : project.name,
+                'Implementation-Version': project.jar.archiveVersion,
+                'Implementation-Vendor' : mod_author,
+                'Built-On-Minecraft'    : minecraft_version
+        ])
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = java_version.toInteger()
+}

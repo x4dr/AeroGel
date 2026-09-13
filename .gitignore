@@ -1,0 +1,34 @@
+# Gradle
+.gradle/
+build/
+out/
+
+# IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Eclipse
+.settings/
+.classpath
+.project
+
+# VS Code
+.vscode/
+
+# Run dirs (dev client/server/data)
+run/
+runs/
+
+# Minecraft dev junk
+crash-reports/
+logs/
+
+# Local libs staging note: libs/ is intentionally tracked? No — staged from the kitchen instance; keep out.
+libs/*.jar
+!libs/README.md
+
+# OS
+.DS_Store
+Thumbs.db
