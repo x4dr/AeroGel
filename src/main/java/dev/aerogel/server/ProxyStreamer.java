@@ -95,6 +95,8 @@ public final class ProxyStreamer {
     private static int statTicks;
     private static long statTickNanos;
     private static int statChunksSent;
+    /** cumulative chunks streamed since init (never reset); read by the flight probe. */
+    private static long totalChunksSent;
     private static int haltTick = -1;
 
     /** one chunk's best streamed data; tier is the detail it was sampled at. */
@@ -360,6 +362,11 @@ public final class ProxyStreamer {
         return ProxyChunkGate.isActive();
     }
 
+    /** cumulative proxy chunks streamed since init (flight-probe metric). */
+    public static long totalChunksSent() {
+        return totalChunksSent;
+    }
+
     /** the sampled biome holder for a chunk, or null when none has been sampled yet. */
     public static Holder<Biome> biomeHolder(ServerLevel lvl, long pos) {
         State state = state(lvl);
@@ -485,6 +492,7 @@ public final class ProxyStreamer {
         }
         statTickNanos += System.nanoTime() - t0;
         statChunksSent += sentThisTick;
+        totalChunksSent += sentThisTick;
         if (++statTicks % 200 == 0) {
             LOGGER.info("stream perf: {} ms/tick avg over {} ticks, {} chunks sent, {} dimensions",
                 String.format("%.2f", statTickNanos / 1e6 / statTicks), statTicks, statChunksSent, STATES.size());

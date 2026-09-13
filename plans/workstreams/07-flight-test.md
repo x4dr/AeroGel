@@ -8,24 +8,32 @@ This is a measurement harness, not a code change to the mod.
 
 `server/FlightProbe.java`, flag file `<serverDir>/aerogel.flight`.
 
-- Waits for the first overworld player, puts them in creative flight at y=180,
-  and teleports them `speed` chunks/tick along +x for `duration` ticks.
-- The flag file may contain `"<speedChunksPerTick> <durationTicks>"` (defaults
-  `4 1200` = 80 chunks/s for 60 s).
-- It does **not** force any switch and does **not** call `debugAlwaysOn`, so it
-  exercises the real adaptive path. Logs one line per second:
-  `flight: t=… chunk=(…) swept…ch | tick … ms, backlog … | adaptive … | promote …`.
-- It never halts the server; after the run it stops moving.
+It runs a **list of configurations back-to-back** on the first overworld player.
+Each run: apply the stream settings, teleport to a fresh terrain band, settle
+until the start chunk is loaded and the server is quiet, then fly `speed`
+chunks/tick along +x for `duration` ticks, sampling server tick time and
+chunk-task backlog. At the end it logs a comparison table.
+
+Flag format, one run per line (`#` comments / blank lines ignored):
+
+```
+radius nearTier farTier nearDistance speedChunksPerTick durationTicks zOffsetChunks
+```
+
+If the file is missing/empty, a default matrix is used: radius 20 at tiers
+5/9/25/81, then radius 50 and 100 at tier 9, each 600 ticks at 4 ch/tick on a
+fresh z-band. It does **not** force any switch (real adaptive path) and never
+halts the server.
 
 ## Run
 
 ```bash
 # server (the dev server is loaded from build classes, so rebuild + restart)
-printf '4 1200' > run/server/aerogel.flight
+printf '20 9 5 32 4 600 0\n20 25 5 32 4 600 2000\n' > run/server/aerogel.flight
 scripts/deploy.sh                     # stop -> build -> deploy client jar -> start
 
 # client: launch/restart the AeroGelDemo Prism instance and connect to localhost
-# (the probe arms on join and flies you)
+# (the probe arms on join and runs the matrix)
 ```
 
 Two profiles, run on **fresh terrain each time** (fly a different direction, or

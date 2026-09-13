@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Summarise a FlightProbe run from the server log (and optionally the Prism client log).
+# Summarise a FlightProbe matrix run from the server log (and optionally the Prism client log).
 #
 # Usage:
 #   scripts/flight-report.sh [server-log] [client-log]
@@ -19,41 +19,31 @@ if [ ! -f "$SERVER_LOG" ]; then
   exit 1
 fi
 
+echo "================ flight matrix ================"
+# the probe logs its own per-run results and the SUMMARY table; just surface them in order.
+grep -E "ae\.flight" "$SERVER_LOG" \
+  | grep -E "RUN [0-9]+ done|SUMMARY|^.*flight: [0-9]+ " || echo "(no completed runs yet)"
+echo
+echo "-- planned runs --"
+grep -E "run [0-9]+ planned" "$SERVER_LOG" | tail -20 || true
+
+echo
 echo "================ server ================"
-echo "-- flight run --"
-grep -E "flight: (pilot|run complete)|flight probe" "$SERVER_LOG" || echo "(no flight probe lines)"
-
-echo
-echo "-- server tick (from flight: lines) --"
-grep -E "^\[.*\] \[Server thread/INFO\] \[ae\.flight" "$SERVER_LOG" \
-  | sed -E 's/.*tick ([0-9.]+) ms, backlog ([0-9]+).*/\1 \2/' \
-  | grep -E '^[0-9]' \
-  | awk '
-      { n++; s+=$1; b+=$2; if (n==1||$1<min) min=$1; if ($1>max) max=$1; if ($2>maxb) maxb=$2 }
-      END { if (n) printf "samples %d | tick min %.1f avg %.1f max %.1f ms | backlog avg %.0f max %d\n", n, min, s/n, max, b/n, maxb }
-    ' || true
-
-echo
-echo "-- enforcing samples --"
-grep -c "ENFORCING" "$SERVER_LOG" 2>/dev/null | sed 's/^/ENFORCING lines: /' || true
-
-echo
-echo "-- server tick stalls (>100ms) --"
+echo "-- tick stalls (>100ms) --"
 grep -c "server tick stall" "$SERVER_LOG" 2>/dev/null | sed 's/^/count: /' || true
-grep "server tick stall" "$SERVER_LOG" | tail -5 || true
-
+grep "server tick stall" "$SERVER_LOG" | tail -8 || true
 echo
-echo "-- stream perf (last 5) --"
-grep "stream perf" "$SERVER_LOG" | tail -5 || true
+echo "-- stream perf (last 6) --"
+grep "stream perf" "$SERVER_LOG" | tail -6 || true
 
 echo
 if [ -f "$CLIENT_LOG" ]; then
-  echo "================ client ($CLIENT_LOG) ================"
-  echo "-- render perf (last 5) --"
-  grep "render perf" "$CLIENT_LOG" | tail -5 || true
+  echo "================ client ================"
+  echo "-- render perf (last 4) --"
+  grep "render perf" "$CLIENT_LOG" | tail -4 || true
   echo
-  echo "-- client frame/tick stalls --"
-  grep -E "client frame stall|client tick stall|render hitch" "$CLIENT_LOG" | tail -10 || true
+  echo "-- client stalls (last 8) --"
+  grep -E "client frame stall|client tick stall|render hitch" "$CLIENT_LOG" | tail -8 || true
 else
   echo "================ client ================"
   echo "(no client log at $CLIENT_LOG)"
