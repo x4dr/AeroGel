@@ -269,8 +269,10 @@ public final class ProxyRenderer {
             ResourceLocation composite = LeafCompositeSource.compositeId(sprite.contents().name());
             TextureAtlasSprite opaque = mc.getTextureAtlas(TextureAtlas.LOCATION_BLOCKS).apply(composite);
             if (opaque != null && composite.equals(opaque.contents().name())) {
+                LOGGER.info("mesh texture: {} -> opaque leaf composite {}", state, composite);
                 return opaque;
             }
+            LOGGER.info("mesh texture: {} -> leaf composite missing, using grass top", state);
             return resolveSprite(Blocks.GRASS_BLOCK.defaultBlockState());
         }
         return sprite;

@@ -23,7 +23,8 @@ import org.slf4j.LoggerFactory;
  * Adds an opaque variant of every {@code *_leaves} block texture to the block atlas: transparent pixels
  * are filled with the grass texture, so the proxy can draw a single layer with no underlay and no
  * see-through holes. Registered as a sprite source by {@code ClientSetup}; see
- * {@code assets/aerogel/atlases/blocks.json}.
+ * {@code assets/minecraft/atlases/blocks.json} (atlas definitions are loaded from the atlas's own
+ * namespace, not the mod's).
  */
 @OnlyIn(Dist.CLIENT)
 public final class LeafCompositeSource implements SpriteSource {
@@ -78,7 +79,11 @@ public final class LeafCompositeSource implements SpriteSource {
             ResourceMetadata.EMPTY);
     }
 
-    /** leaf pixels win; transparent ones are replaced with the (scaled) grass pixel underneath. */
+    /**
+     * Leaf pixels win; transparent ones are replaced with the (scaled) grass pixel underneath. Every output
+     * pixel is forced fully opaque: the shader discards alpha &lt; 0.1, but the surviving antialiased leaf
+     * pixels are still semi-transparent and would blend the void/sky through the single-layer top surface.
+     */
     private static NativeImage composite(SpriteContents leaf, SpriteContents grass) {
         int w = leaf.width();
         int h = leaf.height();
@@ -91,9 +96,9 @@ public final class LeafCompositeSource implements SpriteSource {
             for (int x = 0; x < w; x++) {
                 int leafPixel = leafImage.getPixelRGBA(x, y);
                 if (((leafPixel >>> 24) & 0xFF) >= 26) {
-                    out.setPixelRGBA(x, y, leafPixel);
+                    out.setPixelRGBA(x, y, (leafPixel & 0x00FFFFFF) | 0xFF000000);
                 } else {
-                    out.setPixelRGBA(x, y, grassImage.getPixelRGBA(x * gw / w, y * gh / h));
+                    out.setPixelRGBA(x, y, grassImage.getPixelRGBA(x * gw / w, y * gh / h) | 0xFF000000);
                 }
             }
         }
