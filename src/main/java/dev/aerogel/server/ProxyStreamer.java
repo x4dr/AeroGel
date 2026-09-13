@@ -16,6 +16,7 @@ import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.shorts.ShortArrayList;
 import net.minecraft.core.Holder;
 import net.minecraft.resources.ResourceKey;
@@ -65,10 +66,12 @@ public final class ProxyStreamer {
     private static final int MAX_WANTED_QUEUE = 200_000;
     private static final int MAX_SAMPLER_THREADS = 64;
     /** a single-tick jump beyond this many chunks is treated as a teleport (full wanted rebuild); normal
-     *  fast flight uses the incremental leading-edge path. */
-    private static final int FRESH_JUMP_THRESHOLD = 16;
-    /** how often the near-band promotion sweep runs (ticks); promotion is not latency-critical. */
-    private static final int PROMOTE_INTERVAL = 20;
+     *  fast flight uses the incremental leading-edge path. Raised from 16 to 24: the incremental band cost
+     *  ~2*delta*(2r+1) stays below the fresh ring cost (2r+1)^2 while delta < r, so the extra slack keeps
+     *  moderate flight jumps on the cheaper incremental path at the default r=20. */
+    private static final int FRESH_JUMP_THRESHOLD = 24;
+    /** how often the near-band detail-tier refinement sweep runs (ticks); it is not latency-critical. */
+    private static final int REFINE_INTERVAL = 20;
 
     private static int radius = 20;
     private static final int MAX_SUBMIT_PER_TICK = 512;
@@ -112,8 +115,10 @@ public final class ProxyStreamer {
         final Map<UUID, Stream> streams = new HashMap<>();
         /** scratch for finished samples drained this tick. */
         final long[] completed = new long[MAX_DRAIN_PER_TICK];
+        /** reused per-player packet accumulator; cleared/reset after each {@link #sendAndSubmit}. */
+        final Map<Byte, Batch> scratchBatches = new HashMap<>();
         int pruneTicks;
-        int promoteTicks;
+        int refineTicks;
 
         State(ServerLevel level) {
             this.level = level;
@@ -307,6 +312,9 @@ public final class ProxyStreamer {
             state.pending.clear();
             for (Stream stream : state.streams.values()) {
                 stream.sent.clear();
+                stream.wanted.clear();
+                stream.queued.clear();
+                stream.wantedIndex = 0;
                 stream.center = Long.MIN_VALUE;
             }
         }
@@ -509,7 +517,7 @@ public final class ProxyStreamer {
             state.completed[drained++] = pos;
         }
         int sentThisTick = 0;
-        boolean promoteDue = ++state.promoteTicks % PROMOTE_INTERVAL == 0;
+        boolean refineDue = ++state.refineTicks % REFINE_INTERVAL == 0;
         for (ServerPlayer player : srv.getPlayerList().getPlayers()) {
             if (player.level() != state.level || player.hasDisconnected()) {
                 continue;
@@ -522,7 +530,7 @@ public final class ProxyStreamer {
             if (center.toLong() != stream.center) {
                 rebuildWanted(stream, center);
             }
-            sentThisTick += sendAndSubmit(state, stream, player, center, drained, promoteDue);
+            sentThisTick += sendAndSubmit(state, stream, player, center, drained, refineDue);
         }
         if (++state.pruneTicks % 200 == 0) {
             pruneGrids(state);
@@ -591,10 +599,16 @@ public final class ProxyStreamer {
         boolean fresh = old == null
             || Math.max(Math.abs(center.x - old.x), Math.abs(center.z - old.z)) > FRESH_JUMP_THRESHOLD;
         if (fresh) {
-            // login / teleport: queue the whole window nearest-ring-first (no O(r^2 log r) sort)
+            // login / teleport: queue the whole window nearest-ring-first (no O(r^2 log r) sort). Reset the
+            // queue and its membership mirror; the cap check in the outer loop stops a huge radius walking
+            // the whole O(r^2) window once the queue is full.
             stream.wanted = new LongArrayList();
             stream.wantedIndex = 0;
+            stream.queued.clear();
             for (int k = 0; k <= r; k++) {
+                if (stream.queued.size() >= MAX_WANTED_QUEUE) {
+                    break;
+                }
                 for (int x = center.x - k; x <= center.x + k; x++) {
                     enqueue(stream, x, center.z - k);
                     if (k > 0) {
@@ -612,12 +626,17 @@ public final class ProxyStreamer {
             // the old and new leading edge. Enqueuing only the final edge leaves the intermediate rows
             // unqueued; they then only heal via the client's ~1 s mesh_request reconciliation (the
             // "row missing orthogonal to travel" bug). The lower clamp also covers a jump so large the
-            // old and new windows no longer overlap.
+            // old and new windows no longer overlap. The x-band and z-band overlap in the corner on a
+            // diagonal move; enqueue()'s membership set suppresses that duplicate. Each outer loop bails
+            // once the queue cap is reached.
             int dx = center.x - old.x;
             int dz = center.z - old.z;
             if (dx > 0) {
                 int x0 = Math.max(old.x + r + 1, center.x - r);
                 for (int x = x0; x <= center.x + r; x++) {
+                    if (stream.queued.size() >= MAX_WANTED_QUEUE) {
+                        break;
+                    }
                     for (int z = center.z - r; z <= center.z + r; z++) {
                         enqueue(stream, x, z);
                     }
@@ -625,6 +644,9 @@ public final class ProxyStreamer {
             } else if (dx < 0) {
                 int x0 = Math.min(old.x - r - 1, center.x + r);
                 for (int x = x0; x >= center.x - r; x--) {
+                    if (stream.queued.size() >= MAX_WANTED_QUEUE) {
+                        break;
+                    }
                     for (int z = center.z - r; z <= center.z + r; z++) {
                         enqueue(stream, x, z);
                     }
@@ -633,6 +655,9 @@ public final class ProxyStreamer {
             if (dz > 0) {
                 int z0 = Math.max(old.z + r + 1, center.z - r);
                 for (int z = z0; z <= center.z + r; z++) {
+                    if (stream.queued.size() >= MAX_WANTED_QUEUE) {
+                        break;
+                    }
                     for (int x = center.x - r; x <= center.x + r; x++) {
                         enqueue(stream, x, z);
                     }
@@ -640,6 +665,9 @@ public final class ProxyStreamer {
             } else if (dz < 0) {
                 int z0 = Math.min(old.z - r - 1, center.z + r);
                 for (int z = z0; z >= center.z - r; z--) {
+                    if (stream.queued.size() >= MAX_WANTED_QUEUE) {
+                        break;
+                    }
                     for (int x = center.x - r; x <= center.x + r; x++) {
                         enqueue(stream, x, z);
                     }
@@ -657,13 +685,17 @@ public final class ProxyStreamer {
         }
     }
 
-    /** append a chunk to this player's wanted queue unless already sent or the queue cap is reached. */
+    /**
+     * Append a chunk to this player's wanted queue unless already sent, already queued (the membership set
+     * dedups both the diagonal x/z band overlap and re-enqueues across rebuilds), or the queue cap is
+     * reached.
+     */
     private static void enqueue(Stream stream, int x, int z) {
-        if (stream.wanted.size() - stream.wantedIndex >= MAX_WANTED_QUEUE) {
+        if (stream.queued.size() >= MAX_WANTED_QUEUE) {
             return;
         }
         long pos = ChunkPos.asLong(x, z);
-        if (stream.sent.get(pos) == 0) {
+        if (stream.sent.get(pos) == 0 && stream.queued.add(pos)) {
             stream.wanted.add(pos);
         }
     }
@@ -679,8 +711,10 @@ public final class ProxyStreamer {
      * Sends this player every completed/cached wanted chunk (grouped into one packet per tier) and submits
      * the remainder of the wanted list to the pool. All of this is bookkeeping — no density evaluation.
      */
-    private static int sendAndSubmit(State state, Stream stream, ServerPlayer player, ChunkPos center, int drained, boolean promoteDue) {
-        Map<Byte, Batch> batches = new HashMap<>();
+    private static int sendAndSubmit(State state, Stream stream, ServerPlayer player, ChunkPos center, int drained, boolean refineDue) {
+        // reuse the per-state accumulator instead of allocating a HashMap per player per tick; every Batch is
+        // reset after it is sent, so the map (and its ArrayLists' backing arrays) survive across ticks.
+        Map<Byte, Batch> batches = state.scratchBatches;
         for (int i = 0; i < drained; i++) {
             long pos = state.completed[i];
             if (!inRadius(pos, center, stream.radius)) {
@@ -698,6 +732,7 @@ public final class ProxyStreamer {
         while (stream.wantedIndex < stream.wanted.size() && submitted < MAX_SUBMIT_PER_TICK) {
             long pos = stream.wanted.getLong(stream.wantedIndex);
             stream.wantedIndex++;
+            stream.queued.remove(pos);
             if (ProxyChunkGate.isLoadedReal(state.level, pos)) {
                 continue; // real chunk: the client gets it from vanilla
             }
@@ -711,6 +746,7 @@ public final class ProxyStreamer {
             }
             if (state.pending.size() >= MAX_PENDING) {
                 stream.wantedIndex--; // worker queue full; resume here next tick
+                stream.queued.add(pos);
                 break;
             }
             if (state.pending.get(pos) >= want) {
@@ -720,25 +756,39 @@ public final class ProxyStreamer {
             state.worker.submit(pos, want, false);
             submitted++;
         }
-        if (promoteDue) {
-            promoteNearBand(state, batches, stream, center);
+        // detail-tier refinement is only meaningful once the level actually has proxies; mayHaveProxy is the
+        // WS-01 per-level fast bail (false while dormant with no opt-in), so a proxy-free level never scans.
+        if (refineDue && ProxyChunkGate.mayHaveProxy(state.level)) {
+            refineNearBand(state, batches, stream, center);
         }
         int sent = 0;
         for (Batch batch : batches.values()) {
-            PacketDistributor.sendToPlayer(player, new MeshBatchPayload(batch.tier, batch.pos.toLongArray(),
-                batch.heights.toShortArray(), batch.biomes.toIntArray(), batch.blocks.toIntArray()));
-            sent += batch.pos.size();
+            if (batch.pos.isEmpty()) {
+                continue; // tier retained from an earlier tick, already reset
+            }
+            MeshBatchPayload packet = new MeshBatchPayload(batch.tier, batch.pos.toLongArray(),
+                batch.heights.toShortArray(), batch.biomes.toIntArray(), batch.blocks.toIntArray());
+            int n = batch.pos.size();
+            batch.reset();
+            PacketDistributor.sendToPlayer(player, packet);
+            sent += n;
         }
         return sent;
     }
 
     /**
-     * Promotion sweep: every {@link #PROMOTE_INTERVAL} ticks, make sure every chunk in the near band is
-     * sampled/sent at {@link #nearTier}. Chunks sampled coarse while far are re-submitted (the point cache
-     * already holds their corners, so only the new points cost anything); chunks already fine but sent
-     * coarse are queued for resend. O(nearDistance^2), but only every 20 ticks.
+     * Detail-tier refinement sweep — <b>not</b> real-terrain promotion (that is {@link PromotionManager}).
+     * Every {@link #REFINE_INTERVAL} ticks it makes sure every chunk in the near band is sampled/sent at
+     * {@link #nearTier}: a chunk sampled coarse while far is re-submitted at the finer tier (the point cache
+     * already holds its corners, so only the new points cost anything), and a chunk already fine but sent
+     * coarse is queued for resend. The caller gates it on {@link ProxyChunkGate#mayHaveProxy}; this also
+     * bails when the level has neither a stored grid nor an in-flight sample, so a proxy-free level never
+     * pays the O(nearDistance^2) scan.
      */
-    private static void promoteNearBand(State state, Map<Byte, Batch> batches, Stream stream, ChunkPos center) {
+    private static void refineNearBand(State state, Map<Byte, Batch> batches, Stream stream, ChunkPos center) {
+        if (state.grids.isEmpty() && state.pending.isEmpty()) {
+            return;
+        }
         int r = Math.min(nearDistance, stream.radius);
         for (int dx = -r; dx <= r; dx++) {
             for (int dz = -r; dz <= r; dz++) {
@@ -791,6 +841,8 @@ public final class ProxyStreamer {
         final Long2ByteOpenHashMap sent = new Long2ByteOpenHashMap();
         /** queue of not-yet-submitted chunks, nearest-first on the initial fill then leading edges. */
         LongArrayList wanted = new LongArrayList();
+        /** membership mirror of {@code wanted[wantedIndex..]}: O(1) dedup without scanning the queue. */
+        final LongOpenHashSet queued = new LongOpenHashSet();
         int wantedIndex;
 
         Stream() {
@@ -808,6 +860,14 @@ public final class ProxyStreamer {
 
         Batch(byte tier) {
             this.tier = tier;
+        }
+
+        /** empty the lists but keep their backing arrays for reuse next tick. */
+        void reset() {
+            pos.clear();
+            heights.clear();
+            biomes.clear();
+            blocks.clear();
         }
     }
 
