@@ -34,6 +34,13 @@ final class FlightProbe {
     private static int zOffsetChunks;
     private static int ticks;
     private static boolean reportedDone;
+    /** settle phase: let the client finish the join/teleport load before the sweep starts. */
+    private static boolean settled;
+    private static int settleTicks;
+    /** minimum settle (ticks) even if the spawn chunk is already loaded. */
+    private static final int MIN_SETTLE_TICKS = 200;
+    /** give up waiting for a quiet server after this (ticks). */
+    private static final int MAX_SETTLE_TICKS = 800;
 
     private FlightProbe() {
     }
@@ -76,6 +83,26 @@ final class FlightProbe {
             }
             arm(pilot);
         }
+        if (!settled) {
+            // Wait for the client to finish loading at the start band: the chunk must be real and the
+            // server quiet, so the sweep is measured against a loaded world (not a moving join screen).
+            settleTicks++;
+            boolean loaded = srv.overworld().getChunkSource()
+                .getChunkNow(pilot.chunkPosition().x, pilot.chunkPosition().z) != null;
+            float tickMs = srv.getCurrentSmoothedTickTime();
+            if (settleTicks % 20 == 0) {
+                LOGGER.info("flight: settling t={} chunk=({},{}) loaded={} tick={} ms backlog={}",
+                    settleTicks, pilot.chunkPosition().x, pilot.chunkPosition().z, loaded,
+                    String.format("%.1f", tickMs), srv.overworld().getChunkSource().getPendingTasksCount());
+            }
+            if ((settleTicks >= MIN_SETTLE_TICKS && loaded && tickMs < 30.0f) || settleTicks >= MAX_SETTLE_TICKS) {
+                settled = true;
+                ticks = 0;
+                LOGGER.info("flight: settled after {} ticks (loaded={}, tick={} ms); starting sweep",
+                    settleTicks, loaded, String.format("%.1f", tickMs));
+            }
+            return;
+        }
         ticks++;
         if (ticks > durationTicks) {
             if (!reportedDone) {
@@ -105,6 +132,8 @@ final class FlightProbe {
         player.teleportTo(player.getX(), ALTITUDE, player.getZ() + (double) zOffsetChunks * 16.0);
         ticks = 0;
         reportedDone = false;
+        settled = false;
+        settleTicks = 0;
         LOGGER.info("flight: pilot {} at ({},{}) y={} -> +x at {} chunks/tick",
             player.getGameProfile().getName(),
             String.format("%.0f", player.getX()), String.format("%.0f", player.getZ()),
