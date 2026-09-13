@@ -4,12 +4,16 @@ import dev.aerogel.common.AeroGelConfig;
 import dev.aerogel.mixin.ChunkHolderAccessor;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ChunkLevel;
@@ -19,6 +23,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.chunk.ChunkAccess;
@@ -50,13 +55,34 @@ import org.slf4j.LoggerFactory;
  * chunk then generates forward from its persisted status (features already written by neighbours survive).
  * No backwards reset.</p>
  *
+ * <p><b>Per-dimension.</b> All state lives in a {@link State} per {@code ServerLevel} (keyed by
+ * {@link ResourceKey} and, for the hot {@code updateFutures} path, by {@link ChunkMap} identity). Positions
+ * are dimension-agnostic, so a single global set would treat an overworld proxy (x,z) as a proxy in the
+ * nether/end. Every method that touches a position therefore takes the level (or resolves it from the
+ * {@link ChunkMap}/{@link Level} in scope).</p>
+ *
  * <p>All state is touched on the server thread (the probe callback is queued and drained from the tick).</p>
  */
 public final class ProxyChunkGate {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.gate");
 
-    private static ServerLevel level;
-    private static ChunkMap chunkMap;
+    /** wall-time budget for draining classification completions each tick (always runs at least one). */
+    private static final long PROBE_DRAIN_BUDGET_NANOS = 2_000_000L;
+    /** wall-time budget for draining deferred chunk resends each tick (always runs at least one). */
+    private static final long RESEND_DRAIN_BUDGET_NANOS = 1_000_000L;
+    private static final int PRUNE_INTERVAL_TICKS = 200;
+    /** prune tracked positions only once a set exceeds this, so the scan cost is bounded. */
+    private static final int PRUNE_THRESHOLD = 8192;
+    /** a position farther than this (chunks) from every player and not loaded may be forgotten. */
+    private static final int PRUNE_DISTANCE = 96;
+    /** cap on entries examined per set per prune, so a large set cannot stall the tick. */
+    private static final int PRUNE_SCAN_CAP = 16_384;
+    private static final long[] NO_CENTERS = new long[0];
+
+    private static final Map<ResourceKey<Level>, State> STATES = new HashMap<>();
+    /** {@code ChunkMap} identity -> state, for the hot {@code ChunkHolder.updateFutures} dispatch. */
+    private static final Map<ChunkMap, State> BY_CHUNK_MAP = new HashMap<>();
+
     private static MinecraftServer server;
     private static boolean active;
     /** bisect switch: when off, nothing is gated and reads fall through to vanilla (vanilla generation). */
@@ -64,69 +90,75 @@ public final class ProxyChunkGate {
     /** bisect switch: when off, promotion still runs but the manual chunk packet resend is skipped. */
     private static boolean resendEnabled = true;
 
-    /** adaptive: when true the gate applies globally (the server is struggling). */
-    private static boolean enforcing;
-    /** adaptive: when false the gate behaves as always-on (legacy behaviour). */
-    private static boolean adaptiveEnabled = true;
-    /** opt-in / opt-out player chunk centres (packed longs) and the zone radius, refreshed each tick. */
-    private static long[] optInCenters = new long[0];
-    private static long[] optOutCenters = new long[0];
-    private static int zoneRadius;
-
-    /** promotion allow-list: the only positions permitted to create their own FULL task. */
-    private static final LongOpenHashSet allowed = new LongOpenHashSet();
-    /** positions confirmed disk-FULL this session: vanilla prepare runs, never gated. */
-    private static final LongOpenHashSet real = new LongOpenHashSet();
-    /** positions confirmed non-FULL: gated until promoted. */
-    private static final LongOpenHashSet proxy = new LongOpenHashSet();
-    /** positions with an EMPTY classification probe in flight. */
-    private static final LongOpenHashSet probing = new LongOpenHashSet();
-
-    /** in-memory read-only placeholders handed to chunk reads while the proxy is active. */
-    private static final Long2ObjectOpenHashMap<EmptyLevelChunk> placeholders = new Long2ObjectOpenHashMap<>();
     private static net.minecraft.core.Registry<Biome> biomeRegistry;
     private static Holder<Biome> fallbackBiome;
-
-    /** classification completions that must not run inline inside {@code updateFutures}. */
-    private static final ConcurrentLinkedQueue<Runnable> deferred = new ConcurrentLinkedQueue<>();
-
-    private static int pruneTicks;
 
     private ProxyChunkGate() {
     }
 
-    public static void init(ServerLevel overworld) {
-        level = overworld;
-        chunkMap = overworld.getChunkSource().chunkMap;
-        server = overworld.getServer();
-        biomeRegistry = overworld.registryAccess().registryOrThrow(Registries.BIOME);
-        fallbackBiome = biomeRegistry.getHolderOrThrow(Biomes.PLAINS);
-        allowed.clear();
-        real.clear();
-        proxy.clear();
-        probing.clear();
-        placeholders.clear();
-        deferred.clear();
+    /** per-{@code ServerLevel} gate state. */
+    private static final class State {
+        final ServerLevel level;
+        final ChunkMap chunkMap;
+        /** promotion allow-list: the only positions permitted to create their own FULL task. */
+        final LongOpenHashSet allowed = new LongOpenHashSet();
+        /** positions confirmed disk-FULL this session: vanilla prepare runs, never gated. */
+        final LongOpenHashSet real = new LongOpenHashSet();
+        /** positions confirmed non-FULL: gated until promoted. */
+        final LongOpenHashSet proxy = new LongOpenHashSet();
+        /** positions with an EMPTY classification probe in flight. */
+        final LongOpenHashSet probing = new LongOpenHashSet();
+        /** in-memory read-only placeholders handed to chunk reads while the proxy is active. */
+        final Long2ObjectOpenHashMap<EmptyLevelChunk> placeholders = new Long2ObjectOpenHashMap<>();
+        /** classification completions that must not run inline inside {@code updateFutures}. */
+        final ConcurrentLinkedQueue<Runnable> deferred = new ConcurrentLinkedQueue<>();
+        /** promoted chunks whose client resend is deferred off the promotion callback. */
+        final ArrayDeque<ChunkPos> resendQueue = new ArrayDeque<>();
+        /** cheap fast-bail flag: true once any position in this level was classified a proxy. */
+        volatile boolean anyProxy;
+
+        // adaptive zone state, pushed per level each tick by AdaptiveMode.
+        boolean enforcing;
+        long[] optInCenters = NO_CENTERS;
+        long[] optOutCenters = NO_CENTERS;
+        int zoneRadius;
+        boolean adaptiveEnabled = true;
+
+        int pruneTicks;
+
+        State(ServerLevel level) {
+            this.level = level;
+            this.chunkMap = level.getChunkSource().chunkMap;
+        }
+    }
+
+    /** installs the gate for one level (called from {@link ProxyStreamer#init} for every noise-based level). */
+    public static void init(ServerLevel lvl) {
         active = true;
+        server = lvl.getServer();
+        biomeRegistry = lvl.registryAccess().registryOrThrow(Registries.BIOME);
+        fallbackBiome = biomeRegistry.getHolderOrThrow(Biomes.PLAINS);
         gateEnabled = AeroGelConfig.CFG.gateEnabled.get();
         resendEnabled = AeroGelConfig.CFG.resendEnabled.get();
+        State state = new State(lvl);
+        STATES.put(lvl.dimension(), state);
+        BY_CHUNK_MAP.put(state.chunkMap, state);
     }
 
     public static void shutdown() {
         active = false;
-        level = null;
-        chunkMap = null;
+        STATES.clear();
+        BY_CHUNK_MAP.clear();
         server = null;
-        allowed.clear();
-        real.clear();
-        proxy.clear();
-        probing.clear();
-        placeholders.clear();
-        deferred.clear();
     }
 
     public static boolean isActive() {
         return active && gateEnabled;
+    }
+
+    /** true when this level has an installed gate. */
+    public static boolean isActive(ServerLevel lvl) {
+        return active && gateEnabled && state(lvl) != null;
     }
 
     public static boolean gateEnabled() {
@@ -149,17 +181,42 @@ public final class ProxyChunkGate {
         AeroGelConfig.SPEC.save();
     }
 
-    /** refresh the adaptive zone state; called from {@link AdaptiveMode} each tick. */
-    public static void setAdaptive(boolean enforcingNow, long[] optIn, long[] optOut, int radius, boolean enabled) {
-        enforcing = enforcingNow;
-        optInCenters = optIn;
-        optOutCenters = optOut;
-        zoneRadius = radius;
-        adaptiveEnabled = enabled;
+    private static State state(Level lvl) {
+        return lvl == null ? null : STATES.get(lvl.dimension());
     }
 
-    public static boolean isEnforcing() {
-        return enforcing;
+    private static State state(ServerLevel lvl) {
+        return lvl == null ? null : STATES.get(lvl.dimension());
+    }
+
+    /** refresh one level's adaptive zone state; called from {@link AdaptiveMode} each tick. */
+    public static void setAdaptive(ServerLevel lvl, boolean enforcingNow, long[] optIn, long[] optOut,
+        int radius, boolean enabled) {
+        State state = state(lvl);
+        if (state == null) {
+            return;
+        }
+        state.enforcing = enforcingNow;
+        state.optInCenters = optIn;
+        state.optOutCenters = optOut;
+        state.zoneRadius = radius;
+        state.adaptiveEnabled = enabled;
+    }
+
+    /** set the global enforcement/adaptive state on every installed level (headless probe hook). */
+    public static void setAdaptiveAll(boolean enforcingNow, boolean enabled) {
+        for (State state : STATES.values()) {
+            state.enforcing = enforcingNow;
+            state.optInCenters = NO_CENTERS;
+            state.optOutCenters = NO_CENTERS;
+            state.zoneRadius = 0;
+            state.adaptiveEnabled = enabled;
+        }
+    }
+
+    public static boolean isEnforcing(ServerLevel lvl) {
+        State state = state(lvl);
+        return state != null && state.enforcing;
     }
 
     /**
@@ -167,107 +224,140 @@ public final class ProxyChunkGate {
      * server is enforcing this is global; otherwise it is the union of opt-in player zones minus opt-out
      * player zones (generation is shared, so an opted-out player forces vanilla locally).
      */
-    public static boolean isEngaged(long pos) {
-        if (!active || !gateEnabled) {
+    public static boolean isEngaged(ServerLevel lvl, long pos) {
+        return isEngaged(state(lvl), pos);
+    }
+
+    private static boolean isEngaged(State state, long pos) {
+        if (!active || !gateEnabled || state == null) {
             return false;
         }
-        if (!adaptiveEnabled || enforcing) {
+        if (!state.adaptiveEnabled || state.enforcing) {
             return true;
         }
         int x = ChunkPos.getX(pos);
         int z = ChunkPos.getZ(pos);
-        return nearAny(optInCenters, x, z) && !nearAny(optOutCenters, x, z);
+        return nearAny(state.optInCenters, x, z, state.zoneRadius)
+            && !nearAny(state.optOutCenters, x, z, state.zoneRadius);
     }
 
-    private static boolean nearAny(long[] centers, int x, int z) {
+    private static boolean nearAny(long[] centers, int x, int z, int radius) {
         for (long center : centers) {
             int dx = Math.abs(ChunkPos.getX(center) - x);
             int dz = Math.abs(ChunkPos.getZ(center) - z);
-            if (Math.max(dx, dz) <= zoneRadius) {
+            if (Math.max(dx, dz) <= radius) {
                 return true;
             }
         }
         return false;
     }
 
-    /** true when the position must NOT build its own FULL future (engaged and not promoted/known-real). */
-    public static boolean isGated(long pos) {
-        return isEngaged(pos) && !allowed.contains(pos) && !real.contains(pos);
-    }
-
-    /** true when vanilla may load/generate this position (promoted, or a known disk-FULL chunk). */
-    public static boolean isRealOrAllowed(long pos) {
-        return allowed.contains(pos) || real.contains(pos);
-    }
-
-    /** true while the position is a proxy placeholder (engaged, or a leftover from a previous engaged period). */
-    public static boolean isProxy(long pos) {
-        if (!active || allowed.contains(pos) || real.contains(pos)) {
+    /**
+     * Cheap per-level fast bail for the hot read/write/fluid paths: true when this level could possibly have
+     * a proxy (or is engaged and may create one). Does not touch any position, so it is safe before the
+     * expensive classification chain.
+     */
+    public static boolean mayHaveProxy(ServerLevel lvl) {
+        State state = state(lvl);
+        if (state == null || !active || !gateEnabled) {
             return false;
         }
-        if (loadedNow(pos)) {
-            return false; // a vanilla-loaded chunk is real regardless of classification
+        if (state.anyProxy) {
+            return true;
         }
-        return isEngaged(pos) || proxy.contains(pos);
+        if (!state.adaptiveEnabled || state.enforcing) {
+            return true;
+        }
+        return state.optInCenters.length > 0;
     }
 
-    private static boolean loadedNow(long pos) {
-        return level != null
-            && level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos)) != null;
+    /** true when the position must NOT build its own FULL future (engaged and not promoted/known-real). */
+    public static boolean isGated(ServerLevel lvl, long pos) {
+        return isGated(state(lvl), pos);
+    }
+
+    /** dispatch for the {@code updateFutures} redirects, which only have the {@link ChunkMap}. */
+    public static boolean isGated(ChunkMap chunkMap, long pos) {
+        return isGated(BY_CHUNK_MAP.get(chunkMap), pos);
+    }
+
+    private static boolean isGated(State state, long pos) {
+        return isEngaged(state, pos)
+            && !state.allowed.contains(pos)
+            && !state.real.contains(pos);
+    }
+
+    /**
+     * true while the position is a proxy placeholder (engaged, or a leftover from a previous engaged period).
+     * Cheap set lookups run before the {@code loadedNow} query so a dormant level costs only two set probes.
+     */
+    public static boolean isProxy(ServerLevel lvl, long pos) {
+        State state = state(lvl);
+        if (state == null || !active || state.allowed.contains(pos) || state.real.contains(pos)) {
+            return false;
+        }
+        boolean engaged = isEngaged(state, pos);
+        if (!engaged && !state.proxy.contains(pos)) {
+            return false; // cheap: no loadedNow() needed
+        }
+        if (loadedNow(state, pos)) {
+            return false; // a vanilla-loaded chunk is real regardless of classification
+        }
+        return true;
+    }
+
+    private static boolean loadedNow(State state, long pos) {
+        return state != null
+            && state.level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos)) != null;
     }
 
     /** true when vanilla has this position loaded as a real chunk (the client gets it from vanilla). */
-    public static boolean isLoadedReal(long pos) {
-        return loadedNow(pos);
-    }
-
-    /** true while any chunk is classified as a proxy (used to skip idle work). */
-    public static boolean hasProxies() {
-        return !proxy.isEmpty();
-    }
-
-    public static boolean isAllowed(long pos) {
-        return allowed.contains(pos);
+    public static boolean isLoadedReal(ServerLevel lvl, long pos) {
+        return loadedNow(state(lvl), pos);
     }
 
     // ---- classification ----
 
     /** called at {@code ChunkHolder.updateFutures} HEAD on the server thread. */
     public static void onUpdateFutures(ChunkHolder holder, ChunkMap map) {
-        if (!active) {
+        State state = BY_CHUNK_MAP.get(map);
+        if (!active || state == null) {
             return;
         }
         long pos = holder.getPos().toLong();
-        if (!isEngaged(pos)) {
+        if (!isEngaged(state, pos)) {
             return; // gate off here: let vanilla build the FULL future
         }
-        if (allowed.contains(pos) || real.contains(pos) || proxy.contains(pos) || probing.contains(pos)) {
+        if (state.allowed.contains(pos) || state.real.contains(pos)
+            || state.proxy.contains(pos) || state.probing.contains(pos)) {
             return;
         }
-        probing.add(pos);
+        state.probing.add(pos);
         CompletableFuture<ChunkResult<ChunkAccess>> future;
         try {
             future = holder.scheduleChunkGenerationTask(ChunkStatus.EMPTY, map);
         } catch (Throwable t) {
             LOGGER.error("proxy classification probe failed to schedule for {}", holder.getPos(), t);
-            probing.remove(pos);
-            proxy.add(pos);
+            state.probing.remove(pos);
+            state.proxy.add(pos);
+            state.anyProxy = true;
             return;
         }
-        future.whenComplete((result, error) -> deferred.add(() -> finishProbe(pos, holder, map)));
+        future.whenComplete((result, error) -> state.deferred.add(() -> finishProbe(state, pos, holder, map)));
     }
 
-    private static void finishProbe(long pos, ChunkHolder holder, ChunkMap map) {
-        probing.remove(pos);
-        if (!active || !isEngaged(pos)) {
+    private static void finishProbe(State state, long pos, ChunkHolder holder, ChunkMap map) {
+        state.probing.remove(pos);
+        if (!active || !isEngaged(state, pos)) {
             return; // disengaged while the probe was in flight: leave it unclassified
         }
         ChunkStatus persisted = holder.getPersistedStatus();
         if (persisted != null && persisted.isOrAfter(ChunkStatus.FULL)) {
-            real.add(pos);
+            state.real.add(pos);
             forcePrepare(holder, map);
         } else {
-            proxy.add(pos);
+            state.proxy.add(pos);
+            state.anyProxy = true;
         }
     }
 
@@ -290,32 +380,45 @@ public final class ProxyChunkGate {
 
     // ---- promotion ----
 
-    /** manual promotion entry point ({@code /aerogel generate}). */
+    /** manual promotion entry point ({@code /aerogel generate}); may block on a missing holder. */
     public static boolean promote(ServerLevel lvl, ChunkPos pos) {
-        return promote(lvl, pos, null);
+        return promote(lvl, pos, null, true);
     }
 
     /**
      * Promotion = "stop blocking". Add the position to the allow-list and force its FULL future; the chunk
      * generates forward from whatever status it already reached (no backwards reset). {@code onComplete} runs
-     * on the server thread once the vanilla pipeline has finished (or failed).
+     * on the server thread once the vanilla pipeline has finished (or failed). The caller
+     * ({@link PromotionManager}) pre-checks the holder, so this never blocks.
      */
     public static boolean promote(ServerLevel lvl, ChunkPos pos, Runnable onComplete) {
-        if (!active || lvl != level) {
+        return promote(lvl, pos, onComplete, false);
+    }
+
+    private static boolean promote(ServerLevel lvl, ChunkPos pos, Runnable onComplete, boolean manual) {
+        State state = state(lvl);
+        if (!active || state == null) {
             return false;
         }
         long p = pos.toLong();
-        allowed.add(p);
-        proxy.remove(p);
-        ChunkHolder holder = chunkMap.getVisibleChunkIfPresent(p);
+        state.allowed.add(p);
+        state.proxy.remove(p);
+        state.anyProxy = !state.proxy.isEmpty();
+        ChunkHolder holder = state.chunkMap.getVisibleChunkIfPresent(p);
         if (holder == null) {
-            lvl.getChunk(pos.x, pos.z);
-            if (onComplete != null) {
-                onComplete.run();
+            if (manual) {
+                lvl.getChunk(pos.x, pos.z);
+                if (onComplete != null) {
+                    onComplete.run();
+                }
+                return true;
             }
-            return true;
+            // non-manual callers pre-check the holder; a miss means it unloaded between check and promote.
+            state.allowed.remove(p);
+            LOGGER.warn("promotion holder missing for {} in {}; leaving it gated", pos, lvl.dimension().location());
+            return false;
         }
-        forcePrepare(holder, chunkMap);
+        forcePrepare(holder, state.chunkMap);
         holder.getFullChunkFuture().whenComplete((result, error) -> server.execute(() -> {
             try {
                 if (error != null) {
@@ -324,7 +427,9 @@ public final class ProxyChunkGate {
                 }
                 pushOutOfTerrain(lvl, pos);
                 if (resendEnabled) {
-                    resend(lvl, pos);
+                    // deferred: building the full chunk packet + propagating light is unbudgeted work and
+                    // must not run inside the promotion callback (see ProxyChunkGate.tick).
+                    state.resendQueue.add(pos);
                 }
                 LOGGER.info("promoted proxy chunk {} to real terrain (vanilla pipeline)", pos);
             } catch (Throwable t) {
@@ -388,64 +493,165 @@ public final class ProxyChunkGate {
     // ---- placeholder ----
 
     /** read-only void-air placeholder for a proxy position (cached; carries the sampled biome for F3). */
-    public static ChunkAccess placeholder(net.minecraft.world.level.Level lvl, int x, int z) {
+    public static ChunkAccess placeholder(Level lvl, int x, int z) {
+        State state = state(lvl);
         long pos = ChunkPos.asLong(x, z);
-        EmptyLevelChunk chunk = placeholders.get(pos);
+        if (state == null) {
+            return new EmptyLevelChunk(lvl, new ChunkPos(x, z), fallbackBiome);
+        }
+        EmptyLevelChunk chunk = state.placeholders.get(pos);
         if (chunk == null) {
-            chunk = new EmptyLevelChunk(lvl, new ChunkPos(x, z), biomeFor(pos));
-            placeholders.put(pos, chunk);
+            chunk = new EmptyLevelChunk(lvl, new ChunkPos(x, z), biomeFor(lvl, pos));
+            state.placeholders.put(pos, chunk);
         }
         return chunk;
     }
 
-    private static Holder<Biome> biomeFor(long pos) {
-        Holder<Biome> holder = ProxyStreamer.biomeHolder(pos);
+    private static Holder<Biome> biomeFor(Level lvl, long pos) {
+        if (!(lvl instanceof ServerLevel serverLevel)) {
+            return fallbackBiome;
+        }
+        Holder<Biome> holder = ProxyStreamer.biomeHolder(serverLevel, pos);
         return holder != null ? holder : fallbackBiome;
     }
 
     // ---- tick ----
 
-    /** drain classification completions and prune the placeholder cache; called from the server tick. */
+    /** drain classification completions/resends and prune the per-level caches; called from the server tick. */
     public static void tick(MinecraftServer srv) {
         if (!active) {
             return;
         }
-        Runnable task;
-        int drained = 0;
-        while (drained++ < 4096 && (task = deferred.poll()) != null) {
-            task.run();
-        }
-        if (++pruneTicks % 200 == 0) {
-            prunePlaceholders(srv);
+        drainDeferred(srv);
+        drainResends(srv);
+        for (State state : STATES.values()) {
+            if (++state.pruneTicks % PRUNE_INTERVAL_TICKS == 0) {
+                prunePlaceholders(srv, state);
+                pruneSets(srv, state);
+            }
         }
     }
 
-    private static void prunePlaceholders(MinecraftServer srv) {
-        if (placeholders.isEmpty()) {
+    /**
+     * Time-budgeted drain of classification completions. A burst of disk-FULL probes each run
+     * {@code forcePrepare -> updateFutures}; the old raw 4096 cap could stall a tick. Always runs at least
+     * one task so progress is never starved.
+     */
+    private static void drainDeferred(MinecraftServer srv) {
+        long deadline = System.nanoTime() + PROBE_DRAIN_BUDGET_NANOS;
+        boolean ran = false;
+        for (State state : STATES.values()) {
+            Runnable task;
+            while ((task = state.deferred.poll()) != null) {
+                task.run();
+                ran = true;
+                if (System.nanoTime() >= deadline) {
+                    break;
+                }
+            }
+            if (ran && System.nanoTime() >= deadline) {
+                break;
+            }
+        }
+    }
+
+    /** Time-budgeted drain of deferred chunk resends (see {@link #resend}). */
+    private static void drainResends(MinecraftServer srv) {
+        if (!resendEnabled) {
+            for (State state : STATES.values()) {
+                state.resendQueue.clear();
+            }
             return;
         }
+        long deadline = System.nanoTime() + RESEND_DRAIN_BUDGET_NANOS;
+        boolean ran = false;
+        for (State state : STATES.values()) {
+            ChunkPos pos;
+            while ((pos = state.resendQueue.poll()) != null) {
+                resend(state.level, pos);
+                ran = true;
+                if (System.nanoTime() >= deadline) {
+                    break;
+                }
+            }
+            if (ran && System.nanoTime() >= deadline) {
+                break;
+            }
+        }
+    }
+
+    private static void prunePlaceholders(MinecraftServer srv, State state) {
+        if (state.placeholders.isEmpty()) {
+            return;
+        }
+        List<ChunkPos> centers = playerCenters(srv, state.level);
+        int margin = ProxyStreamer.radius() + 4;
+        var it = state.placeholders.long2ObjectEntrySet().iterator();
+        while (it.hasNext()) {
+            long pos = it.next().getLongKey();
+            if (!nearAnyCenter(centers, pos, margin)) {
+                it.remove();
+            }
+        }
+    }
+
+    /**
+     * Bounded pruning of the tracked sets. Without this a long session grows {@code real}/{@code allowed}/
+     * {@code proxy} forever. We only drop positions that are (a) not currently loaded and (b) farther than
+     * {@link #PRUNE_DISTANCE} from every player in the level, so an active chunk is never forgotten. Runs
+     * only when a set exceeds {@link #PRUNE_THRESHOLD} so the scan stays cheap. {@code anyProxy} is
+     * recomputed after the proxy set shrinks.
+     */
+    private static void pruneSets(MinecraftServer srv, State state) {
+        if (state.proxy.size() <= PRUNE_THRESHOLD
+            && state.real.size() <= PRUNE_THRESHOLD
+            && state.allowed.size() <= PRUNE_THRESHOLD) {
+            return;
+        }
+        List<ChunkPos> centers = playerCenters(srv, state.level);
+        pruneSet(state.real, state, centers);
+        pruneSet(state.allowed, state, centers);
+        if (pruneSet(state.proxy, state, centers)) {
+            state.anyProxy = !state.proxy.isEmpty();
+        }
+    }
+
+    private static boolean pruneSet(LongOpenHashSet set, State state, List<ChunkPos> centers) {
+        if (set.isEmpty()) {
+            return false;
+        }
+        boolean removed = false;
+        int scanned = 0;
+        var it = set.iterator();
+        while (it.hasNext() && scanned++ < PRUNE_SCAN_CAP) {
+            long pos = it.nextLong();
+            if (loadedNow(state, pos) || nearAnyCenter(centers, pos, PRUNE_DISTANCE)) {
+                continue;
+            }
+            it.remove();
+            removed = true;
+        }
+        return removed;
+    }
+
+    private static List<ChunkPos> playerCenters(MinecraftServer srv, ServerLevel level) {
         List<ChunkPos> centers = new ArrayList<>();
         for (ServerPlayer player : srv.getPlayerList().getPlayers()) {
             if (player.level() == level && !player.hasDisconnected()) {
                 centers.add(player.chunkPosition());
             }
         }
-        int margin = ProxyStreamer.radius() + 4;
-        var it = placeholders.long2ObjectEntrySet().iterator();
-        while (it.hasNext()) {
-            long pos = it.next().getLongKey();
-            boolean keep = false;
-            for (ChunkPos center : centers) {
-                int dx = ChunkPos.getX(pos) - center.x;
-                int dz = ChunkPos.getZ(pos) - center.z;
-                if (Math.max(Math.abs(dx), Math.abs(dz)) <= margin) {
-                    keep = true;
-                    break;
-                }
-            }
-            if (!keep) {
-                it.remove();
+        return centers;
+    }
+
+    private static boolean nearAnyCenter(List<ChunkPos> centers, long pos, int margin) {
+        int x = ChunkPos.getX(pos);
+        int z = ChunkPos.getZ(pos);
+        for (ChunkPos center : centers) {
+            if (Math.max(Math.abs(x - center.x), Math.abs(z - center.z)) <= margin) {
+                return true;
             }
         }
+        return false;
     }
 }

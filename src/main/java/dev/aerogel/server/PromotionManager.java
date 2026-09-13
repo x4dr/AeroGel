@@ -6,8 +6,11 @@ import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ChunkLevel;
 import net.minecraft.server.level.ChunkMap;
@@ -15,6 +18,7 @@ import net.minecraft.server.level.FullChunkStatus;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import org.slf4j.Logger;
@@ -41,6 +45,10 @@ import org.slf4j.LoggerFactory;
  * check and the hard gate but still debit the bucket, slowing ordinary promotion down. {@code maxInFlight}
  * bounds how many regenerations run concurrently for every class.</p>
  *
+ * <p><b>Per-dimension.</b> The queue/linger/budget state lives in a {@link State} per {@code ServerLevel};
+ * scalar config stays global. Every method resolves the state from the {@link ServerLevel} in scope, so an
+ * overworld position is never treated as a proxy in the nether/end.</p>
+ *
  * <p>All state is touched on the server thread (tick / player-tick / block-write events).</p>
  */
 public final class PromotionManager {
@@ -56,7 +64,7 @@ public final class PromotionManager {
     private static final int MAX_RANGE = 64;
     private static final byte NO_DISTANCE = (byte) 127;
 
-    private static ServerLevel level;
+    private static final Map<ResourceKey<Level>, State> STATES = new HashMap<>();
 
     private static int maxRange = -1;
     private static int lingerMinIdleTicks = 200;
@@ -72,34 +80,39 @@ public final class PromotionManager {
     private static double idleTickMs = 10.0;
     private static double busyTickMs = 45.0;
     private static boolean enabled = true;
-
-    /** chunk -> ticks of accumulated player proximity; seen = last tick it was occupied. */
-    private static final Long2IntOpenHashMap lingerTicks = new Long2IntOpenHashMap();
-    private static final Long2IntOpenHashMap lingerSeen = new Long2IntOpenHashMap();
-    /** per-tick scratch: chunk -> minimum Chebyshev distance to an opt-in player (this tick only). */
-    private static final Long2ByteOpenHashMap occupied = new Long2ByteOpenHashMap();
-    /** queued chunks awaiting a free slot, keyed by chunk pos. */
-    private static final Long2ObjectOpenHashMap<Promotion> queue = new Long2ObjectOpenHashMap<>();
-    /** chunks handed to {@link ProxyChunkGate#promote} whose completion callback has not fired yet. */
-    private static final LongOpenHashSet inFlight = new LongOpenHashSet();
-    /** chunk -> writes cancelled while it was a proxy, to be replayed once it is real. */
-    private static final Long2ObjectOpenHashMap<List<DeferredWrite>> deferredWrites = new Long2ObjectOpenHashMap<>();
-
-    /** generation-time budget in ms (may go negative when immediate work overspends it). */
-    private static double budgetMs;
-    private static long lastRefillNanos;
-    private static int tickCounter;
     private static long lastStatusLog;
 
-    static {
-        occupied.defaultReturnValue(NO_DISTANCE);
+    /** per-{@code ServerLevel} promotion state. */
+    private static final class State {
+        final ServerLevel level;
+        /** chunk -> ticks of accumulated player proximity; seen = last tick it was occupied. */
+        final Long2IntOpenHashMap lingerTicks = new Long2IntOpenHashMap();
+        final Long2IntOpenHashMap lingerSeen = new Long2IntOpenHashMap();
+        /** per-tick scratch: chunk -> minimum Chebyshev distance to an opt-in player (this tick only). */
+        final Long2ByteOpenHashMap occupied = new Long2ByteOpenHashMap();
+        /** queued chunks awaiting a free slot, keyed by chunk pos. */
+        final Long2ObjectOpenHashMap<Promotion> queue = new Long2ObjectOpenHashMap<>();
+        /** chunks handed to {@link ProxyChunkGate#promote} whose completion callback has not fired yet. */
+        final LongOpenHashSet inFlight = new LongOpenHashSet();
+        /** chunk -> writes cancelled while it was a proxy, to be replayed once it is real. */
+        final Long2ObjectOpenHashMap<List<DeferredWrite>> deferredWrites = new Long2ObjectOpenHashMap<>();
+
+        /** generation-time budget in ms (may go negative when immediate work overspends it). */
+        double budgetMs;
+        long lastRefillNanos;
+        int tickCounter;
+
+        State(ServerLevel level) {
+            this.level = level;
+            occupied.defaultReturnValue(NO_DISTANCE);
+            this.budgetMs = burstMs;
+        }
     }
 
     private PromotionManager() {
     }
 
-    public static void init(ServerLevel overworld) {
-        level = overworld;
+    public static void init(ServerLevel lvl) {
         AeroGelConfig cfg = AeroGelConfig.CFG;
         enabled = cfg.promotionEnabled.get();
         maxRange = cfg.maxRange.get();
@@ -115,24 +128,25 @@ public final class PromotionManager {
         hardGateMs = cfg.hardGateMs.get();
         idleTickMs = cfg.idleTickMs.get();
         busyTickMs = cfg.busyTickMs.get();
-        budgetMs = burstMs;
-        lastRefillNanos = 0L;
-        tickCounter = 0;
-        LOGGER.info("promotion active: linger {}..{}s (idle) / {}..{}s (busy) out to {} chunks, "
+        STATES.put(lvl.dimension(), new State(lvl));
+        LOGGER.info("promotion active for {}: linger {}..{}s (idle) / {}..{}s (busy) out to {} chunks, "
                 + "landing {} blocks, concurrency {}, budget {} ms/s, cost {} ms",
+            lvl.dimension().location(),
             lingerMinIdleTicks / 20, lingerMaxIdleTicks / 20, lingerMinBusyTicks / 20, lingerMaxBusyTicks / 20,
-            effectiveMaxRange(overworld.getServer()), landingMargin, maxInFlight,
+            effectiveMaxRange(lvl.getServer()), landingMargin, maxInFlight,
             (int) (maxGenFraction * 1000), chunkCostMs);
     }
 
     public static void shutdown() {
-        level = null;
-        queue.clear();
-        inFlight.clear();
-        deferredWrites.clear();
-        lingerTicks.clear();
-        lingerSeen.clear();
-        occupied.clear();
+        STATES.clear();
+    }
+
+    private static State state(Level lvl) {
+        return lvl == null ? null : STATES.get(lvl.dimension());
+    }
+
+    private static State state(ServerLevel lvl) {
+        return lvl == null ? null : STATES.get(lvl.dimension());
     }
 
     // ---- tuning (each setter persists to the COMMON config) ----
@@ -244,9 +258,14 @@ public final class PromotionManager {
         return Math.min(view + FULL_SLACK, MAX_RANGE);
     }
 
-    /** true while any chunk is mid-linger (adaptive enforcement must not stop while this is non-empty). */
+    /** true while any chunk in any dimension is mid-linger (adaptive enforcement must not stop). */
     public static boolean hasLinger() {
-        return !lingerTicks.isEmpty();
+        for (State state : STATES.values()) {
+            if (!state.lingerTicks.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** effective linger threshold in ticks at distance {@code distance} and the current load. */
@@ -260,10 +279,16 @@ public final class PromotionManager {
 
     public static String status(MinecraftServer server, float tickMs) {
         int range = effectiveMaxRange(server);
+        int queued = 0;
         int urgent = 0;
-        for (Promotion promotion : queue.values()) {
-            if (promotion.urgent) {
-                urgent++;
+        int inFlight = 0;
+        for (State state : STATES.values()) {
+            queued += state.queue.size();
+            inFlight += state.inFlight.size();
+            for (Promotion promotion : state.queue.values()) {
+                if (promotion.urgent) {
+                    urgent++;
+                }
             }
         }
         return "promote: " + (enabled ? "on" : "off")
@@ -272,9 +297,16 @@ public final class PromotionManager {
             + " (now d0 " + fmt(thresholdTicks(0, range, tickMs) / 20.0) + "s, d" + range + " "
             + fmt(thresholdTicks(range, range, tickMs) / 20.0) + "s @ " + fmt(tickMs) + " ms)"
             + ", landing " + fmt(landingMargin) + " blocks"
-            + ", concurrency " + maxInFlight + ", budget " + fmt(budgetMs) + "/" + (int) (maxGenFraction * 1000) + " ms/s"
+            + ", concurrency " + maxInFlight + ", budget " + fmt(budgetOfFirst()) + "/" + (int) (maxGenFraction * 1000) + " ms/s"
             + ", cost " + fmt(chunkCostMs) + " ms, hard gate " + fmt(hardGateMs) + " ms"
-            + ", queued " + queue.size() + " (" + urgent + " immediate), in flight " + inFlight.size();
+            + ", queued " + queued + " (" + urgent + " immediate), in flight " + inFlight;
+    }
+
+    private static double budgetOfFirst() {
+        for (State state : STATES.values()) {
+            return state.budgetMs;
+        }
+        return 0.0;
     }
 
     private static String fmt(double value) {
@@ -284,44 +316,47 @@ public final class PromotionManager {
     // ---- tick ----
 
     public static void tick(MinecraftServer server) {
-        if (level == null) {
-            return;
+        for (State state : STATES.values()) {
+            tickState(server, state);
         }
-        tickCounter++;
+    }
+
+    private static void tickState(MinecraftServer server, State state) {
+        state.tickCounter++;
         if (!enabled) {
-            if (tickCounter % 100 == 0) {
-                pruneLinger();
+            if (state.tickCounter % 100 == 0) {
+                pruneLinger(state);
             }
             return;
         }
         float tickMs = server.getCurrentSmoothedTickTime();
-        List<ServerPlayer> players = overworldPlayers(server);
-        refillBudget();
+        List<ServerPlayer> players = levelPlayers(server, state.level);
+        refillBudget(state);
         if (!players.isEmpty()) {
-            accumulateLinger(players, server, tickMs);
+            accumulateLinger(state, players, server, tickMs);
         }
-        if (tickCounter % 100 == 0) {
-            pruneLinger();
+        if (state.tickCounter % 100 == 0) {
+            pruneLinger(state);
             if (System.currentTimeMillis() - lastStatusLog > 30_000) {
                 lastStatusLog = System.currentTimeMillis();
                 LOGGER.info(status(server, tickMs));
             }
         }
-        processQueue(players, tickMs);
+        processQueue(state, players, tickMs);
     }
 
-    private static void refillBudget() {
+    private static void refillBudget(State state) {
         long now = System.nanoTime();
-        if (lastRefillNanos == 0L) {
-            lastRefillNanos = now;
+        if (state.lastRefillNanos == 0L) {
+            state.lastRefillNanos = now;
             return;
         }
-        double elapsedMs = (now - lastRefillNanos) / 1_000_000.0;
-        lastRefillNanos = now;
-        budgetMs = Math.min(burstMs, budgetMs + elapsedMs * maxGenFraction);
+        double elapsedMs = (now - state.lastRefillNanos) / 1_000_000.0;
+        state.lastRefillNanos = now;
+        state.budgetMs = Math.min(burstMs, state.budgetMs + elapsedMs * maxGenFraction);
     }
 
-    private static List<ServerPlayer> overworldPlayers(MinecraftServer server) {
+    private static List<ServerPlayer> levelPlayers(MinecraftServer server, ServerLevel level) {
         List<ServerPlayer> players = new ArrayList<>();
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             if (player.level() == level && !player.hasDisconnected()) {
@@ -335,10 +370,10 @@ public final class PromotionManager {
      * One pass over the range of every player. Opt-in players (or everyone while the server is enforcing)
      * accrue linger; opted-out players instead force their nearby leftovers to real terrain.
      */
-    private static void accumulateLinger(List<ServerPlayer> players, MinecraftServer server, float tickMs) {
+    private static void accumulateLinger(State state, List<ServerPlayer> players, MinecraftServer server, float tickMs) {
         int range = effectiveMaxRange(server);
         boolean enforce = AdaptiveMode.enforcing();
-        occupied.clear();
+        state.occupied.clear();
         for (ServerPlayer player : players) {
             ChunkPos center = player.chunkPosition();
             if (!enforce && !AdaptiveMode.isOptIn(player)) {
@@ -346,8 +381,8 @@ public final class PromotionManager {
                 for (int dx = -range; dx <= range; dx++) {
                     for (int dz = -range; dz <= range; dz++) {
                         long pos = ChunkPos.asLong(center.x + dx, center.z + dz);
-                        if (ProxyChunkGate.isProxy(pos)) {
-                            enqueue(pos, true);
+                        if (ProxyChunkGate.isProxy(state.level, pos)) {
+                            enqueue(state, pos, true);
                         }
                     }
                 }
@@ -356,37 +391,37 @@ public final class PromotionManager {
             for (int dx = -range; dx <= range; dx++) {
                 for (int dz = -range; dz <= range; dz++) {
                     long pos = ChunkPos.asLong(center.x + dx, center.z + dz);
-                    if (!ProxyChunkGate.isProxy(pos)) {
+                    if (!ProxyChunkGate.isProxy(state.level, pos)) {
                         continue;
                     }
                     int dist = Math.max(Math.abs(dx), Math.abs(dz));
-                    byte existing = occupied.get(pos);
+                    byte existing = state.occupied.get(pos);
                     if (dist < existing) {
-                        occupied.put(pos, (byte) dist);
+                        state.occupied.put(pos, (byte) dist);
                         if (existing == NO_DISTANCE) {
-                            lingerTicks.addTo(pos, 1);
+                            state.lingerTicks.addTo(pos, 1);
                         }
                     }
-                    lingerSeen.put(pos, tickCounter);
+                    state.lingerSeen.put(pos, state.tickCounter);
                 }
             }
         }
-        for (var entry : occupied.long2ByteEntrySet()) {
+        for (var entry : state.occupied.long2ByteEntrySet()) {
             long pos = entry.getLongKey();
             int distance = entry.getByteValue();
-            if (lingerTicks.get(pos) >= thresholdTicks(distance, range, tickMs)) {
-                enqueue(pos, false);
+            if (state.lingerTicks.get(pos) >= thresholdTicks(distance, range, tickMs)) {
+                enqueue(state, pos, false);
             }
         }
     }
 
     /** drop linger state for chunks no player has been near recently, so the maps cannot grow unbounded. */
-    private static void pruneLinger() {
-        var it = lingerSeen.long2IntEntrySet().iterator();
+    private static void pruneLinger(State state) {
+        var it = state.lingerSeen.long2IntEntrySet().iterator();
         while (it.hasNext()) {
             var entry = it.next();
-            if (tickCounter - entry.getIntValue() > LINGER_GRACE_TICKS) {
-                lingerTicks.remove(entry.getLongKey());
+            if (state.tickCounter - entry.getIntValue() > LINGER_GRACE_TICKS) {
+                state.lingerTicks.remove(entry.getLongKey());
                 it.remove();
             }
         }
@@ -394,106 +429,115 @@ public final class PromotionManager {
 
     /** touch trigger: called from the streamer's player tick once the proxy surface is known. */
     public static void onPlayerNearSurface(ServerPlayer player, long chunkPos, double surface) {
-        if (!enabled || level == null || player.level() != level || player.isSpectator()) {
+        State state = state(player.level());
+        if (!enabled || state == null || player.isSpectator()) {
             return;
         }
         if (player.getY() - surface <= landingMargin && player.getDeltaMovement().y <= 0.08) {
-            enqueue(chunkPos, true);
+            enqueue(state, chunkPos, true);
         }
     }
 
     /**
      * Runtime block-write guard. Called from {@code Level.setBlock} for every server-side write; returns
      * true when the write must be cancelled because it targets a proxy (the write is remembered and
-     * replayed after promotion).
+     * replayed after promotion). The fast bail keeps the dormant case to one state lookup + one volatile
+     * flag read.
      */
     public static boolean tryDeferWrite(ServerLevel serverLevel, BlockPos pos, BlockState state, int flags) {
-        if (!enabled || level == null || serverLevel != level) {
+        if (!enabled) {
+            return false;
+        }
+        State promotion = state(serverLevel);
+        if (promotion == null || !ProxyChunkGate.mayHaveProxy(serverLevel)) {
             return false;
         }
         long chunkPos = ChunkPos.asLong(pos);
-        if (!isStubTarget(chunkPos)) {
+        if (!isStubTarget(promotion, chunkPos)) {
             return false;
         }
-        List<DeferredWrite> writes = deferredWrites.computeIfAbsent(chunkPos, k -> new ArrayList<>());
+        List<DeferredWrite> writes = promotion.deferredWrites.computeIfAbsent(chunkPos, k -> new ArrayList<>());
         if (writes.size() < MAX_WRITE_LOG) {
             writes.add(new DeferredWrite(pos.immutable(), state, flags));
         } else {
             LOGGER.warn("proxy chunk {} has more than {} deferred writes; dropping the newest", new ChunkPos(chunkPos), MAX_WRITE_LOG);
         }
-        enqueue(chunkPos, true);
+        enqueue(promotion, chunkPos, true);
         return true;
     }
 
     /** true while the position is a proxy placeholder (tagged, or untagged-but-air) or mid-promotion. */
-    private static boolean isStubTarget(long chunkPos) {
-        return inFlight.contains(chunkPos) || ProxyStreamer.isProxyPlaceholder(chunkPos);
+    private static boolean isStubTarget(State state, long chunkPos) {
+        return state.inFlight.contains(chunkPos) || ProxyChunkGate.isProxy(state.level, chunkPos);
     }
 
     /** test hook: queue a chunk as if it had lingered (headless stress probe). */
-    static void debugEnqueue(long chunkPos) {
-        enqueue(chunkPos, false);
+    static void debugEnqueue(ServerLevel lvl, long chunkPos) {
+        State state = state(lvl);
+        if (state != null) {
+            enqueue(state, chunkPos, false);
+        }
     }
 
-    private static void enqueue(long chunkPos, boolean urgent) {
-        if (!enabled || inFlight.contains(chunkPos)) {
+    private static void enqueue(State state, long chunkPos, boolean urgent) {
+        if (!enabled || state.inFlight.contains(chunkPos)) {
             return;
         }
-        Promotion existing = queue.get(chunkPos);
+        Promotion existing = state.queue.get(chunkPos);
         if (existing != null) {
             existing.urgent |= urgent;
             return;
         }
-        if (!ProxyStreamer.isProxyPlaceholder(chunkPos)) {
+        if (!ProxyChunkGate.isProxy(state.level, chunkPos)) {
             return; // already real (or the proxy is inactive)
         }
-        queue.put(chunkPos, new Promotion(chunkPos, urgent));
+        state.queue.put(chunkPos, new Promotion(chunkPos, urgent));
     }
 
-    private static void processQueue(List<ServerPlayer> players, float tickMs) {
-        if (queue.isEmpty() || inFlight.size() >= maxInFlight) {
+    private static void processQueue(State state, List<ServerPlayer> players, float tickMs) {
+        if (state.queue.isEmpty() || state.inFlight.size() >= maxInFlight) {
             return;
         }
-        Promotion promotion = pickNext(players);
+        Promotion promotion = pickNext(state, players);
         if (promotion == null) {
             return; // nothing with a loaded holder; try again next tick
         }
         if (promotion.urgent) {
             // immediate work ignores the budget and the hard gate, but still debits the bucket so ordinary
             // linger promotion is slowed down by it.
-            budgetMs -= chunkCostMs;
+            state.budgetMs -= chunkCostMs;
         } else {
             if (hardGateMs > 0.0 && tickMs >= hardGateMs) {
                 return; // server already over budget: queue, do not start ordinary work
             }
-            if (budgetMs < chunkCostMs) {
+            if (state.budgetMs < chunkCostMs) {
                 return; // no generation time left this window
             }
-            budgetMs -= chunkCostMs;
+            state.budgetMs -= chunkCostMs;
         }
         long pos = promotion.pos;
-        queue.remove(pos);
-        inFlight.add(pos);
+        state.queue.remove(pos);
+        state.inFlight.add(pos);
         boolean started;
         try {
-            started = ProxyChunkGate.promote(level, new ChunkPos(pos), () -> onComplete(pos));
+            started = ProxyChunkGate.promote(state.level, new ChunkPos(pos), () -> onComplete(state, pos));
         } catch (Throwable t) {
             LOGGER.error("failed to start regeneration of proxy chunk {}", new ChunkPos(pos), t);
             started = false;
         }
         if (!started) {
-            inFlight.remove(pos);
-            budgetMs += chunkCostMs; // the promotion never ran: refund the budget
-            enqueue(pos, promotion.urgent);
+            state.inFlight.remove(pos);
+            state.budgetMs += chunkCostMs; // the promotion never ran: refund the budget
+            enqueue(state, pos, promotion.urgent);
         }
     }
 
     /** immediate first, then nearest-to-a-player (vanilla-like fan-out). */
-    private static Promotion pickNext(List<ServerPlayer> players) {
-        ChunkMap chunkMap = level.getChunkSource().chunkMap;
+    private static Promotion pickNext(State state, List<ServerPlayer> players) {
+        ChunkMap chunkMap = state.level.getChunkSource().chunkMap;
         Promotion best = null;
         int bestDist = Integer.MAX_VALUE;
-        for (Promotion promotion : queue.values()) {
+        for (Promotion promotion : state.queue.values()) {
             if (chunkMap.getVisibleChunkIfPresent(promotion.pos) == null) {
                 continue; // holder not loaded yet; leave it queued
             }
@@ -523,30 +567,30 @@ public final class PromotionManager {
         return best;
     }
 
-    private static void onComplete(long pos) {
-        inFlight.remove(pos);
-        lingerTicks.remove(pos);
-        lingerSeen.remove(pos);
-        replayWrites(pos);
+    private static void onComplete(State state, long pos) {
+        state.inFlight.remove(pos);
+        state.lingerTicks.remove(pos);
+        state.lingerSeen.remove(pos);
+        replayWrites(state, pos);
     }
 
-    private static void replayWrites(long pos) {
-        List<DeferredWrite> writes = deferredWrites.get(pos);
+    private static void replayWrites(State state, long pos) {
+        List<DeferredWrite> writes = state.deferredWrites.get(pos);
         if (writes == null || writes.isEmpty()) {
-            deferredWrites.remove(pos);
+            state.deferredWrites.remove(pos);
             return;
         }
-        LevelChunk chunk = level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos));
+        LevelChunk chunk = state.level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos));
         if (chunk == null) {
             // regeneration did not actually produce real terrain (or the chunk unloaded): keep the writes
             // queued for a retry rather than silently dropping the player's edit.
             LOGGER.warn("proxy chunk {} not real after promotion; keeping {} deferred write(s)", new ChunkPos(pos), writes.size());
-            enqueue(pos, true);
+            enqueue(state, pos, true);
             return;
         }
-        deferredWrites.remove(pos);
+        state.deferredWrites.remove(pos);
         for (DeferredWrite write : writes) {
-            level.setBlock(write.pos(), write.state(), write.flags());
+            state.level.setBlock(write.pos(), write.state(), write.flags());
         }
         LOGGER.info("replayed {} deferred write(s) into promoted chunk {}", writes.size(), new ChunkPos(pos));
     }

@@ -7,9 +7,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ServerChunkCache;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.Level;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,8 +45,8 @@ public final class AdaptiveMode {
 
     private static final Map<UUID, Boolean> travel = new HashMap<>();
     private static final Map<UUID, Boolean> proxy = new HashMap<>();
-    private static long[] optInCenters = new long[0];
-    private static long[] optOutCenters = new long[0];
+    private static int optInCount;
+    private static int optOutCount;
 
     private AdaptiveMode() {
     }
@@ -58,8 +61,8 @@ public final class AdaptiveMode {
         enforcing = false;
         travel.clear();
         proxy.clear();
-        optInCenters = new long[0];
-        optOutCenters = new long[0];
+        optInCount = 0;
+        optOutCount = 0;
         LOGGER.info("adaptive: {} (activate {} ms / backlog {}, deactivate {} ms / backlog {})",
             enabled ? "on" : "off", activateTickMs, backlogActivate, deactivateTickMs, backlogDeactivate);
     }
@@ -68,8 +71,8 @@ public final class AdaptiveMode {
         enforcing = false;
         travel.clear();
         proxy.clear();
-        optInCenters = new long[0];
-        optOutCenters = new long[0];
+        optInCount = 0;
+        optOutCount = 0;
     }
 
     public static void tick(MinecraftServer server) {
@@ -95,26 +98,34 @@ public final class AdaptiveMode {
     }
 
     private static void pushZones(MinecraftServer server) {
-        List<Long> in = new ArrayList<>();
-        List<Long> out = new ArrayList<>();
+        // zones are per-dimension: a player only gates the level they are actually in.
+        Map<ResourceKey<Level>, List<Long>> in = new HashMap<>();
+        Map<ResourceKey<Level>, List<Long>> out = new HashMap<>();
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (player.level() != server.overworld() || player.hasDisconnected()) {
+            if (player.hasDisconnected()) {
                 continue;
             }
+            ResourceKey<Level> key = player.level().dimension();
             long center = player.chunkPosition().toLong();
             if (travel.getOrDefault(player.getUUID(), false)) {
-                in.add(center);
+                in.computeIfAbsent(key, k -> new ArrayList<>()).add(center);
             } else {
-                out.add(center);
+                out.computeIfAbsent(key, k -> new ArrayList<>()).add(center);
             }
         }
-        optInCenters = toArray(in);
-        optOutCenters = toArray(out);
-        ProxyChunkGate.setAdaptive(enforcing, optInCenters, optOutCenters,
-            PromotionManager.effectiveMaxRange(server), enabled);
+        optInCount = in.values().stream().mapToInt(List::size).sum();
+        optOutCount = out.values().stream().mapToInt(List::size).sum();
+        int radius = PromotionManager.effectiveMaxRange(server);
+        for (ServerLevel level : server.getAllLevels()) {
+            ResourceKey<Level> key = level.dimension();
+            ProxyChunkGate.setAdaptive(level, enforcing, toArray(in.get(key)), toArray(out.get(key)), radius, enabled);
+        }
     }
 
     private static long[] toArray(List<Long> list) {
+        if (list == null) {
+            return new long[0];
+        }
         long[] array = new long[list.size()];
         for (int i = 0; i < array.length; i++) {
             array[i] = list.get(i);
@@ -136,7 +147,7 @@ public final class AdaptiveMode {
     public static void debugAlwaysOn() {
         enabled = false;
         enforcing = false;
-        ProxyChunkGate.setAdaptive(false, new long[0], new long[0], 0, false);
+        ProxyChunkGate.setAdaptiveAll(false, false);
     }
 
     /** true when this player should use the lingering gate (server-enforced, or they opted in). */
@@ -212,7 +223,7 @@ public final class AdaptiveMode {
             + ", backlog " + backlog + " (act " + backlogActivate + " / deact " + backlogDeactivate + ")"
             + ", tick " + String.format("%.1f", tickMs) + " ms (act "
             + String.format("%.1f", activateTickMs) + " / deact " + String.format("%.1f", deactivateTickMs) + ")"
-            + ", opt-in " + optInCenters.length + ", opt-out " + optOutCenters.length
+            + ", opt-in " + optInCount + ", opt-out " + optOutCount
             + ", linger " + (PromotionManager.hasLinger() ? "yes" : "no");
     }
 

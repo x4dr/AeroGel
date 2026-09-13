@@ -339,12 +339,12 @@ public final class ServerHandlers {
         return 1;
     }
 
-    /** server-side mirror of each client switch, so {@code /aerogel switch <feature>} can toggle. */
-    private static final Map<String, Boolean> switchState = new HashMap<>();
+    /** per-player server-side mirror of each client switch, so {@code /aerogel switch <feature>} can toggle. */
+    private static final Map<java.util.UUID, Map<String, Boolean>> switchState = new HashMap<>();
 
     /** client→server sync of its persisted switch state on join, so a bare toggle flips the right way. */
     public static void onClientSwitch(ServerPlayer player, ClientSwitchPayload payload) {
-        switchState.put(payload.feature(), payload.on());
+        switchState.computeIfAbsent(player.getUUID(), id -> new HashMap<>()).put(payload.feature(), payload.on());
         AdaptiveMode.onClientSwitch(player, payload);
     }
 
@@ -358,8 +358,11 @@ public final class ServerHandlers {
             ctx.getSource().sendFailure(Component.literal("AeroGel: unknown feature '" + feature + "'"));
             return 0;
         }
+        ServerPlayer actor = ctx.getSource().getEntity() instanceof ServerPlayer player ? player : null;
         boolean on = requested != null ? requested : !currentSwitch(ctx, feature, client);
-        switchState.put(feature, on);
+        if (actor != null) {
+            switchState.computeIfAbsent(actor.getUUID(), id -> new HashMap<>()).put(feature, on);
+        }
         if (client) {
             ServerPlayer player = ctx.getSource().getPlayerOrException();
             AdaptiveMode.setPlayerSwitch(player, feature, on);
@@ -409,7 +412,11 @@ public final class ServerHandlers {
             && ctx.getSource().getEntity() instanceof ServerPlayer player) {
             return AdaptiveMode.playerSwitch(player, feature);
         }
-        return switchState.getOrDefault(feature, ClientSwitchPayload.defaultOn(feature));
+        if (ctx.getSource().getEntity() instanceof ServerPlayer player) {
+            return switchState.getOrDefault(player.getUUID(), Map.of())
+                .getOrDefault(feature, ClientSwitchPayload.defaultOn(feature));
+        }
+        return ClientSwitchPayload.defaultOn(feature);
     }
 
     @SubscribeEvent
@@ -424,6 +431,7 @@ public final class ServerHandlers {
 
     @SubscribeEvent
     public static void onPlayerLogout(net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerLoggedOutEvent event) {
+        switchState.remove(event.getEntity().getUUID());
         ProxyStreamer.onPlayerLogout(event);
     }
 }

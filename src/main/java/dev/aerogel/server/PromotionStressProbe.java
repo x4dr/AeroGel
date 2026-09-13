@@ -35,7 +35,7 @@ final class PromotionStressProbe {
                 int z = center.z + dz;
                 level.setChunkForced(x, z, true);
                 level.getChunk(x, z); // instant placeholder
-                PromotionManager.debugEnqueue(ChunkPos.asLong(x, z));
+                PromotionManager.debugEnqueue(level, ChunkPos.asLong(x, z));
                 expected++;
             }
         }

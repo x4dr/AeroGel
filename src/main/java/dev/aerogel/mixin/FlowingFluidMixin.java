@@ -29,7 +29,13 @@ public class FlowingFluidMixin {
         cancellable = true
     )
     private void aerogel$noSpreadIntoProxies(LevelAccessor level, BlockPos pos, BlockState blockState, Direction direction, FluidState fluidState, CallbackInfo ci) {
-        if (level instanceof ServerLevel && ProxyChunkGate.isProxy(ChunkPos.asLong(pos))) {
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return;
+        }
+        if (!ProxyChunkGate.mayHaveProxy(serverLevel)) {
+            return; // dormant level: no proxy and not engaged -> vanilla spread
+        }
+        if (ProxyChunkGate.isProxy(serverLevel, ChunkPos.asLong(pos))) {
             ci.cancel();
         }
     }

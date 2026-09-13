@@ -1,6 +1,7 @@
 package dev.aerogel.mixin;
 
 import dev.aerogel.server.PromotionManager;
+import dev.aerogel.server.ProxyChunkGate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
@@ -27,8 +28,13 @@ public class LevelWriteGuardMixin {
         cancellable = true
     )
     private void aerogel$deferWriteIntoStub(BlockPos pos, BlockState state, int flags, CallbackInfoReturnable<Boolean> cir) {
-        if ((Object) this instanceof ServerLevel serverLevel
-            && PromotionManager.tryDeferWrite(serverLevel, pos, state, flags)) {
+        if (!((Object) this instanceof ServerLevel serverLevel)) {
+            return;
+        }
+        if (!ProxyChunkGate.mayHaveProxy(serverLevel)) {
+            return; // dormant level: no proxy and not engaged -> vanilla write
+        }
+        if (PromotionManager.tryDeferWrite(serverLevel, pos, state, flags)) {
             cir.setReturnValue(true);
         }
     }

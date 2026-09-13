@@ -60,7 +60,7 @@ final class GenerationProbe {
         for (byte tier : new byte[] { dev.aerogel.common.ProxyTopology.FIVE, dev.aerogel.common.ProxyTopology.NINE,
                 dev.aerogel.common.ProxyTopology.GRID25, dev.aerogel.common.ProxyTopology.GRID81 }) {
             LOGGER.info("sampler self-test {} {}: {}", probe, dev.aerogel.common.ProxyTopology.name(tier),
-                ProxyStreamer.probeSampleBlocking(probe, tier));
+                ProxyStreamer.probeSampleBlocking(level, probe, tier));
         }
 
         // wait a few ticks so the classification probe and placeholder path are exercised under ticking

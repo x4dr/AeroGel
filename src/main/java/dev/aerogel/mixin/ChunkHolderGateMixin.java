@@ -37,7 +37,7 @@ public abstract class ChunkHolderGateMixin {
             target = "Lnet/minecraft/server/level/ChunkMap;prepareAccessibleChunk(Lnet/minecraft/server/level/ChunkHolder;)Ljava/util/concurrent/CompletableFuture;")
     )
     private CompletableFuture<ChunkResult<LevelChunk>> aerogel$gateFull(ChunkMap chunkMap, ChunkHolder holder) {
-        if (ProxyChunkGate.isGated(holder.getPos().toLong())) {
+        if (ProxyChunkGate.isGated(chunkMap, holder.getPos().toLong())) {
             return ChunkHolderAccessor.unloadedFuture();
         }
         return chunkMap.prepareAccessibleChunk(holder);
@@ -49,7 +49,7 @@ public abstract class ChunkHolderGateMixin {
             target = "Lnet/minecraft/server/level/ChunkMap;prepareTickingChunk(Lnet/minecraft/server/level/ChunkHolder;)Ljava/util/concurrent/CompletableFuture;")
     )
     private CompletableFuture<ChunkResult<LevelChunk>> aerogel$gateTicking(ChunkMap chunkMap, ChunkHolder holder) {
-        if (ProxyChunkGate.isGated(holder.getPos().toLong())) {
+        if (ProxyChunkGate.isGated(chunkMap, holder.getPos().toLong())) {
             return ChunkHolderAccessor.unloadedFuture();
         }
         return chunkMap.prepareTickingChunk(holder);
@@ -61,7 +61,7 @@ public abstract class ChunkHolderGateMixin {
             target = "Lnet/minecraft/server/level/ChunkMap;prepareEntityTickingChunk(Lnet/minecraft/server/level/ChunkHolder;)Ljava/util/concurrent/CompletableFuture;")
     )
     private CompletableFuture<ChunkResult<LevelChunk>> aerogel$gateEntityTicking(ChunkMap chunkMap, ChunkHolder holder) {
-        if (ProxyChunkGate.isGated(holder.getPos().toLong())) {
+        if (ProxyChunkGate.isGated(chunkMap, holder.getPos().toLong())) {
             return ChunkHolderAccessor.unloadedFuture();
         }
         return chunkMap.prepareEntityTickingChunk(holder);

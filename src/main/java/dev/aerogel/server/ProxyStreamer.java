@@ -16,21 +16,17 @@ import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.shorts.ShortArrayList;
 import net.minecraft.core.Holder;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.BiomeSource;
-import net.minecraft.world.level.chunk.ChunkAccess;
-import net.minecraft.world.level.chunk.LevelChunk;
-import net.minecraft.world.level.chunk.LevelChunkSection;
-import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
@@ -51,6 +47,11 @@ import org.slf4j.LoggerFactory;
  * to near is re-sampled at the finer tier and re-sent; the client always bakes at its own fixed render tier
  * and upsamples, so promotion only changes heights. Biomes add one probe per chunk (packed colour +
  * representative block).</p>
+ *
+ * <p><b>Per-dimension.</b> Each noise-based {@code ServerLevel} gets its own {@link State}: a worker pool
+ * (its own {@code RandomState}s, settings, biomes and seed), grid/pending caches and per-player streams.
+ * Scalar config stays global. Every position-taking method resolves the state from the level in scope, so a
+ * nether read never consults an overworld grid.</p>
  *
  * <p>All stream state is touched on the server thread only (tick events); the worker pool owns the
  * sampling threads.</p>
@@ -74,8 +75,9 @@ public final class ProxyStreamer {
     private static final int MAX_PENDING = 4096;
     private static final int MAX_DRAIN_PER_TICK = 1024;
 
-    private static ServerLevel overworld;
-    private static SamplerPool worker;
+    private static MinecraftServer server;
+    private static final Map<ResourceKey<Level>, State> STATES = new HashMap<>();
+
     /** the finest tier, used within {@link #nearDistance} chunks of a player. */
     private static byte nearTier = ProxyTopology.DEFAULT;
     /** the cheapest tier, used beyond {@link #nearDistance}. */
@@ -85,28 +87,38 @@ public final class ProxyStreamer {
     /** bisect switch: when off, proxy meshes are neither sampled nor sent (the gate still runs). */
     private static boolean streamEnabled = true;
     private static boolean bypassMoveCheck = true;
-
-    /** init-time state kept so a live thread-count change can rebuild the pool. */
-    private static NoiseGeneratorSettings workerSettings;
-    private static BiomeSource workerBiomes;
-    private static long workerSeed;
     private static int samplerThreads = 1;
+
+    private static int statTicks;
+    private static long statTickNanos;
+    private static int statChunksSent;
+    private static int haltTick = -1;
 
     /** one chunk's best streamed data; tier is the detail it was sampled at. */
     private record Grid(byte tier, short[] heights, int biome, int block) {
     }
 
-    private static final Long2ObjectOpenHashMap<Grid> grids = new Long2ObjectOpenHashMap<>();
-    /** chunk -> highest tier currently requested from the pool (0 = not pending). */
-    private static final Long2ByteOpenHashMap pending = new Long2ByteOpenHashMap();
-    private static final Map<UUID, Stream> streams = new HashMap<>();
+    /** per-{@code ServerLevel} stream state. */
+    private static final class State {
+        final ServerLevel level;
+        SamplerPool worker;
+        NoiseGeneratorSettings workerSettings;
+        BiomeSource workerBiomes;
+        long workerSeed;
 
-    private static final long[] completed = new long[MAX_DRAIN_PER_TICK];
-    private static int statTicks;
-    private static long statTickNanos;
-    private static int statChunksSent;
-    private static int pruneTicks;
-    private static int promoteTicks;
+        final Long2ObjectOpenHashMap<Grid> grids = new Long2ObjectOpenHashMap<>();
+        /** chunk -> highest tier currently requested from the pool (0 = not pending). */
+        final Long2ByteOpenHashMap pending = new Long2ByteOpenHashMap();
+        final Map<UUID, Stream> streams = new HashMap<>();
+        /** scratch for finished samples drained this tick. */
+        final long[] completed = new long[MAX_DRAIN_PER_TICK];
+        int pruneTicks;
+        int promoteTicks;
+
+        State(ServerLevel level) {
+            this.level = level;
+        }
+    }
 
     private ProxyStreamer() {
     }
@@ -127,17 +139,13 @@ public final class ProxyStreamer {
     }
 
     /**
-     * Starts the streamer. The overworld generator is left REAL: generation only runs when a proxy is
-     * promoted, and a leaked FULL task then simply generates real terrain (a safety net). The virtual-proxy
-     * gate ({@link ProxyChunkGate}) is what stops a never-generated chunk's ticket from building its own task.
+     * Starts the streamer for every noise-based {@link ServerLevel}. The generators are left REAL:
+     * generation only runs when a proxy is promoted, and a leaked FULL task then simply generates real
+     * terrain (a safety net). The virtual-proxy gate ({@link ProxyChunkGate}) is what stops a
+     * never-generated chunk's ticket from building its own task.
      */
-    public static void init(MinecraftServer server) {
-        overworld = server.overworld();
-        if (!(overworld.getChunkSource().getGenerator() instanceof NoiseBasedChunkGenerator noiseGen)) {
-            LOGGER.info("overworld generator is not noise-based ({}); proxy streaming inactive",
-                overworld.getChunkSource().getGenerator());
-            return;
-        }
+    public static void init(MinecraftServer srv) {
+        server = srv;
         AeroGelConfig cfg = AeroGelConfig.CFG;
         streamEnabled = cfg.streamEnabled.get();
         radius = cfg.streamRadius.get();
@@ -153,28 +161,53 @@ public final class ProxyStreamer {
         biomeColors = cfg.biomeColors.get();
         samplerThreads = cfg.samplerThreads.get();
         bypassMoveCheck = cfg.bypassMoveCheck.get();
-        workerSettings = noiseGen.generatorSettings().value();
-        workerBiomes = noiseGen.getBiomeSource();
-        workerSeed = overworld.getSeed();
-        worker = createPool();
-        ProxyChunkGate.init(overworld);
-        PromotionManager.init(overworld);
+
+        int count = 0;
+        for (ServerLevel level : srv.getAllLevels()) {
+            if (!(level.getChunkSource().getGenerator() instanceof NoiseBasedChunkGenerator noiseGen)) {
+                LOGGER.info("dimension {} generator is not noise-based ({}); proxy streaming skipped",
+                    level.dimension().location(), level.getChunkSource().getGenerator());
+                continue;
+            }
+            State state = new State(level);
+            state.workerSettings = noiseGen.generatorSettings().value();
+            state.workerBiomes = noiseGen.getBiomeSource();
+            state.workerSeed = level.getSeed();
+            state.worker = createPool(state);
+            STATES.put(level.dimension(), state);
+            ProxyChunkGate.init(level);
+            PromotionManager.init(level);
+            count++;
+            LOGGER.info("virtual proxy chunks active for {}; {} sampler thread(s), near {} (<= {} chunks), far {}, colours {}",
+                level.dimension().location(), state.worker.threads(),
+                ProxyTopology.name(nearTier), nearDistance, ProxyTopology.name(farTier), biomeColors);
+        }
+        if (count == 0) {
+            LOGGER.info("no noise-based dimensions; proxy streaming inactive");
+            return;
+        }
         AdaptiveMode.init();
-        LOGGER.info("virtual proxy chunks active for {}; {} sampler thread(s), near {} (<= {} chunks), far {}, colours {}",
-            overworld.dimension().location(), worker.threads(),
-            ProxyTopology.name(nearTier), nearDistance, ProxyTopology.name(farTier), biomeColors);
+        LOGGER.info("virtual proxy chunks active for {} dimension(s)", count);
     }
 
-    private static SamplerPool createPool() {
+    private static SamplerPool createPool(State state) {
         List<RandomState> states = new ArrayList<>(samplerThreads);
-        var noise = overworld.registryAccess().lookupOrThrow(Registries.NOISE);
+        var noise = state.level.registryAccess().lookupOrThrow(Registries.NOISE);
         for (int i = 0; i < samplerThreads; i++) {
             // each worker gets its OWN RandomState: the router's interpolator/cache wrappers are stateful,
             // so sharing would race. Same seed + settings => identical heights.
-            states.add(RandomState.create(workerSettings, noise, workerSeed));
+            states.add(RandomState.create(state.workerSettings, noise, state.workerSeed));
         }
-        return new SamplerPool(states, workerSettings, workerBiomes,
-            overworld.registryAccess().registryOrThrow(Registries.BIOME), samplerThreads);
+        return new SamplerPool(states, state.workerSettings, state.workerBiomes,
+            state.level.registryAccess().registryOrThrow(Registries.BIOME), samplerThreads);
+    }
+
+    private static State state(Level lvl) {
+        return lvl == null ? null : STATES.get(lvl.dimension());
+    }
+
+    private static State state(ServerLevel lvl) {
+        return lvl == null ? null : STATES.get(lvl.dimension());
     }
 
     /** the finest (near) tier currently configured. */
@@ -191,7 +224,7 @@ public final class ProxyStreamer {
     }
 
     public static int threads() {
-        return worker == null ? samplerThreads : worker.threads();
+        return samplerThreads;
     }
 
     public static boolean biomeColors() {
@@ -209,7 +242,7 @@ public final class ProxyStreamer {
     }
 
     /**
-     * Live near-tier switch. The worker pool is not rebuilt (tier travels per task); we drop every
+     * Live near-tier switch. The worker pools are not rebuilt (tier travels per task); we drop every
      * per-player sent set and the grid cache so the new tier re-streams.
      */
     public static void setTopology(byte newTier) {
@@ -250,32 +283,32 @@ public final class ProxyStreamer {
         clearStreamState(); // re-stream so existing chunks pick up the new tint
     }
 
-    /** live sampler-thread count change; rebuilds the pool (caches are lost) and re-streams. */
+    /** live sampler-thread count change; rebuilds every pool (caches are lost) and re-streams. */
     public static void setThreads(int threads) {
-        if (worker == null) {
-            samplerThreads = Math.clamp(threads, 1, MAX_SAMPLER_THREADS);
-            AeroGelConfig.CFG.samplerThreads.set(samplerThreads);
-            AeroGelConfig.SPEC.save();
-            return;
-        }
         int clamped = Math.clamp(threads, 1, MAX_SAMPLER_THREADS);
-        if (clamped == threads()) {
+        if (clamped == samplerThreads) {
             return;
         }
         samplerThreads = clamped;
         AeroGelConfig.CFG.samplerThreads.set(clamped);
         AeroGelConfig.SPEC.save();
-        worker.close();
-        worker = createPool();
+        for (State state : STATES.values()) {
+            if (state.worker != null) {
+                state.worker.close();
+                state.worker = createPool(state);
+            }
+        }
         clearStreamState();
     }
 
     private static void clearStreamState() {
-        grids.clear();
-        pending.clear();
-        for (Stream stream : streams.values()) {
-            stream.sent.clear();
-            stream.center = Long.MIN_VALUE;
+        for (State state : STATES.values()) {
+            state.grids.clear();
+            state.pending.clear();
+            for (Stream stream : state.streams.values()) {
+                stream.sent.clear();
+                stream.center = Long.MIN_VALUE;
+            }
         }
     }
 
@@ -297,39 +330,47 @@ public final class ProxyStreamer {
 
     /** stops the sampling threads on server shutdown. */
     public static void shutdown() {
-        if (worker != null) {
-            worker.close();
-            worker = null;
+        for (State state : STATES.values()) {
+            if (state.worker != null) {
+                state.worker.close();
+            }
         }
+        STATES.clear();
         PromotionManager.shutdown();
         ProxyChunkGate.shutdown();
         AdaptiveMode.shutdown();
+        server = null;
     }
 
     /** true while the position is a virtual proxy (the write guard and promotion queue use this). */
-    public static boolean isProxyPlaceholder(long pos) {
-        return ProxyChunkGate.isProxy(pos);
+    public static boolean isProxyPlaceholder(ServerLevel lvl, long pos) {
+        return ProxyChunkGate.isProxy(lvl, pos);
     }
 
-    /** true once the virtual-proxy gate has been installed for the overworld. */
+    /** true once the virtual-proxy gate has been installed for any dimension. */
     public static boolean isActive() {
         return ProxyChunkGate.isActive();
     }
 
     /** the sampled biome holder for a chunk, or null when none has been sampled yet. */
-    public static Holder<Biome> biomeHolder(long pos) {
-        Grid grid = grids.get(pos);
-        if (grid == null || grid.biome() < 0 || overworld == null) {
+    public static Holder<Biome> biomeHolder(ServerLevel lvl, long pos) {
+        State state = state(lvl);
+        if (state == null) {
             return null;
         }
-        return overworld.registryAccess().registryOrThrow(Registries.BIOME).getHolder(grid.biome()).orElse(null);
+        Grid grid = state.grids.get(pos);
+        if (grid == null || grid.biome() < 0) {
+            return null;
+        }
+        return lvl.registryAccess().registryOrThrow(Registries.BIOME).getHolder(grid.biome()).orElse(null);
     }
 
     /** dump the stored mesh points for one chunk (local x,z and height). */
-    public static String dumpGrid(long pos) {
+    public static String dumpGrid(ServerLevel lvl, long pos) {
         int cx = ChunkPos.getX(pos);
         int cz = ChunkPos.getZ(pos);
-        Grid grid = grids.get(pos);
+        State state = state(lvl);
+        Grid grid = state == null ? null : state.grids.get(pos);
         if (grid == null) {
             return "AeroGel: no proxy grid stored for chunk (" + cx + "," + cz + ")";
         }
@@ -348,14 +389,15 @@ public final class ProxyStreamer {
      * caller is the server thread, so the normal tick drain cannot run and steal the result). Exercises the
      * pool routing, the worker and the biome probe without a client.
      */
-    public static String probeSampleBlocking(ChunkPos pos, byte tier) {
-        if (worker == null) {
+    public static String probeSampleBlocking(ServerLevel lvl, ChunkPos pos, byte tier) {
+        State state = state(lvl);
+        if (state == null || state.worker == null) {
             return "worker null (proxy inactive)";
         }
-        worker.submit(pos.toLong(), tier, true);
+        state.worker.submit(pos.toLong(), tier, true);
         long deadline = System.nanoTime() + 5_000_000_000L;
         while (System.nanoTime() < deadline) {
-            OffThreadSampler.Result r = worker.poll();
+            OffThreadSampler.Result r = state.worker.poll();
             if (r != null && r.chunkPos() == pos.toLong() && r.topology() == tier) {
                 return "tier=" + ProxyTopology.name(r.topology()) + " heights=" + r.grid().length
                     + " first=" + r.grid()[0] + " biome=" + r.biome()
@@ -372,17 +414,17 @@ public final class ProxyStreamer {
     }
 
     /** drop cached grids no player could still need, so a long fast flight cannot leak the cache. */
-    private static void pruneGrids(MinecraftServer server) {
-        if (grids.isEmpty()) {
+    private static void pruneGrids(State state) {
+        if (state.grids.isEmpty()) {
             return;
         }
         List<ChunkPos> centers = new ArrayList<>();
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (player.level() == overworld && !player.hasDisconnected()) {
+        for (ServerPlayer player : state.level.getServer().getPlayerList().getPlayers()) {
+            if (player.level() == state.level && !player.hasDisconnected()) {
                 centers.add(player.chunkPosition());
             }
         }
-        var it = grids.long2ObjectEntrySet().iterator();
+        var it = state.grids.long2ObjectEntrySet().iterator();
         while (it.hasNext()) {
             long pos = it.next().getLongKey();
             boolean keep = false;
@@ -402,104 +444,110 @@ public final class ProxyStreamer {
 
     /** headless probe hook: halt the server after {@code delayTicks} real ticks (TickTask can't delay when idle). */
     public static void scheduleHalt(int delayTicks) {
-        if (overworld != null) {
-            haltTick = overworld.getServer().getTickCount() + delayTicks;
+        if (server != null) {
+            haltTick = server.getTickCount() + delayTicks;
         }
     }
 
-    private static int haltTick = -1;
-
     public static void onServerTick(ServerTickEvent.Post event) {
-        if (worker == null) {
+        if (STATES.isEmpty()) {
             return;
         }
         long t0 = System.nanoTime();
-        MinecraftServer server = event.getServer();
-        if (haltTick >= 0 && server.getTickCount() >= haltTick) {
+        MinecraftServer srv = event.getServer();
+        if (haltTick >= 0 && srv.getTickCount() >= haltTick) {
             haltTick = -1;
-            server.halt(false);
+            srv.halt(false);
             return;
         }
         // 0. adaptive enforcement: decide whether the gate is on at all this tick
-        AdaptiveMode.tick(server);
+        AdaptiveMode.tick(srv);
         // 0a. automatic promotion: linger/touch/write -> real chunk, paced by server load
-        PromotionManager.tick(server);
+        PromotionManager.tick(srv);
         // 0b. classification completions + placeholder cache pruning
-        ProxyChunkGate.tick(server);
+        ProxyChunkGate.tick(srv);
         if (!streamEnabled) {
             return; // bisect switch: no proxy sampling/sending; the gate and promotion still run
         }
-        // 1. move finished samples out of the worker queue (cheap; NO density work on this thread)
-        int drained = 0;
-        OffThreadSampler.Result result;
-        while (drained < MAX_DRAIN_PER_TICK && (result = worker.poll()) != null) {
-            long pos = result.chunkPos();
-            byte requested = pending.get(pos);
-            if (requested == 0) {
-                continue; // stale: state was reset / the chunk is no longer wanted
-            }
-            // a coarse result that arrives while a finer one is still in flight must not clear the request,
-            // or the finer result would be dropped when it lands
-            if (result.topology() >= requested) {
-                pending.remove(pos);
-            }
-            Grid prev = grids.get(pos);
-            if (prev != null && prev.tier() > result.topology()) {
-                continue; // never downgrade a chunk that was already sampled finer
-            }
-            grids.put(pos, new Grid(result.topology(), result.grid(), result.biome(), result.block()));
-            completed[drained++] = pos;
-        }
-        // 2. per player: send completed/cached wanted chunks, submit the rest to the pool
         int sentThisTick = 0;
-        boolean promoteDue = ++promoteTicks % PROMOTE_INTERVAL == 0;
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (player.level() != overworld || player.hasDisconnected()) {
-                continue;
+        for (State state : STATES.values()) {
+            if (state.worker != null) {
+                sentThisTick += drainAndStream(srv, state);
             }
-            if (!AdaptiveMode.renders(player)) {
-                continue; // this client is not rendering proxies: no need to stream to it
-            }
-            Stream stream = streams.computeIfAbsent(player.getUUID(), id -> new Stream());
-            ChunkPos center = player.chunkPosition();
-            if (center.toLong() != stream.center) {
-                rebuildWanted(stream, center, player);
-            }
-            sentThisTick += sendAndSubmit(stream, player, center, drained, promoteDue);
-        }
-        if (++pruneTicks % 200 == 0) {
-            pruneGrids(server);
         }
         statTickNanos += System.nanoTime() - t0;
         statChunksSent += sentThisTick;
         if (++statTicks % 200 == 0) {
-            LOGGER.info("stream perf: {} ms/tick avg over {} ticks, {} chunks sent, worker {} samples avg {} ms, backlog {}, threads {}, radius {}, near {}<= {}, far {}",
-                String.format("%.2f", statTickNanos / 1e6 / statTicks), statTicks, statChunksSent,
-                worker.sampledCount(), String.format("%.2f", worker.avgMillis()), worker.backlog(),
-                worker.threads(), radius, ProxyTopology.name(nearTier), nearDistance, ProxyTopology.name(farTier));
+            LOGGER.info("stream perf: {} ms/tick avg over {} ticks, {} chunks sent, {} dimensions",
+                String.format("%.2f", statTickNanos / 1e6 / statTicks), statTicks, statChunksSent, STATES.size());
             statTicks = 0;
             statTickNanos = 0;
             statChunksSent = 0;
         }
     }
 
+    /** move finished samples out of one level's worker queue and stream them to that level's players. */
+    private static int drainAndStream(MinecraftServer srv, State state) {
+        int drained = 0;
+        OffThreadSampler.Result result;
+        while (drained < MAX_DRAIN_PER_TICK && (result = state.worker.poll()) != null) {
+            long pos = result.chunkPos();
+            byte requested = state.pending.get(pos);
+            if (requested == 0) {
+                continue; // stale: state was reset / the chunk is no longer wanted
+            }
+            // a coarse result that arrives while a finer one is still in flight must not clear the request,
+            // or the finer result would be dropped when it lands
+            if (result.topology() >= requested) {
+                state.pending.remove(pos);
+            }
+            Grid prev = state.grids.get(pos);
+            if (prev != null && prev.tier() > result.topology()) {
+                continue; // never downgrade a chunk that was already sampled finer
+            }
+            state.grids.put(pos, new Grid(result.topology(), result.grid(), result.biome(), result.block()));
+            state.completed[drained++] = pos;
+        }
+        int sentThisTick = 0;
+        boolean promoteDue = ++state.promoteTicks % PROMOTE_INTERVAL == 0;
+        for (ServerPlayer player : srv.getPlayerList().getPlayers()) {
+            if (player.level() != state.level || player.hasDisconnected()) {
+                continue;
+            }
+            if (!AdaptiveMode.renders(player)) {
+                continue; // this client is not rendering proxies: no need to stream to it
+            }
+            Stream stream = state.streams.computeIfAbsent(player.getUUID(), id -> new Stream());
+            ChunkPos center = player.chunkPosition();
+            if (center.toLong() != stream.center) {
+                rebuildWanted(stream, center);
+            }
+            sentThisTick += sendAndSubmit(state, stream, player, center, drained, promoteDue);
+        }
+        if (++state.pruneTicks % 200 == 0) {
+            pruneGrids(state);
+        }
+        return sentThisTick;
+    }
+
     /** Crude proxy collision: clamp players up onto the sampled surface. */
     public static void onPlayerTick(PlayerTickEvent.Post event) {
-        if (worker == null || !(event.getEntity() instanceof ServerPlayer player) || player.level() != overworld) {
+        if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
         }
-        if (player.isSpectator()) {
+        State state = state(player.level());
+        if (state == null || state.worker == null || player.isSpectator()) {
             return;
         }
         long chunkPos = player.chunkPosition().toLong();
-        Grid grid = grids.get(chunkPos);
+        Grid grid = state.grids.get(chunkPos);
         if (grid == null) {
             return; // no proxy data here -> real (pre-existing) chunk handles it
         }
         // a promoted/real chunk at the player's position has real collision; clamping there would fight it
         int cx = ChunkPos.getX(chunkPos);
         int cz = ChunkPos.getZ(chunkPos);
-        boolean realHere = !ProxyChunkGate.isProxy(chunkPos);
+        boolean realHere = !ProxyChunkGate.isProxy(state.level, chunkPos);
         double surface = MeshMath.surfaceAt(chunkPos, grid.tier(), grid.heights(), player.getX(), player.getZ());
         if (realHere) {
             return;
@@ -517,11 +565,14 @@ public final class ProxyStreamer {
     }
 
     public static void onPlayerLogout(PlayerEvent.PlayerLoggedOutEvent event) {
-        streams.remove(event.getEntity().getUUID());
-        AdaptiveMode.removePlayer(event.getEntity().getUUID());
+        UUID id = event.getEntity().getUUID();
+        for (State state : STATES.values()) {
+            state.streams.remove(id);
+        }
+        AdaptiveMode.removePlayer(id);
     }
 
-    private static void rebuildWanted(Stream stream, ChunkPos center, ServerPlayer player) {
+    private static void rebuildWanted(Stream stream, ChunkPos center) {
         int r = radius;
         ChunkPos old = stream.center == Long.MIN_VALUE ? null : new ChunkPos(stream.center);
         stream.center = center.toLong();
@@ -628,17 +679,17 @@ public final class ProxyStreamer {
      * Sends this player every completed/cached wanted chunk (grouped into one packet per tier) and submits
      * the remainder of the wanted list to the pool. All of this is bookkeeping — no density evaluation.
      */
-    private static int sendAndSubmit(Stream stream, ServerPlayer player, ChunkPos center, int drained, boolean promoteDue) {
+    private static int sendAndSubmit(State state, Stream stream, ServerPlayer player, ChunkPos center, int drained, boolean promoteDue) {
         Map<Byte, Batch> batches = new HashMap<>();
         for (int i = 0; i < drained; i++) {
-            long pos = completed[i];
+            long pos = state.completed[i];
             if (!inRadius(pos, center, stream.radius)) {
                 continue;
             }
-            if (ProxyChunkGate.isLoadedReal(pos)) {
+            if (ProxyChunkGate.isLoadedReal(state.level, pos)) {
                 continue; // vanilla already gives the client this chunk
             }
-            Grid grid = grids.get(pos);
+            Grid grid = state.grids.get(pos);
             if (grid != null && stream.sent.get(pos) < grid.tier()) {
                 addToBatch(batches, stream, pos, grid);
             }
@@ -647,30 +698,30 @@ public final class ProxyStreamer {
         while (stream.wantedIndex < stream.wanted.size() && submitted < MAX_SUBMIT_PER_TICK) {
             long pos = stream.wanted.getLong(stream.wantedIndex);
             stream.wantedIndex++;
-            if (ProxyChunkGate.isLoadedReal(pos)) {
+            if (ProxyChunkGate.isLoadedReal(state.level, pos)) {
                 continue; // real chunk: the client gets it from vanilla
             }
             byte want = desiredTier(pos, center);
-            Grid grid = grids.get(pos);
+            Grid grid = state.grids.get(pos);
             if (grid != null && grid.tier() >= want) {
                 if (stream.sent.get(pos) < grid.tier()) {
                     addToBatch(batches, stream, pos, grid);
                 }
                 continue;
             }
-            if (pending.size() >= MAX_PENDING) {
+            if (state.pending.size() >= MAX_PENDING) {
                 stream.wantedIndex--; // worker queue full; resume here next tick
                 break;
             }
-            if (pending.get(pos) >= want) {
+            if (state.pending.get(pos) >= want) {
                 continue; // already in flight at an equal-or-finer tier
             }
-            pending.put(pos, want);
-            worker.submit(pos, want, false);
+            state.pending.put(pos, want);
+            state.worker.submit(pos, want, false);
             submitted++;
         }
         if (promoteDue) {
-            promoteNearBand(batches, stream, center);
+            promoteNearBand(state, batches, stream, center);
         }
         int sent = 0;
         for (Batch batch : batches.values()) {
@@ -687,15 +738,15 @@ public final class ProxyStreamer {
      * already holds their corners, so only the new points cost anything); chunks already fine but sent
      * coarse are queued for resend. O(nearDistance^2), but only every 20 ticks.
      */
-    private static void promoteNearBand(Map<Byte, Batch> batches, Stream stream, ChunkPos center) {
+    private static void promoteNearBand(State state, Map<Byte, Batch> batches, Stream stream, ChunkPos center) {
         int r = Math.min(nearDistance, stream.radius);
         for (int dx = -r; dx <= r; dx++) {
             for (int dz = -r; dz <= r; dz++) {
                 long pos = ChunkPos.asLong(center.x + dx, center.z + dz);
-                if (ProxyChunkGate.isLoadedReal(pos)) {
+                if (ProxyChunkGate.isLoadedReal(state.level, pos)) {
                     continue; // real chunk: the client gets it from vanilla
                 }
-                Grid grid = grids.get(pos);
+                Grid grid = state.grids.get(pos);
                 if (grid != null) {
                     if (grid.tier() >= nearTier) {
                         if (stream.sent.get(pos) < grid.tier()) {
@@ -704,14 +755,14 @@ public final class ProxyStreamer {
                         continue;
                     }
                 }
-                if (pending.get(pos) >= nearTier) {
+                if (state.pending.get(pos) >= nearTier) {
                     continue;
                 }
-                if (pending.size() >= MAX_PENDING) {
+                if (state.pending.size() >= MAX_PENDING) {
                     return;
                 }
-                pending.put(pos, nearTier);
-                worker.submit(pos, nearTier, true);
+                state.pending.put(pos, nearTier);
+                state.worker.submit(pos, nearTier, true);
             }
         }
     }
@@ -766,10 +817,11 @@ public final class ProxyStreamer {
      * `urgent`.
      */
     public static void onMeshRequest(ServerPlayer player, MeshRequestPayload payload) {
-        if (worker == null || player.level() != overworld) {
+        State state = state(player.level());
+        if (state == null || state.worker == null) {
             return;
         }
-        Stream stream = streams.computeIfAbsent(player.getUUID(), id -> new Stream());
+        Stream stream = state.streams.computeIfAbsent(player.getUUID(), id -> new Stream());
         ChunkPos center = player.chunkPosition();
         Map<Byte, Batch> batches = new HashMap<>();
         int urgentAdded = 0;
@@ -779,7 +831,7 @@ public final class ProxyStreamer {
             if (Math.max(Math.abs(dx), Math.abs(dz)) > radius + 2) {
                 continue; // sanity: only serve chunks near the player
             }
-            Grid grid = grids.get(pos);
+            Grid grid = state.grids.get(pos);
             if (grid != null) {
                 Batch batch = batches.computeIfAbsent(grid.tier(), Batch::new);
                 if (batch.pos.size() < 128) {
@@ -793,9 +845,9 @@ public final class ProxyStreamer {
                 }
             } else {
                 byte want = desiredTier(pos, center);
-                if (urgentAdded < 64 && pending.size() < MAX_PENDING && pending.get(pos) < want) {
-                    pending.put(pos, want);
-                    worker.submit(pos, want, true);
+                if (urgentAdded < 64 && state.pending.size() < MAX_PENDING && state.pending.get(pos) < want) {
+                    state.pending.put(pos, want);
+                    state.worker.submit(pos, want, true);
                     urgentAdded++;
                 }
             }
