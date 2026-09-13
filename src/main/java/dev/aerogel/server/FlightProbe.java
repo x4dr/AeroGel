@@ -30,6 +30,8 @@ final class FlightProbe {
     private static ServerPlayer pilot;
     private static int speedChunks = DEFAULT_SPEED_CHUNKS;
     private static int durationTicks = DEFAULT_DURATION_TICKS;
+    /** start band offset in chunks along z, so repeated A/B runs use fresh terrain. */
+    private static int zOffsetChunks;
     private static int ticks;
     private static boolean reportedDone;
 
@@ -50,14 +52,17 @@ final class FlightProbe {
                     if (parts.length >= 2) {
                         durationTicks = Math.clamp(Integer.parseInt(parts[1]), 20, 24000);
                     }
+                    if (parts.length >= 3) {
+                        zOffsetChunks = Integer.parseInt(parts[2]);
+                    }
                 }
             }
         } catch (Exception e) {
             LOGGER.warn("flight: could not parse {}, using defaults ({} ch/tick, {} ticks)",
                 flag, DEFAULT_SPEED_CHUNKS, DEFAULT_DURATION_TICKS, e);
         }
-        LOGGER.info("=== flight probe armed: {} chunks/tick, {} ticks, altitude {}; waiting for a player ===",
-            speedChunks, durationTicks, ALTITUDE);
+        LOGGER.info("=== flight probe armed: {} chunks/tick, {} ticks, z-offset {} ch, altitude {}; waiting for a player ===",
+            speedChunks, durationTicks, zOffsetChunks, ALTITUDE);
     }
 
     static void tick(MinecraftServer srv) {
@@ -97,7 +102,7 @@ final class FlightProbe {
         player.getAbilities().mayfly = true;
         player.getAbilities().setFlyingSpeed(0.5f);
         player.onUpdateAbilities();
-        player.teleportTo(player.getX(), ALTITUDE, player.getZ());
+        player.teleportTo(player.getX(), ALTITUDE, player.getZ() + (double) zOffsetChunks * 16.0);
         ticks = 0;
         reportedDone = false;
         LOGGER.info("flight: pilot {} at ({},{}) y={} -> +x at {} chunks/tick",
