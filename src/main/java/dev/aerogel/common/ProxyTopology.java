@@ -75,62 +75,6 @@ public final class ProxyTopology {
         return (idx % side(topology)) * spacing(topology);
     }
 
-    /**
-     * Upsample {@code src} (a {@code from} grid) to a {@code to} grid. Nested tiers mean this is a pure
-     * refinement: known points are kept, new points are bilinearly interpolated. FIVE is first expanded to
-     * its 3x3 form (edge midpoints = average of the two adjacent corners). Returns {@code src} unchanged
-     * when {@code from == to}.
-     */
-    public static short[] upsample(byte from, short[] src, byte to) {
-        if (from == to) {
-            return src;
-        }
-        byte base = from;
-        short[] baseGrid = src;
-        if (from == FIVE) {
-            base = NINE;
-            baseGrid = new short[9];
-            baseGrid[0] = src[0];
-            baseGrid[2] = src[1];
-            baseGrid[6] = src[2];
-            baseGrid[8] = src[3];
-            baseGrid[4] = src[4];
-            baseGrid[1] = avg(src[0], src[1]);
-            baseGrid[3] = avg(src[0], src[2]);
-            baseGrid[5] = avg(src[1], src[3]);
-            baseGrid[7] = avg(src[2], src[3]);
-        }
-        if (base == to) {
-            return baseGrid;
-        }
-        int fromSide = side(base);
-        int toSide = side(to);
-        double step = (double) (fromSide - 1) / (toSide - 1);
-        short[] out = new short[toSide * toSide];
-        for (int i = 0; i < toSide; i++) {
-            double vx = i * step;
-            int i0 = Math.min((int) vx, fromSide - 2);
-            double fx = vx - i0;
-            for (int k = 0; k < toSide; k++) {
-                double vz = k * step;
-                int k0 = Math.min((int) vz, fromSide - 2);
-                double fz = vz - k0;
-                double h00 = baseGrid[i0 * fromSide + k0];
-                double h10 = baseGrid[(i0 + 1) * fromSide + k0];
-                double h01 = baseGrid[i0 * fromSide + k0 + 1];
-                double h11 = baseGrid[(i0 + 1) * fromSide + k0 + 1];
-                double a = h00 + (h10 - h00) * fx;
-                double b = h01 + (h11 - h01) * fx;
-                out[i * toSide + k] = (short) Math.round(a + (b - a) * fz);
-            }
-        }
-        return out;
-    }
-
-    private static short avg(short a, short b) {
-        return (short) ((a + b) >> 1);
-    }
-
     /** parse a command/property value ("five"/"5", "nine"/"9", "25", "81"), or -1 if unknown. */
     public static byte parse(String s) {
         if (s == null) {

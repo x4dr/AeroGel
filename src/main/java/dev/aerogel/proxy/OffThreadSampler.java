@@ -5,7 +5,6 @@ import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.biome.BiomeSource;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
@@ -42,8 +41,6 @@ public final class OffThreadSampler implements AutoCloseable {
     private final ConcurrentLinkedQueue<Task> urgent = new ConcurrentLinkedQueue<>();
     private final ConcurrentLinkedQueue<Result> done = new ConcurrentLinkedQueue<>();
     private volatile boolean running = true;
-    private final AtomicLong sampled = new AtomicLong();
-    private final AtomicLong sampledNanos = new AtomicLong();
 
     public OffThreadSampler(RandomState state, NoiseGeneratorSettings settings, BiomeSource biomeSource,
             net.minecraft.core.Registry<net.minecraft.world.level.biome.Biome> biomeRegistry, int maxCache) {
@@ -72,24 +69,6 @@ public final class OffThreadSampler implements AutoCloseable {
 
     public Result poll() {
         return done.poll();
-    }
-
-    public int backlog() {
-        return normal.size() + urgent.size() + done.size();
-    }
-
-    public long sampledCount() {
-        return sampled.get();
-    }
-
-    /** total density-evaluation wall time this worker has spent since construction. */
-    public long sampledNanos() {
-        return sampledNanos.get();
-    }
-
-    public double avgMillis() {
-        long c = sampled.get();
-        return c == 0 ? 0.0 : sampledNanos.get() / 1e6 / c;
     }
 
     @Override
@@ -136,8 +115,6 @@ public final class OffThreadSampler implements AutoCloseable {
                 Arrays.fill(grid, SEA_LEVEL);
             }
             long dt = System.nanoTime() - t0;
-            sampled.incrementAndGet();
-            sampledNanos.addAndGet(dt);
             done.add(new Result(pos, topo, grid, biome, block, dt));
         }
     }

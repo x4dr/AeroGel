@@ -13,8 +13,7 @@
   ],
   "client": [
     "LevelRendererAccessor",
-    "RenderSectionNeighborsMixin",
-    "ViewAreaInvoker"
+    "RenderSectionNeighborsMixin"
   ],
   "injectors": {
     "defaultRequire": 1

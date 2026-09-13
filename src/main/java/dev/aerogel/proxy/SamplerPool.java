@@ -56,35 +56,6 @@ public final class SamplerPool implements AutoCloseable {
         return null;
     }
 
-    public int backlog() {
-        int s = 0;
-        for (OffThreadSampler w : workers) {
-            s += w.backlog();
-        }
-        return s;
-    }
-
-    public long sampledCount() {
-        long s = 0;
-        for (OffThreadSampler w : workers) {
-            s += w.sampledCount();
-        }
-        return s;
-    }
-
-    public long sampledNanos() {
-        long s = 0;
-        for (OffThreadSampler w : workers) {
-            s += w.sampledNanos();
-        }
-        return s;
-    }
-
-    public double avgMillis() {
-        long c = sampledCount();
-        return c == 0 ? 0.0 : sampledNanos() / 1e6 / c;
-    }
-
     public int threads() {
         return workers.length;
     }
