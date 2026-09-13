@@ -7,6 +7,32 @@ the gate + proxy rendering are verified in-game** (2026-09-13). Read only the
 **`# IMPLEMENTATION STATUS — READ THIS FIRST`** section of that plan; it has the file map and the verified
 vanilla signatures. **Do not re-read vanilla sources** — the plan's `# Research done` has the line numbers.
 
+## ✅ PERFORMANCE REMEDIATION — 2026-09-13 (all workstreams landed, probes PASS)
+
+The review + remediation plans live in `plans/workstreams/` (index + 6 specs). **They are implemented** and
+committed; the headless gate/promote/stress probes all PASS after the refactor. Do not redo them. Summary:
+
+- **Per-dimension.** `ProxyChunkGate`, `ProxyStreamer` and `PromotionManager` state is now per-`ServerLevel`
+  (`Map<ResourceKey<Level>, State>`); mixins dispatch on the level in scope. Fixes the bug where an overworld
+  proxy `(x,z)` was treated as a proxy in the nether/end and `placeholders` returned an overworld chunk.
+  Overworld/Nether/End all use `NoiseBasedChunkGenerator`, so all three stream; non-noise dimensions skip.
+- **Dormant fast bail.** `ProxyChunkGate.mayHaveProxy(ServerLevel)` is checked first on the
+  `ServerChunkCache.getChunk` / `Level.setBlock` / `FlowingFluid.spreadTo` hot paths; `isProxy` does the
+  cheap set checks before `getChunkNow`. `real`/`allowed`/`proxy` sets are pruned (bounded, 200-tick).
+- **Budgeted promotion plumbing.** `ProxyChunkGate.tick` drains classification completions at ~2 ms/tick and
+  chunk resends at ~1 ms/tick (was a raw 4096 cap / inline callback).
+- **Promotion queue** is bounded (oldest non-urgent evicted, urgent never dropped, deferred writes exempt),
+  evicts entries no player has been near for 10 s, and times out stuck `inFlight` (300 ticks).
+- **Streamer**: `promoteNearBand` renamed **`refineNearBand`** (it is mesh detail refinement, not terrain
+  promotion); wanted-list dedup via a per-stream membership set; refinement gated on `mayHaveProxy`.
+- **Client**: per-dimension floor/sea/void-plane (nether/end get no water classification and no y=0 plane);
+  sprite caches cleared on resource reload; `proxyPositions` is a locked primitive set; reconciliation
+  early-outs when dormant.
+- **Sampler**: point cache bounded per pool (~48 MB/dimension cap) with FIFO eighth-eviction; vertical ceiling
+  derived from the dimension's noise settings; biome diagnostic string built once per biome.
+- **Removed dead code**: `ProxyTopology.upsample`, `WireframePayload`, `ViewAreaInvoker` +
+  `LevelRendererAccessor.viewArea`, unused sampler stat counters.
+
 **What changed:** the `ProxyChunkGenerator`/`ChunkRegenerator` backwards-reset design, the save guards, the
 `nogen` test scaffolding and the `WorldGenRegion` write guard are **deleted**. `server/ProxyChunkGate` gates
 `ChunkHolder.updateFutures` so a proxy never builds its own FULL task, classifies disk-FULL vs proxy with a
@@ -23,7 +49,7 @@ client-side under the `neighbors` switch:
   `getCompiled` reports a proxy section as `CompiledSection.EMPTY` (transparent; else the occlusion walk
   stops at the proxy and real chunks beyond it never render).
 - Proxy hide is exact: hide only when the real chunk is in the renderer's actual drawn set
-  (`LevelRenderer.visibleSections`, via `LevelRendererAccessor` + `ViewAreaInvoker`); compiled-but-culled
+  (`LevelRenderer.visibleSections`, via `LevelRendererAccessor`); compiled-but-culled
   chunks keep the proxy. `isCompiled` checks the `ViewArea` slot origin because `getRenderSectionAt` wraps
   its index.
 - Client reconciliation requests a proxy mesh whenever `ProxyRenderer.isRendered` is false, including a
@@ -90,7 +116,8 @@ all** (server must not choke at ~80 chunks/s swept).
 - **Streaming**: `ProxyStreamer`. `rebuildWanted` runs on every player chunk-cross: it drops `sent` entries
   outside the radius (so re-approaching resends) and queues the window nearest-first on a fresh
   login/teleport, or only the leading-edge band incrementally during flight (O(r)/cross, 200k cap). A 20-tick
-  promotion sweep re-samples/re-sends chunks entering the near tier band. **Radius is live-tunable**
+  `refineNearBand` sweep re-samples/re-sends chunks entering the near tier band (detail refinement, **not**
+  terrain promotion; gated on `mayHaveProxy`). **Radius is live-tunable**
   (`/aerogel detail radius <4-1000>`; default 20) — the client's render distance is the other cap.
   **Budgets:** `MAX_SUBMIT_PER_TICK=512` / `MAX_PENDING=4096` / `MAX_DRAIN_PER_TICK=1024`.
   `sendAndSubmit` sends every completed in-radius chunk drained this tick as `aerogel:mesh_batch` (one packet

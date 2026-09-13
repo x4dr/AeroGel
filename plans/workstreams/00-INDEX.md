@@ -52,3 +52,35 @@ JAVA_HOME=~/.local/share/PrismLauncher/java/java-runtime-delta ./gradlew :compil
 ```
 
 The dev server is stopped, so the Gradle project lock is free. Do not start it.
+
+## STATUS — 2026-09-13: ALL WORKSTREAMS COMPLETE
+
+Commits (oldest first): `8646439` WS-01, `1603ac6` WS-02, `808d250` WS-03, `ff84b8a` WS-04,
+`3df8646` WS-05, `8364e6f` WS-06, `efea20c` dead-code sweep. All `:compileJava`/`:assemble` green.
+
+**Verified headless after the refactor** (flag files, server self-halts):
+- `aerogel.probe` → `VERDICT: PASS` (disk chunks real, fresh chunks instant placeholders) + all four
+  sampler tiers (5/9/25/81) sample.
+- `aerogel.promote` → `VERDICT PASS` (deferred write cancelled then replayed onto real terrain).
+- `aerogel.promotestress` → `VERDICT PASS` (all 25 chunks real in 20 ticks).
+
+**Not yet verified in-game**: nether/end proxy rendering, resource-reload sprite re-bake, the
+per-dimension void-plane/sea decisions, and the new promotion eviction/timeout under real flight. See
+`AGENTS.md` CURRENT TASK for the in-game checklist.
+
+### Streaming cost table (WS-03 model — estimates marked)
+
+Assumptions: uniform tier; `N=(2r+1)²`; per-chunk wire `= 8 + 2·count + biome + block` bytes; sampler
+`0.15 ms/chunk @ tier 9` (5→0.083, 9→0.15, 25→0.42, 81→1.35; 25/81 estimated); steady state `(2r+1)·80`
+chunks/s; client RAM `≈ 120 + 2·count` B/chunk; GPU ≈ 1.2 KiB/chunk.
+
+| r | N | one-time CPU @9 | one-time net @9 | steady CPU cores @9 | steady net @9 |
+|---|---|---|---|---|---|
+| 20 | 1,681 | 0.25 s | 46 KiB | 0.49 | 90 KiB/s |
+| 50 | 10,201 | 1.53 s | 279 KiB | 1.21 | 221 KiB/s |
+| 100 | 40,401 | 6.06 s | 1.08 MiB | 2.41 | 440 KiB/s |
+
+Client one-time RAM/GPU: r20 ≈ 227 KiB / ~2.0 MiB · r50 ≈ 1.34 MiB / ~12 MiB · r100 ≈ 5.3 MiB / ~47 MiB.
+The dominant cost is sampler CPU (one thread saturates near r≈32); network and client memory are small at
+normal radii. The always-on per-tick cost was the real problem, addressed by the WS-01 fast bail and the
+WS-02/03 scan gating.
