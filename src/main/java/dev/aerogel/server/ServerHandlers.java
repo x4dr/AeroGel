@@ -66,6 +66,10 @@ public final class ServerHandlers {
         if (Files.exists(server.getServerDirectory().resolve("aerogel.promotestress"))) {
             server.execute(() -> PromotionStressProbe.start(server));
         }
+        // flight harness: keeps the REAL adaptive path (no debugAlwaysOn) and waits for a player.
+        if (Files.exists(server.getServerDirectory().resolve("aerogel.flight"))) {
+            FlightProbe.start(server);
+        }
     }
 
     private static long tickStartNanos;
@@ -81,6 +85,7 @@ public final class ServerHandlers {
         if (dt >= 100_000_000L) {
             LOGGER.warn("server tick stall: {} ms", String.format("%.2f", dt / 1e6));
         }
+        FlightProbe.tick(event.getServer()); // move the pilot first, so the streamer sees the new position
         ProxyStreamer.onServerTick(event);
         PromotionProbe.tick(event.getServer());
         PromotionStressProbe.tick(event.getServer());
