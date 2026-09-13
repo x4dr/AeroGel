@@ -32,3 +32,6 @@ libs/*.jar
 # OS
 .DS_Store
 Thumbs.db
+
+# Parallel agent worktrees (if used)
+.worktrees/
