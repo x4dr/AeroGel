@@ -724,18 +724,102 @@ public final class ProxyRenderer {
      * True when the vanilla renderer is actually drawing this chunk this frame. A chunk can be real and
      * compiled yet still be culled (frustum or occlusion), so the only accurate signal is the renderer's
      * drawn-section list. When this is false the proxy must cover the chunk, or the boundary loses a chunk.
+     *
+     * <p>That signal only exists on the vanilla renderer: Sodium never fills {@code visibleSections}, so there
+     * a loaded non-air chunk is the best available answer. Without the fallback the proxy layer draws over
+     * every real chunk in view, border walls included.</p>
      */
     static boolean isRendered(ClientLevel level, long pos) {
-        return isReal(level, pos) && visibleChunks.contains(pos);
+        return isReal(level, pos)
+            && (usesVanillaVisibleSet() ? visibleChunks.contains(pos) : realCoversOnSodium(pos));
     }
 
     /** sync-loop variant of {@link #isRendered}: memoises the expensive {@code isAirStub} scan per chunk. */
     private static boolean isRenderedCached(ClientLevel level, long pos) {
-        return isRealCached(level, pos) && visibleChunks.contains(pos);
+        return isRealCached(level, pos)
+            && (usesVanillaVisibleSet() ? visibleChunks.contains(pos) : realCoversOnSodium(pos));
+    }
+
+    /**
+     * Sodium fallback for "real terrain covers this position". Inside the distance the client actually renders
+     * to, a loaded non-air chunk is a safe assumption. Past it the real chunk renders as <em>nothing</em>:
+     * the far field is Distant Horizons' territory, and a chunk the server never generated has no LOD either,
+     * so hiding the proxy there leaves a hole you can walk on. Keep covering.
+     */
+    private static boolean realCoversOnSodium(long pos) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) {
+            return true;
+        }
+        ChunkPos center = mc.player.chunkPosition();
+        int dx = Math.abs(ChunkPos.getX(pos) - center.x);
+        int dz = Math.abs(ChunkPos.getZ(pos) - center.z);
+        return Math.max(dx, dz) <= drawRadius();
     }
 
     /** chunk positions with at least one section in the renderer's drawn set; rebuilt each sync. */
     private static final LongOpenHashSet visibleChunks = new LongOpenHashSet();
+
+    /** null until first use: whether {@code visibleChunks} is a usable signal (see {@link #usesVanillaVisibleSet}). */
+    private static Boolean useVanillaVisibleSet;
+
+    /**
+     * Whether vanilla's {@code LevelRenderer.visibleSections} is the renderer in use. Sodium replaces the
+     * terrain renderer and never maintains that list, which makes an empty drawn set indistinguishable from
+     * "nothing is drawn" — the one case where trusting it is catastrophic.
+     */
+    private static boolean usesVanillaVisibleSet() {
+        Boolean cached = useVanillaVisibleSet;
+        if (cached == null) {
+            boolean vanilla = true;
+            try {
+                vanilla = !net.neoforged.fml.ModList.get().isLoaded("sodium");
+            } catch (Throwable t) {
+                // mod list not ready: assume the vanilla renderer, i.e. the behaviour verified in-game
+            }
+            cached = vanilla;
+            useVanillaVisibleSet = cached;
+        }
+        return cached;
+    }
+
+    /** short description of the drawn-set signal, for the periodic diag line. */
+    static String visibleSignal() {
+        return usesVanillaVisibleSet() ? "drawn=" + visibleChunks.size() : "unavailable(sodium)";
+    }
+
+    /**
+     * One-shot dump for {@code /aerogel diag}: the state of the hide rule over every mesh currently in the
+     * store. The first question when proxies draw over real terrain is whether the renderer's drawn set is
+     * being trusted at all, so that leads the line.
+     */
+    static String diagnostic(ClientLevel level, ChunkPos center) {
+        int radius = drawRadius();
+        int meshes = 0;
+        int real = 0;
+        int hidden = 0;
+        for (Long2ObjectMap.Entry<ClientMeshStore.Mesh> e : ClientMeshStore.meshes().long2ObjectEntrySet()) {
+            long pos = e.getLongKey();
+            if (dist(center, pos) > radius) {
+                continue;
+            }
+            meshes++;
+            if (isReal(level, pos)) {
+                real++;
+            }
+            if (isRendered(level, pos)) {
+                hidden++;
+            }
+        }
+        long here = center.toLong();
+        return String.format(
+            "diag: renderer=%s visibleChunks=%d store=%d gpu=%d | within %d: meshes=%d real=%d hidden=%d drawn=%d"
+                + " | here (%d,%d): mesh=%b real=%b rendered=%b",
+            usesVanillaVisibleSet() ? "vanilla" : "sodium (no drawn set)",
+            visibleChunks.size(), ClientMeshStore.size(), gpu.size(),
+            radius, meshes, real, hidden, meshes - hidden,
+            center.x, center.z, ClientMeshStore.has(here), isReal(level, here), isRendered(level, here));
+    }
 
     private static void rebuildVisibleChunks() {
         visibleChunks.clear();
@@ -752,6 +836,12 @@ public final class ProxyRenderer {
 
     /** bitmask of borders needing a wall: a border is walled unless the neighbour is itself a rendered proxy. */
     private static int wallMask(ClientLevel level, long pos) {
+        if (!usesVanillaVisibleSet()) {
+            // Sodium gives us no per-section visibility, so a wall cannot be aimed: the only choices are to
+            // draw one against every neighbour (a slab running to minY wherever that neighbour is air) or none
+            // at all. None, until there is a reliable signal for what is actually drawn.
+            return 0;
+        }
         int cx = ChunkPos.getX(pos);
         int cz = ChunkPos.getZ(pos);
         int mask = 0;

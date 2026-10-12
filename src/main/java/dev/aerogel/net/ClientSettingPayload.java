@@ -12,6 +12,8 @@ import net.minecraft.resources.ResourceLocation;
  */
 public record ClientSettingPayload(String feature, int value) implements CustomPacketPayload {
     public static final String DRAW_RADIUS = "drawRadius";
+    /** one-shot: log a proxy-layer diagnostic block on the client. */
+    public static final String DIAG = "diag";
 
     public static final Type<ClientSettingPayload> TYPE =
         new Type<>(ResourceLocation.fromNamespaceAndPath(AeroGel.MOD_ID, "client_setting"));

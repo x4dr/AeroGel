@@ -45,10 +45,16 @@ public final class ClientHandlers {
     private ClientHandlers() {
     }
 
-    /** apply a server-relayed client-only setting (draw radius). */
+    /** apply a server-relayed client-only setting (draw radius, one-shot diagnostics). */
     public static void applySetting(ClientSettingPayload payload) {
         switch (payload.feature()) {
             case ClientSettingPayload.DRAW_RADIUS -> ProxyRenderer.setDrawRadius(payload.value());
+            case ClientSettingPayload.DIAG -> {
+                Minecraft mc = Minecraft.getInstance();
+                if (mc.level != null && mc.player != null) {
+                    LOGGER.info(ProxyRenderer.diagnostic(mc.level, mc.player.chunkPosition()));
+                }
+            }
             default -> {
             }
         }
@@ -134,10 +140,10 @@ public final class ClientHandlers {
         ClientMeshStore.Mesh mesh = ClientMeshStore.get(chunkPos);
         if (++diagTicks % 100 == 0) {
             LevelChunk diagChunk = mc.level.getChunkSource().getChunk(player.chunkPosition().x, player.chunkPosition().z, ChunkStatus.FULL, false);
-            LOGGER.info("proxy diag: store {}, chunk ({},{}), hasMesh {}, loaded {}, y {}",
+            LOGGER.info("proxy diag: store {}, chunk ({},{}), hasMesh {}, loaded {}, visible {}, y {}",
                 ClientMeshStore.size(), player.chunkPosition().x, player.chunkPosition().z, mesh != null,
                 diagChunk == null ? "none" : ProxyChunkUtil.isAirStub(diagChunk) ? "stub" : "real",
-                String.format("%.1f", player.getY()));
+                ProxyRenderer.visibleSignal(), String.format("%.1f", player.getY()));
         }
         if (!ClientFeatures.proxy || !ClientFeatures.clamp || mesh == null) {
             return;

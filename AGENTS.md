@@ -219,6 +219,16 @@ all** (server must not choke at ~80 chunks/s swept).
   holes that only the slow `mesh_request` reconciliation healed. GPU buffers are still freed at the draw
   radius; the cheap height grids are kept. Optional debug wireframe via `/aerogel switch wireframe`, off by
   default.
+- **Renderer under Sodium / Distant Horizons — read before trusting the renderer.** Whether a proxy is drawn
+  at all is decided by "is the real chunk actually drawn", which reads vanilla's
+  `LevelRenderer.visibleSections`. Sodium replaces the terrain renderer and never fills that list, so on a
+  Sodium client the rule falls back to "a loaded non-air chunk inside the draw radius covers the position",
+  and **border walls are not emitted at all** — without a per-section visibility signal a wall cannot be
+  aimed, and an unaimed one runs to `minY` and hangs over air. Distant Horizons owns the far field: a chunk
+  the server never generated has no LOD either, so past the draw radius the proxy must keep covering the
+  position or it renders as nothing you can still walk on. The client render integration was verified on a
+  **vanilla-renderer** instance (Create family only — no Sodium, Iris or DH); a Sodium + DH client is a
+  different renderer, not a detail.
 - **Deploy**: `scripts/deploy.sh` (stop -> build -> deploy -> start); or `./gradlew :deployDemo` to copy the
   jar into a Prism Launcher instance's `mods/` — pick the instance with `-PaerogelInstance=<name>` or
   `AEROGEL_INSTANCE=<name>` (default `AeroGelDemo`). The test client also carries the Create-family jars
@@ -249,7 +259,10 @@ all** (server must not choke at ~80 chunks/s swept).
   - `/aerogel adaptive status` (backlog/tick/opt-in/opt-out/linger), `adaptive activate <1-200 ms>`,
     `adaptive deactivate <1-200 ms>`, `adaptive backlog <activate> <deactivate>` (default 64/16).
   - `draw` is client-only: the server command relays a `ClientSettingPayload` to the player.
-- **Diagnostics**: client `proxy diag`, `render perf` (per-200-frame summary: frame ms/fps/worst, `render()` ms, sync count/ms, chunk uploads, draws/frame, active morphs, payload-handle ms, GC count/ms) and `render hitch` warnings; `aerogel.perf` `client tick stall` / `client frame stall` (always-on, independent of the proxy switches; the frame-stall line names the slowest vanilla render stages); server `clamp diag`/`stream perf`/`stream state` + `server tick stall` log lines.
+- **Diagnostics**: client `proxy diag` (a `proxy diag:` log line every 5 s, now carrying the renderer signal —
+  `visible drawn=N` or `visible unavailable(sodium)`), a one-shot dump relayed by **`/aerogel diag`**
+  (`renderer=… visibleChunks=… store=… | within R: meshes=… real=… hidden=… drawn=… | here: mesh=… real=…
+  rendered=…` — the first thing to read when proxies draw over real terrain or leave holes), `render perf` (per-200-frame summary: frame ms/fps/worst, `render()` ms, sync count/ms, chunk uploads, draws/frame, active morphs, payload-handle ms, GC count/ms) and `render hitch` warnings; `aerogel.perf` `client tick stall` / `client frame stall` (always-on, independent of the proxy switches; the frame-stall line names the slowest vanilla render stages); server `clamp diag`/`stream perf`/`stream state` + `server tick stall` log lines.
 
 **Headless tools** (all self-halt; delete the flag before a normal run). The probe code lives in the `dev`
 source set (`src/dev/java`, contributed through `DevProbe`/`DevProbes` as a `ServiceLoader` provider), so it is

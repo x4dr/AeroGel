@@ -106,6 +106,14 @@ public final class ServerHandlers {
                         ctx.getSource().sendSuccess(() -> Component.literal(dump), false);
                         return 1;
                     }))
+                .then(Commands.literal("diag")
+                    .executes(ctx -> {
+                        ServerPlayer player = ctx.getSource().getPlayerOrException();
+                        PacketDistributor.sendToPlayer(player, new ClientSettingPayload(ClientSettingPayload.DIAG, 0));
+                        ctx.getSource().sendSuccess(() -> Component.literal(
+                            "AeroGel: client proxy diagnostic written to the client log"), false);
+                        return 1;
+                    }))
                 .then(Commands.literal("switch")
                     .then(Commands.argument("feature", StringArgumentType.word())
                         .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(SWITCH_FEATURES, builder))
