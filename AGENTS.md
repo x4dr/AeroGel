@@ -153,7 +153,11 @@ all** (server must not choke at ~80 chunks/s swept).
   `MAX_RADIUS_LIMIT=1000` is a testing knob, not a target; normal range is 8-32. **The worker pool is in**
   (`/aerogel detail threads <n>`): the "cores" figures are the *requirement*, so radius >~32 now just needs N
   threads, each its own `RandomState` + `PointSurfaceSampler`; the renderer still caps the useful radius
-  (~100-200). Tiers cut the far-band sampling cost on top.
+  (~100-200). **Do not try to match Distant Horizons' LOD distance with this layer.** DH streams precomputed,
+  cached LODs it only has to upload, while every proxy chunk is sampled on demand (~0.15 ms) and drawn as its
+  own `VertexBuffer`: at r=512 the fill is ~1M chunks, ~12 cores to keep up and ~1M draw calls. AeroGel owns
+  the near/transit field and the chunks DH has no LOD for; DH owns the far field. Tiers cut the far-band
+  sampling cost on top.
 - **Persistence**: vanilla persists **partial** chunks, so a proxy that received a neighbour's feature writes
   is written on unload and reloaded at its partial status — cross-border features survive a restart. AeroGel's
   old proxy save guards are **deleted** (they existed only for the old all-air FULL stubs). See
@@ -202,7 +206,8 @@ all** (server must not choke at ~80 chunks/s swept).
   vertical **draw-matrix offset** (per-chunk `riseStart`/`removeStart` on the GPU record), never a geometry
   edit — so a moving mesh costs nothing and collision (settled grid) is untouched. **First-time uploads are
   budgeted by wall time (2 ms, hard cap 512) per sync** (`overUploadBudget`). Drawn per chunk at
-  `RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS`; draw with
+  `RenderLevelStageEvent.Stage.AFTER_SKY` — before the terrain, depth-tested and **not** depth-writing — so
+  real geometry covers the proxy wherever it exists; draw with
   `new Matrix4f(event.getModelViewMatrix()).translate(-cam)` (the event's PoseStack is an IDENTITY stack in
   1.21.1 — camera rotation lives in getModelViewMatrix). Every chunk is baked at **exactly the tier the
   server sent**. Tops are slanted quads in `POSITION_TEX_COLOR`, **textured with the chunk's representative
@@ -219,16 +224,18 @@ all** (server must not choke at ~80 chunks/s swept).
   holes that only the slow `mesh_request` reconciliation healed. GPU buffers are still freed at the draw
   radius; the cheap height grids are kept. Optional debug wireframe via `/aerogel switch wireframe`, off by
   default.
-- **Renderer under Sodium / Distant Horizons — read before trusting the renderer.** Whether a proxy is drawn
-  at all is decided by "is the real chunk actually drawn", which reads vanilla's
-  `LevelRenderer.visibleSections`. Sodium replaces the terrain renderer and never fills that list, so on a
-  Sodium client the rule falls back to "a loaded non-air chunk inside the draw radius covers the position",
-  and **border walls are not emitted at all** — without a per-section visibility signal a wall cannot be
-  aimed, and an unaimed one runs to `minY` and hangs over air. Distant Horizons owns the far field: a chunk
-  the server never generated has no LOD either, so past the draw radius the proxy must keep covering the
-  position or it renders as nothing you can still walk on. The client render integration was verified on a
-  **vanilla-renderer** instance (Create family only — no Sodium, Iris or DH); a Sodium + DH client is a
-  different renderer, not a detail.
+- **Renderer under Sodium / Distant Horizons — read before trusting the renderer.** The layer is drawn
+  **before the terrain** (at `AFTER_SKY`), depth-tested but not depth-writing, so real geometry painted
+  afterwards covers it and the layer shows exactly where nothing else draws. That replaces the old "hide the
+  proxy where the real chunk is drawn" rule, which had to know what the renderer draws — a question Sodium
+  cannot answer, because it replaces the terrain renderer and never fills vanilla's
+  `LevelRenderer.visibleSections`. Two consequences to keep in mind: the layer cannot occlude anything (real
+  terrain genuinely farther away paints over it), and **border walls are not emitted under Sodium** (without a
+  per-section visibility signal a wall cannot be aimed, and an unaimed one runs to `minY` and hangs over air).
+  It also composes with Distant Horizons, which owns the far field and paints over us where it has LODs — a
+  chunk the server never generated has no LOD either, which is exactly the gap we fill. The client render
+  integration was verified on a **vanilla-renderer** instance (Create family only, no Sodium/Iris/DH); a
+  Sodium + DH client is a different renderer, not a detail.
 - **Deploy**: `scripts/deploy.sh` (stop -> build -> deploy -> start); or `./gradlew :deployDemo` to copy the
   jar into a Prism Launcher instance's `mods/` — pick the instance with `-PaerogelInstance=<name>` or
   `AEROGEL_INSTANCE=<name>` (default `AeroGelDemo`). The test client also carries the Create-family jars
