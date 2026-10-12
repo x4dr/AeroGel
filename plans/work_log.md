@@ -6,6 +6,43 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-13 — hardening pass + release prep
+
+A review of the whole mod, aimed at making a build that is either working or loudly broken. Compiles; the mod
+loads to the main menu on NeoForge 21.1.252 / FML 4.0.44 with the Create family present; `:runServer` +
+`aerogel.promote` PASSes. No mechanism was redesigned — this is bounds, dead code and honesty in the docs.
+
+- **Immediate promotion is plain vanilla generation.** Touch/landing, block writes and opted-out leftovers no
+  longer enter the promotion queue; `PromotionManager.promoteImmediate` starts them at once with no budget,
+  hard gate or `maxInFlight`, deduped only by `inFlight` (one promotion per chunk, not per write). The
+  `urgent` class and its budget/hard-gate bypass, `markUrgent`, the urgent-first `pickNext` and the
+  urgent-eviction exemption are gone. The concurrent-collection hazard the old design carried (uncapped urgent
+  queue) is gone with them.
+- **Void plane deleted.** `/aerogel switch void` had toggled nothing since the y=0 quad was hard-disabled; the
+  quad, its buffer, its build path, its perf counters and its config key are removed rather than left dead.
+- **Config validated.** `AeroGelConfig.validate()` runs at server start and corrects cross-field violations
+  (idle/busy tick time, adaptive activate/deactivate, backlog, linger ordering) with a warning; `loadFactor`
+  guards the degenerate span too. First attempt hung it off `ModConfigEvent.Loading`, which NeoForge fires
+  while the other configs are still unloaded — reading a value there throws and killed the launch. Validating
+  where the values are consumed is both correct and simpler.
+- **Probes are a dev-only source set.** The four probes moved to `src/dev/java` behind a
+  `DevProbe`/`DevProbes` `ServiceLoader` hook registered only for dev runs; the jar task takes `main` alone,
+  so no probe class is packaged and no runtime JVM flag decides whether they exist. Flag files still arm them.
+  `ProxyChunkGate.pushOutOfTerrain` and `PromotionManager.debugEnqueue` became public so the probes can call
+  them from the other source set.
+- **Both packet paths bounded.** Outbound batches are split at `MAX_BATCH_CHUNKS=2048` per packet (the
+  refinement sweep could build one batch past the client's 4096 read cap and disconnect the player);
+  `mesh_request` is per-player token-bucketed (2/s, burst 4) so one client cannot drain the level-shared
+  pending queue.
+- **Smaller fixes.** `MeshMath.surfaceAt` falls back on the grid's own shape instead of throwing on the client
+  tick path; sampler threads are named `aerogel-sampler-<i>`; `deployDemo` takes `-PaerogelInstance=<name>`
+  instead of a hardcoded instance; NeoForge pinned to 21.1.252 and Sable to 2.0.6 to match the pack.
+- **Docs corrected against the code.** The `void` switch is out of every list, promotion/rate-limit wording
+  matches the de-urgented code, and the load-order incident is closed as unreproducible with the mixins left
+  `required` on purpose (the earlier text suggested weakening them, which contradicts the fail-loud posture).
+
+---
+
 ## 2026-09-13 (later-2) — adaptive enforcement, smooth linger, per-player streaming
 
 Made AeroGel inert when it is not needed, per the "invisible mod" goal. Compiles; `aerogel.probe` and

@@ -58,7 +58,9 @@ for fast movers), not an Aeronautics problem.
 ### Scope (all fast movers, not just planes)
 - elytra, creative flight, Create trains, Aeronautics planes, whatever. Same system.
 - Create/Aeronautics-specific code is additive and loaded only when those mods are present (optional deps).
-- This is why the mod is safe in "any NeoForge config" — it degrades to a general fast-travel helper.
+- This is why the mod is usable in any NeoForge config: with no Create-family mod present it is a general
+  fast-travel helper, and while nothing is enabled or triggered it is inert — every hot path keeps a cheap
+  per-level fast bail, so a dormant AeroGel costs no measurable server time.
 
 ### Budget
 - Target ~**0.2 ms/chunk** server-side for proxy sampling; accept up to ~1 ms at high density for PoC.

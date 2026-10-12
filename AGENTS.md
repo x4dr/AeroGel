@@ -1,11 +1,23 @@
 # AeroGel — AGENTS.md
 
-## ▶ CURRENT TASK: virtual-proxy gate + client render integration — VERIFIED IN-GAME
+## ▶ CURRENT TASK: hardening pass + release prep — compiles, loads, probes PASS
 
-The plan `plans/proxy-chunk-state-machine.md` is **IMPLEMENTED, compiles, all four headless probes PASS, and
-the gate + proxy rendering are verified in-game** (2026-09-13). Read only the
-**`# IMPLEMENTATION STATUS — READ THIS FIRST`** section of that plan; it has the file map and the verified
-vanilla signatures. **Do not re-read vanilla sources** — the plan's `# Research done` has the line numbers.
+The virtual-proxy gate and the client render integration (2026-09-13,
+`plans/proxy-chunk-state-machine.md`) are unchanged and still verified in-game. On top of that a
+review-driven hardening pass landed (2026-10-13): immediate promotion is now plain vanilla generation, the
+void plane is deleted, the config is cross-checked, the headless probes are a dev-only source set, and the
+two packet paths are bounded. Verified: the mod loads to the main menu on NeoForge **21.1.252 / FML 4.0.44**,
+and `:runServer` + `touch run/server/aerogel.promote` reports **VERDICT PASS** (write deferred, immediate
+promotion, write replayed). See `plans/work_log.md` for the change list.
+
+**Posture — work, or crash, never silently nothing.** `aerogel.mixins.json` stays `"required": true` with
+`"defaultRequire": 1` on purpose: a moved injection target is a launch failure, not a silently disabled
+feature, and the config is validated rather than trusted. The flip side is the dormant path — while no
+mechanic is enabled or triggered, the mod has to be undetectable, so every hot path keeps its cheap per-level
+fast bail (`ProxyChunkGate.mayHaveProxy` first).
+
+Previous list, still open: in-game verification of detail tiers, adaptive enforcement + automatic promotion
+(`/aerogel adaptive status`, `/aerogel promote status`), then morphing if the pop ever reads badly.
 
 ## ✅ PERFORMANCE REMEDIATION — 2026-09-13 (all workstreams landed, probes PASS)
 
@@ -25,9 +37,8 @@ committed; the headless gate/promote/stress probes all PASS after the refactor. 
   evicts entries no player has been near for 10 s, and times out stuck `inFlight` (300 ticks).
 - **Streamer**: `promoteNearBand` renamed **`refineNearBand`** (it is mesh detail refinement, not terrain
   promotion); wanted-list dedup via a per-stream membership set; refinement gated on `mayHaveProxy`.
-- **Client**: per-dimension floor/sea/void-plane (nether/end get no water classification and no y=0 plane);
-  sprite caches cleared on resource reload; `proxyPositions` is a locked primitive set; reconciliation
-  early-outs when dormant.
+- **Client**: per-dimension floor/sea (nether/end get no water classification); sprite caches cleared on
+  resource reload; `proxyPositions` is a locked primitive set; reconciliation early-outs when dormant.
 - **Sampler**: point cache bounded per pool (~48 MB/dimension cap) with FIFO eighth-eviction; vertical ceiling
   derived from the dimension's noise settings; biome diagnostic string built once per biome.
 - **Removed dead code**: `ProxyTopology.upsample`, `WireframePayload`, `ViewAreaInvoker` +
@@ -59,7 +70,7 @@ Proxy water at sea level is sunk `WATER_SINK=0.15` (real surface is at `seaLevel
 the real water surface and does not z-fight it.
 
 **Bisect switches** — `/aerogel switch <feature> [true|false]` (Brigadier `bool`, not `on`/`off`): client
-`proxy`, `travel`, `void`, `anim`, `sync`, `store`, `clamp`, `reconcile`, `wireframe`, `neighbors`, `colors`;
+`proxy`, `travel`, `anim`, `sync`, `store`, `clamp`, `reconcile`, `wireframe`, `neighbors`, `colors`;
 server `movecheck`, `promote`, `gate`, `stream`, `resend`, `adaptive`.
 
 Next session, priority order:
@@ -73,11 +84,15 @@ Next session, priority order:
    shows backlog/tick/opt-in/opt-out/linger; `/aerogel switch travel true` opts a client in while the server is
    not enforcing. Stand still: the chunk under you promotes after ~10 s (`d=0` min), the fringe
    (view-distance+2 = 12 ch) after ~30 s (max), linearly between (`/aerogel promote status`); touching/landing
-   or a block write generates at once. Watch `server tick stall` / `stream perf`. Tune
-   `promote range/linger/landing/concurrency/budget/cost`.
-3. **Sable/Rapier collider PoC** — feed the proxy surface into the physics path near the hull (hook points in
+   or a block write generates at once, uncapped. Watch `server tick stall` / `stream perf`. Tune
+   `promote range/linger/landing/concurrency/budget/cost` (the budget and concurrency knobs shape **linger**
+   promotion only).
+3. **Watch the write→promotion path under a mass write** — an immediate trigger now starts the promotion
+   inside `Level.setBlock`, one per chunk (not one per write). Confirm a wide `/fill` over proxies stays
+   smooth; it is deliberately not rate-limited.
+4. **Sable/Rapier collider PoC** — feed the proxy surface into the physics path near the hull (hook points in
    `plans/investigations/aeronautics-sable-physics.md` §7). Only the crude player clamp exists today.
-4. **Morphing (optional)** — the user accepts pop-over on promotion; a vertex slide is only worth it if the
+5. **Morphing (optional)** — the user accepts pop-over on promotion; a vertex slide is only worth it if the
    pop ever reads badly. The client already renders at the source tier, so a promotion changes triangulation.
 
 A NeoForge 1.21.1 mod that stops chunk-load lag when flying Create Aeronautics contraptions very fast.
@@ -90,7 +105,7 @@ all** (server must not choke at ~80 chunks/s swept).
 
 ## Project facts
 
-- Target pack: **"2026 sinking the kitchen"** — MC 1.21.1, NeoForge 21.1.249, Create 6.0.10, Create Aeronautics 1.3.2 (bundled: aeronautics+simulated+offroad), Sable 2.0.5 (Rapier physics), Distant Horizons present.
+- Target pack: MC 1.21.1, NeoForge 21.1.252 (FML 4.0.44), Create 6.0.10, Create Aeronautics 1.3.2 (bundled: aeronautics+simulated+offroad), Sable 2.0.6 (Rapier physics), Distant Horizons present.
 - Mod id: `aerogel`. Group: `dev.aerogel`. Java 21. Single NeoForge module (server + client, one jar).
 - Build: gradle 9.4.1 wrapper, ModDevGradle `2.0.140`, Parchment 1.21/2024.11.10, NeoForm `1.21.1-20240808.144430`.
 - Dev deps (Create/Aeronautics/Sable) are staged in `libs/` from the kitchen instance — NOT pulled from maven, NOT committed. See `libs/README.md` for re-staging.
@@ -123,7 +138,10 @@ all** (server must not choke at ~80 chunks/s swept).
   `sendAndSubmit` sends every completed in-radius chunk drained this tick as `aerogel:mesh_batch` (one packet
   per tier: topology byte + long positions + `ProxyTopology.count` shorts + varint biome id + varint block id
   per chunk). Client→server reconciliation: `aerogel:mesh_request` (nearest-first missing-mesh requests every
-  1 s; server replies from grid cache or front-queues them) — heals join drops/reconnects.
+  1 s; server replies from grid cache or front-queues them) — heals join drops/reconnects. Outbound batches are
+  **split at `MAX_BATCH_CHUNKS=2048` per packet** (a refinement sweep can otherwise build one batch past the
+  client's 4096 read cap, which would drop the connection), and `mesh_request` is **per-player token-bucketed**
+  (2/s sustained, burst 4) so one client cannot drain the level-shared pending queue.
 - **Radius scaling forecast** (sampler ~0.15 ms/chunk, sweep ~80 chunks/s → leading edge `2r+1`/cross;
   demand `(2r+1)*80`/s, CPU = demand*0.15 ms, initial fill `(2r+1)^2*0.15 ms`, client draws `(2r+1)^2`/frame):
   r=20 → ~3.3k/s ≈ 0.5 core, 0.25 s fill, 1.7k draws · r=32 → ~5.2k/s ≈ 0.8 core, 0.6 s, 4.2k draws ·
@@ -151,20 +169,24 @@ all** (server must not choke at ~80 chunks/s swept).
 - **Promotion**: `server/PromotionManager` + `ProxyChunkGate.promote`. One cumulative per-chunk counter; the
   threshold interpolates with distance `t(d) = min + (d/maxRange)*(max - min)` (Chebyshev distance to the nearest
   opt-in player), with both endpoints load-adaptive (idle 10..30 s, busy 20..60 s) and `maxRange` auto =
-  view-distance + 2 (12 ch here). Touching the surface (landing) and block writes queue immediately; a player's
-  own chunk while flying uses `min`. The queue is drained immediate-first then nearest-first. **Rate limit = a
-  generation-time budget**: a token bucket refilled at `maxGenFraction` ms/ms (default 0.5 = at most half the
-  server's wall time) charged `chunkCostMs` per promotion; ordinary linger starts also stop while smoothed tick
-  time ≥ `hardGateMs`. Immediate (touch/write/opt-out) promotions bypass the budget/hard gate but still debit
-  the bucket, and `maxInFlight` bounds concurrency for all classes. Promotion **forces the FULL future forward**
+  view-distance + 2 (12 ch here). A player's own chunk while flying uses `min`. Touching the surface (landing),
+  a block write, and the leftovers around an opted-out player are **not queued at all**: the chunk goes
+  straight to vanilla generation on the trigger, with no budget, hard gate or `maxInFlight`, deduped only so
+  the same chunk is not started twice (a mass write = one promotion per chunk, not one per write). **Linger
+  promotion is the only paced path**: a token bucket refilled at `maxGenFraction` ms/ms (default 0.5 = at most
+  half the server's wall time) charged `chunkCostMs` per start, blocked while smoothed tick time ≥
+  `hardGateMs`, and bounded by `maxInFlight`; the queue drains strictly nearest-player-first. Promotion **forces the FULL future forward**
   from the chunk's persisted status — no backwards reset. `ProxyChunkGate.forcePrepare` first resets the three
   cached futures to the **exact** unloaded sentinel object (`ChunkHolderAccessor.unloadedFuture()`), because
   `updateFutures`'s ENTITY_TICKING branch throws `IllegalStateException` on an identity mismatch (a throw there
   is swallowed, leaving the holder half-demoted and crashing the next vanilla `DistanceManager.runAllUpdates`).
   `/aerogel generate` is the manual entry point. All knobs live in `config/aerogel-common.toml`
   (`AeroGelConfig`); the client switches/draw radius in `config/aerogel-client.toml` (`AeroGelClientConfig`).
+  Cross-field pairs (idle/busy tick time, adaptive activate/deactivate, backlog, linger ordering) are checked at
+  server start by `AeroGelConfig.validate()` and corrected with a warning, so a hand-edited file cannot produce
+  NaN thresholds.
 - **Block-write guard**: `mixin/LevelWriteGuardMixin` intercepts `Level.setBlock`; for a proxy it cancels the
-  write, records it, and queues the chunk, then `PromotionManager.replayWrites` re-applies it after promotion
+  write, records it, and starts the promotion immediately, then `PromotionManager.replayWrites` re-applies it after promotion
   (returning true preserves the client's prediction). `mixin/FlowingFluidMixin` cancels fluid spread into
   proxies (fluid does not promote). Bounded write log (`MAX_WRITE_LOG=256`).
 - **Clamp**: client `ClientTickEvent.Post` owns standing (snap + onGround claim → sprint/jump work); server
@@ -198,14 +220,15 @@ all** (server must not choke at ~80 chunks/s swept).
   radius; the cheap height grids are kept. Optional debug wireframe via `/aerogel switch wireframe`, off by
   default.
 - **Deploy**: `scripts/deploy.sh` (stop -> build -> deploy -> start); or `./gradlew :deployDemo` to copy the
-  jar to `~/.local/share/PrismLauncher/instances/AeroGelDemo/.minecraft/mods/`. Demo client also carries the
-  Create-family jars (create, aeronautics-bundled, sable) — mandatory channels. See "Build / run commands".
+  jar into a Prism Launcher instance's `mods/` — pick the instance with `-PaerogelInstance=<name>` or
+  `AEROGEL_INSTANCE=<name>` (default `AeroGelDemo`). The test client also carries the Create-family jars
+  (create, aeronautics-bundled, sable) — mandatory channels. See "Build / run commands".
 - **Commands** (no JVM args needed for tuning):
   - `/aerogel flyspeed <0.05-10>`, `/aerogel generate` (real chunk at the player's position),
     `/aerogel biomes` (dump the server's `Biome -> block` cache).
   - `/aerogel switch <feature> [true|false]` — **all toggles**, client + server (the argument is a Brigadier
     `bool`, so `true`/`false`, not `on`/`off`; omit it to toggle): client `proxy` (master: draw + clamp +
-    reconcile + neighbour override), `travel` (request proxy travel from the server), `void`, `anim`, `sync`,
+    reconcile + neighbour override), `travel` (request proxy travel from the server), `anim`, `sync`,
     `store`, `clamp`, `reconcile`, `wireframe`, `neighbors` (count a proxy neighbour as an existing chunk for
     vanilla's render visibility graph), `colors` (biome tint on the wire; the block texture is always sent);
     server `movecheck` (true = exempt fast creative flight/elytra from vanilla's "moved too quickly"
@@ -218,18 +241,23 @@ all** (server must not choke at ~80 chunks/s swept).
     option), `detail threads <1-64>` (sampler workers; default 1).
   - `/aerogel promote range <-1-64>` (linger range; -1 = auto view-distance+2), `promote linger <minIdle>
     <minBusy> <maxIdle> <maxBusy>` (seconds; default 10 20 30 60), `promote landing <0-64>` (blocks above the
-    proxy surface; default 8), `promote concurrency <1-16>` (in-flight regenerations; default 2),
-    `promote budget <0.05-1.0>` (fraction of wall time; default 0.5), `promote cost <ms>` (budget charged per
-    promotion; default 100), `promote hardgate <ms>` (linger tick-time brake; default 60), `promote status`
-    (effective thresholds, budget, queue/in-flight). Every setter writes the COMMON config.
+    proxy surface; default 8), `promote concurrency <1-16>` (concurrent **linger** regenerations; default 2),
+    `promote budget <0.05-1.0>` (fraction of wall time for linger; default 0.5), `promote cost <ms>` (budget
+    charged per linger promotion; default 100), `promote hardgate <ms>` (linger tick-time brake; default 60),
+    `promote status` (effective thresholds, budget, queue/in-flight). Every setter writes the COMMON config.
+    Immediate (touch / write / opt-out) promotion ignores `concurrency`, `budget` and `hardgate` by design.
   - `/aerogel adaptive status` (backlog/tick/opt-in/opt-out/linger), `adaptive activate <1-200 ms>`,
     `adaptive deactivate <1-200 ms>`, `adaptive backlog <activate> <deactivate>` (default 64/16).
   - `draw` is client-only: the server command relays a `ClientSettingPayload` to the player.
-- **Diagnostics**: client `proxy diag`, `render perf` (per-200-frame summary: frame ms/fps/worst, `render()` ms, sync count/ms, chunk uploads, draws/frame, void-quad builds, active morphs, payload-handle ms, GC count/ms) and `render hitch` warnings; `aerogel.perf` `client tick stall` / `client frame stall` (always-on, independent of the proxy switches; the frame-stall line names the slowest vanilla render stages); server `clamp diag`/`stream perf`/`stream state` + `server tick stall` log lines.
+- **Diagnostics**: client `proxy diag`, `render perf` (per-200-frame summary: frame ms/fps/worst, `render()` ms, sync count/ms, chunk uploads, draws/frame, active morphs, payload-handle ms, GC count/ms) and `render hitch` warnings; `aerogel.perf` `client tick stall` / `client frame stall` (always-on, independent of the proxy switches; the frame-stall line names the slowest vanilla render stages); server `clamp diag`/`stream perf`/`stream state` + `server tick stall` log lines.
 
-**Headless tools** (all self-halt; delete the flag before a normal run):
+**Headless tools** (all self-halt; delete the flag before a normal run). The probe code lives in the `dev`
+source set (`src/dev/java`, contributed through `DevProbe`/`DevProbes` as a `ServiceLoader` provider), so it is
+compiled into every dev run and into **no published jar**. There is no runtime flag that decides whether it
+exists — the code either is in the build or is not:
 `touch run/server/aerogel.probe` (gate smoke test), `touch run/server/aerogel.promote` (promotion +
-deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (25-chunk promotion burst).
+deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (25-chunk promotion burst),
+`touch run/server/aerogel.flight` (fast-flight benchmark matrix).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 

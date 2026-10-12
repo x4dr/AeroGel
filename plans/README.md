@@ -18,11 +18,18 @@
 3. ~~Sampler worker pool + detail tiers + biome colours/textures~~ — DONE (`SamplerPool`, `BiomeColors`).
 4. ~~Chunk lifecycle (virtual-proxy gate)~~ — DONE (`server/ProxyChunkGate`, verified in-game).
 5. ~~Automatic promotion + block-write guard~~ — DONE (`PromotionManager`, `LevelWriteGuardMixin`); in-game
-   verification pending.
-6. **Collider PoC** — feed the low-poly surface into Sable Rapier
+   verification pending. Immediate promotion is plain vanilla generation (see
+   `proxy-chunk-state-machine.md`), linger is budget-paced.
+6. ~~Hardening pass~~ — DONE (2026-10-13). Void plane deleted, config validated, probes moved to the `dev`
+   source set, outbound mesh batches split and `mesh_request` rate-limited, promotion de-urgented. Verified:
+   loads on NeoForge 21.1.252 and the `aerogel.promote` probe PASSes. See `work_log.md`.
+7. **In-game checks** — detail tiers, adaptive enforcement, automatic promotion, and the mass-write path. See
+   `../AGENTS.md` CURRENT TASK.
+8. **Collider PoC** — feed the low-poly surface into Sable Rapier
    (`RapierPhysicsPipeline.handleChunkSectionAddition` / VoxelColliderData) and vanilla entity collision;
    verify a fast hull stops without real chunks. Only the crude player clamp exists.
-7. **In-game checks** — detail tiers, automatic promotion, rider chunk-ticket coordinate space, FULL-gen
-   stall timing. See `../AGENTS.md` CURRENT TASK.
+
+`investigations/` holds the research reports; `level-mixin-load-order.md` is a closed incident record (the
+mixins are required on purpose — read it before "fixing" a load failure).
 
 See `../AGENTS.md` for standing decisions.

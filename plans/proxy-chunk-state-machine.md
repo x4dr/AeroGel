@@ -97,7 +97,7 @@ enforced at all. Nothing about the gate's mechanism or `ProxyChunkGate.promote` 
   `activateTickMs` (35 ms), and off only once both fall back below the deactivate values **and no linger
   counters remain** (so switching to vanilla never bursts instant generation). While not enforcing, a player
   whose client `travel` switch is on is still gated in their zone; an opted-out player forces vanilla locally
-  (their leftovers are queued immediate), and if the two overlap the opted-out zone wins. The client `proxy`
+  (their leftovers are promoted immediately), and if the two overlap the opted-out zone wins. The client `proxy`
   switch controls whether that player receives meshes at all (per-player streaming). `ProxyChunkGate.isEngaged`
   is the zone test; `isGated`/`isProxy` layer the allowed/real classification on top, and `isProxy` also checks
   whether the chunk is actually loaded so a vanilla-generating chunk is never mistaken for a proxy.
@@ -107,18 +107,25 @@ enforced at all. Nothing about the gate's mechanism or `ProxyChunkGate.promote` 
   `t(d) = min + (d/maxRange)*(max - min)` where `d` is the Chebyshev distance to the nearest opt-in player;
   `min`/`max` are each interpolated between idle and busy by `loadFactor` (idle 10..30 s, busy 20..60 s). So a
   chunk banked at the fringe promotes the moment it is walked into range. Real chunks are skipped.
-- **Generation budget.** `budgetMs` refills at `maxGenFraction` ms/ms (default 0.5 → half the wall time),
-  capped at `burstMs`; every promotion start costs `chunkCostMs` (default 100). Ordinary linger promotions
-  need the budget and are also blocked while smoothed tick time ≥ `hardGateMs`. **Immediate** promotions
-  (touch/landing, block write, opted-out leftovers) bypass the budget check and the hard gate so they start at
-  once, but still debit the bucket (it may go negative), which slows subsequent linger promotions. `maxInFlight`
-  (default 2) bounds concurrent regenerations for all classes. `pickNext` prefers immediate, then nearest.
+- **Immediate promotion = vanilla generation.** Touching the surface (landing), a runtime block write, and the
+  leftovers around an opted-out player are not queued: `PromotionManager.promoteImmediate` hands the chunk to
+  `ProxyChunkGate.promote` the moment it is triggered, with no budget, hard gate or `maxInFlight`. The only
+  guard is `inFlight`, so the same chunk is started once (a mass write starts one promotion per chunk, not one
+  per write — after the first, the chunk is `allowed` and `isProxy` is false, so vanilla handles the rest).
+  If the holder is not loaded yet, the trigger falls back to the linger queue rather than being lost.
+- **Linger budget.** Only linger promotion is paced. `budgetMs` refills at `maxGenFraction` ms/ms (default
+  0.5 → half the wall time), capped at `burstMs`; every linger start costs `chunkCostMs` (default 100) and is
+  blocked while smoothed tick time ≥ `hardGateMs`. `maxInFlight` (default 2) bounds concurrent linger
+  regenerations. `pickNext` takes the strictly nearest player's chunk.
 - **Config.** `dev.aerogel.common.AeroGelConfig` (COMMON, `config/aerogel-common.toml`) holds every server
   knob; `dev.aerogel.client.AeroGelClientConfig` (CLIENT, `config/aerogel-client.toml`) holds the client
-  switches + draw radius. Commands write the value back and `ModConfigSpec.save()`, so tuning persists. The
-  client syncs its persisted switch state to the server on join (bidirectional `ClientSwitchPayload`) so a
-  bare `/aerogel switch <feature>` still flips the right way. The headless probes call
-  `AdaptiveMode.debugAlwaysOn()` (non-persisting) so they still exercise the gate with no players online.
+  switches + draw radius. Commands write the value back and `ModConfigSpec.save()`, so tuning persists.
+  `AeroGelConfig.validate()` runs at server start and corrects cross-field violations (idle/busy tick time,
+  adaptive activate/deactivate, backlog, linger ordering) with a warning, so a hand-edited file cannot produce
+  NaN thresholds. The client syncs its persisted switch state to the server on join (bidirectional
+  `ClientSwitchPayload`) so a bare `/aerogel switch <feature>` still flips the right way. The headless probes
+  call `AdaptiveMode.debugAlwaysOn()` (non-persisting) so they still exercise the gate with no players online;
+  they live in the `dev` source set and are in no published jar.
 
 ## Client render integration (2026-09-13, verified in-game)
 

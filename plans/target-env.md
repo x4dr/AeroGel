@@ -8,13 +8,13 @@ Everything AeroGel builds against. Source of truth: the PrismLauncher instance
 | Component | Version | Notes |
 |---|---|---|
 | Minecraft | 1.21.1 | |
-| NeoForge | 21.1.249 | dev: moddevgradle `2.0.140`, NeoForm `1.21.1-20240808.144430` |
+| NeoForge | 21.1.252 | FML 4.0.44; dev: moddevgradle `2.0.140`, NeoForm `1.21.1-20240808.144430` |
 | Create | 6.0.10 | jar: `create-1.21.1-6.0.10.jar`; maven coordinate `com.simibubi.create:create-1.21.1:6.0.10-280` (build -280) |
 | Create Aeronautics | 1.3.2 | modrinth slug `create-aeronautics`; distributed as `create-aeronautics-bundled-...jar` |
 | — aeronautics (inner) | 1.3.2 | `dev.eriksonn.aeronautics`, modId `aeronautics` |
 | — simulated (inner) | 1.3.2 | `dev.simulated_team.simulated`, modId `simulated` |
 | — offroad (inner) | 1.3.2 | `dev.ryanhcode.offroad`, modId `offroad` |
-| Sable (physics) | 2.0.5 | `dev.ryanhcode.sable`, modId `sable`, Rapier native via `.sable/natives/` |
+| Sable (physics) | 2.0.6 | `dev.ryanhcode.sable`, modId `sable`, Rapier native via `.sable/natives/` |
 | Distant Horizons | 3.2.0-b | present in pack (rendering only; not part of AeroGel) |
 
 Aeronautics deps (from its `neoforge.mods.toml`): neoforge `[21.1.228,)`, create `[6.0.10,)`,
