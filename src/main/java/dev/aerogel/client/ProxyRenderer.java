@@ -317,7 +317,7 @@ public final class ProxyRenderer {
     }
 
     public static void render(RenderLevelStageEvent event) {
-        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS) {
+        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_SKY) {
             return;
         }
         // frame-interval / hitch accounting happens before any work so a stall in the PREVIOUS frame is
@@ -396,6 +396,13 @@ public final class ProxyRenderer {
                 RenderSystem.setShader(GameRenderer::getPositionColorShader);
                 RenderSystem.disableCull();
                 RenderSystem.disableBlend();
+                // Drawn BEFORE the terrain, depth-tested but not depth-writing: real geometry painted
+                // afterwards covers these pixels wherever it exists, so the proxy is visible exactly where
+                // nothing else draws. That is what removes the need to know what the renderer is drawing
+                // (Sodium never tells us), and it cannot leave a hole — the worst case is a proxy pixel
+                // being painted over, never a real-terrain pixel being hidden by a proxy.
+                RenderSystem.enableDepthTest();
+                RenderSystem.depthMask(false);
                 // proxy chunks are textured: bind the block atlas and use the position_tex_color shader
                 RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
                 // proxy terrain is lit by sky light 15 only (no block light): multiply the baked biome tint by
@@ -438,6 +445,7 @@ public final class ProxyRenderer {
                 VertexBuffer.unbind();
                 RenderSystem.enableCull();
                 RenderSystem.enableBlend();
+                RenderSystem.depthMask(true);
             }
         } finally {
             perfRenderNanos += System.nanoTime() - renderStart;
@@ -524,23 +532,10 @@ public final class ProxyRenderer {
             }
             ClientMeshStore.Mesh mesh = e.getValue();
             ChunkGpu g = gpu.get(pos);
-            if (isRenderedCached(level, pos) && dist(center, pos) <= renderDistance) {
-                // a real chunk took over -> sink/hide the proxy, but KEEP the mesh in the store: the real
-                // chunk only covers the client render distance, so at the border of a generated patch it
-                // leaves view again and the proxy must be drawable. The server will not resend a chunk it
-                // already sent, so dropping the mesh here turns that border into a permanent void.
-                if (g == null) {
-                    continue; // nothing uploaded; the mesh stays for when the real chunk leaves view
-                }
-                if (g.removeStart == 0L) {
-                    g.removeStart = now;
-                }
-                if (progress(g.removeStart, now) >= 1.0f) {
-                    close(g);
-                    gpu.remove(pos);
-                }
-                continue;
-            }
+            // Real terrain is no longer a reason to stop drawing a proxy: the layer is painted before the
+            // terrain and does not write depth, so anything the renderer draws covers it. Uploading
+            // unconditionally is also what guarantees no hole — a chunk the renderer happens not to draw is
+            // still covered by us.
             if (g != null && g.removeStart != 0L) {
                 // the real chunk left view again before the sink finished -> bring the proxy back
                 g.removeStart = 0L;
@@ -786,6 +781,15 @@ public final class ProxyRenderer {
     /** short description of the drawn-set signal, for the periodic diag line. */
     static String visibleSignal() {
         return usesVanillaVisibleSet() ? "drawn=" + visibleChunks.size() : "unavailable(sodium)";
+    }
+
+    /**
+     * True when the client holds real, non-air terrain for this position. Used to decide whether the server
+     * still needs to stream a proxy there — not to decide whether to draw one: the layer is painted before the
+     * terrain, so drawing everything we have is both cheaper to reason about and hole-free.
+     */
+    static boolean hasRealTerrain(ClientLevel level, long pos) {
+        return isReal(level, pos);
     }
 
     /**

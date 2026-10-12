@@ -121,9 +121,10 @@ public final class ClientHandlers {
                             if (ClientMeshStore.has(pos)) {
                                 continue;
                             }
-                            // a real chunk that is actually drawn renders itself; if it is present but not
-                            // rendered (uncompiled or culled) the proxy must cover it, so still request it
-                            if (ProxyRenderer.isRendered(mc.level, pos)) {
+                            // only ask for a proxy where the client has no real terrain to be covered by; the
+                            // covering test is not "is it drawn" (unknowable under Sodium) because the layer
+                            // is drawn first and the terrain paints over it
+                            if (ProxyRenderer.hasRealTerrain(mc.level, pos)) {
                                 continue;
                             }
                             reconcileBuffer[count++] = pos;
@@ -165,7 +166,7 @@ public final class ClientHandlers {
     @SubscribeEvent
     public static void onRenderLevelStage(RenderLevelStageEvent event) {
         ClientPerf.onStage(event);
-        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS) {
+        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_SKY) {
             return;
         }
         if (ClientFeatures.proxy) {

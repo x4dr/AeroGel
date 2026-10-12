@@ -77,6 +77,15 @@ public final class ProxyChunkGate {
     private static final int PRUNE_DISTANCE = 96;
     /** cap on entries examined per set per prune, so a large set cannot stall the tick. */
     private static final int PRUNE_SCAN_CAP = 16_384;
+    /** how often the rescue sweep for externally-generated chunks runs (ticks). */
+    private static final int RESCUE_INTERVAL_TICKS = 20;
+    /** how many proxy positions one rescue sweep may examine, so the tick stays cheap. */
+    private static final int RESCUE_SCAN_CAP = 256;
+    /**
+     * How far a rescued entity may be lifted. Deeper than this and it is underground on purpose, so it is
+     * left alone rather than flung to the surface.
+     */
+    private static final int MAX_PUSH_STEPS = 12;
     private static final long[] NO_CENTERS = new long[0];
 
     private static final Map<ResourceKey<Level>, State> STATES = new HashMap<>();
@@ -480,7 +489,7 @@ public final class ProxyChunkGate {
             }
             double y = entity.getY();
             int steps = 0;
-            while (!lvl.noCollision(entity, box) && steps++ < lvl.getHeight()) {
+            while (!lvl.noCollision(entity, box) && steps++ < MAX_PUSH_STEPS) {
                 y += 1.0;
                 box = box.move(0.0, 1.0, 0.0);
             }
@@ -559,11 +568,42 @@ public final class ProxyChunkGate {
         drainCompletions(srv);
         drainResends(srv);
         for (State state : STATES.values()) {
-            if (++state.pruneTicks % PRUNE_INTERVAL_TICKS == 0) {
+            if (++state.pruneTicks % RESCUE_INTERVAL_TICKS == 0) {
+                rescueGenerated(state);
+            }
+            if (state.pruneTicks % PRUNE_INTERVAL_TICKS == 0) {
                 prunePlaceholders(srv, state);
                 pruneSets(srv, state);
             }
         }
+    }
+
+    /**
+     * Rescue sweep for chunks that became real <em>without</em> a promotion of ours — dependency generation
+     * and vanilla's own pipeline. Terrain can appear around a player who is standing on a proxy surface, or
+     * flying into chunks being generated ahead of them, sealing them in; nothing else runs
+     * {@link #pushOutOfTerrain} for those, so they stay stuck inside a mountain.
+     *
+     * <p>Only positions this gate classified as proxies are considered, so a player who digs themselves into
+     * ordinary terrain is never touched, and {@link #MAX_PUSH_STEPS} leaves anyone genuinely deep underground
+     * where they are instead of throwing them to the surface.</p>
+     */
+    private static void rescueGenerated(State state) {
+        if (state.proxy.isEmpty()) {
+            return;
+        }
+        int scanned = 0;
+        var it = state.proxy.iterator();
+        while (it.hasNext() && scanned++ < RESCUE_SCAN_CAP) {
+            long pos = it.nextLong();
+            if (!loadedNow(state, pos)) {
+                continue; // still a proxy: nothing was generated
+            }
+            it.remove();
+            state.real.add(pos);
+            pushOutOfTerrain(state.level, new ChunkPos(pos));
+        }
+        state.anyProxy = !state.proxy.isEmpty();
     }
 
     /**
