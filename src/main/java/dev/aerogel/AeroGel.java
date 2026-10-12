@@ -35,6 +35,11 @@ public final class AeroGel {
         }
     }
 
+    /**
+     * Cross-field config sanity (see {@link AeroGelConfig#validate()}), run before anything reads a config
+     * value. It is deliberately not hung off {@code ModConfigEvent}: NeoForge fires that for the first
+     * config while the others are still unloaded, and a value read at that point throws.
+     */
     @SubscribeEvent
     void onRegisterPayloads(RegisterPayloadHandlersEvent event) {
         event.registrar("1").playToClient(MeshBatchPayload.TYPE, MeshBatchPayload.STREAM_CODEC,

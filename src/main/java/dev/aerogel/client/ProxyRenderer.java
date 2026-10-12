@@ -78,13 +78,6 @@ public final class ProxyRenderer {
     private static final int MAX_UPLOADS_PER_SYNC = 512;
     /** reuse freed chunk buffers instead of create/delete churn (fast flight rotates chunks constantly). */
     private static final int MAX_BUFFER_POOL = 1024;
-    /**
-     * The void filler is ONE quad at y=0, sized to the view and centred under the camera by its draw
-     * matrix — no per-chunk loop, no rebuild, no radius cap. (It used to be a per-chunk flat mesh out to
-     * 2x render distance, re-emitted every 500 ms; at render distance 32 that was a 129x129 field with a
-     * getChunkNow each — the join hitch and the reason for the radius cap.)
-     */
-    private static final int VOID_MIN_SIZE = 1024;
     /** water proxy top sits this far below sea level (real surface is at seaLevel-0.125) so it does not
      *  z-fight the real water surface. */
     private static final float WATER_SINK = 0.15f;
@@ -103,9 +96,6 @@ public final class ProxyRenderer {
     private static int waterTint = 0x3F76E4;
     /** overworld only: classify cells at/below sea level as water (else render the representative block). */
     private static boolean waterEnabled = true;
-    /** the single void-filler quad is only useful where there is void below y=0 (a negative min height). */
-    private static boolean voidPlaneEnabled = true;
-    private static float voidPlaneY = 0.0f;
     /**
      * Proxy draw radius (chunks). Default 0 = the vanilla render-distance option; a larger value lets the
      * proxy draw its coarse far band beyond the vanilla chunk range ({@code /aerogel detail draw <n>}).
@@ -171,10 +161,6 @@ public final class ProxyRenderer {
     private static long lastCenter = Long.MIN_VALUE;
     private static final Matrix4f scratch = new Matrix4f();
 
-    /** void filler: ONE quad at y=0, centred under the camera at draw time. */
-    private static VertexBuffer voidQuad;
-    private static int voidQuadSize;
-
     /** debug wireframe over the sampled lattice (light green), off by default; `/aerogel switch wireframe`. */
     private static VertexBuffer edgeBuffer;
     private static int edgeSegments;
@@ -194,8 +180,6 @@ public final class ProxyRenderer {
     private static long perfUploadNanos;
     private static int perfSyncs;
     private static long perfSyncNanos;
-    private static int perfVoidBuilds;
-    private static long perfVoidBuildNanos;
     private static int perfDraws;
     private static long perfAnimSum;
     private static int perfAnimFrames;
@@ -207,7 +191,6 @@ public final class ProxyRenderer {
     private static long lastUploadNanos;
     private static int lastUploadChunks;
     private static long lastSyncNanos;
-    private static long lastVoidBuildNanos;
     private static int lastActiveAnims;
 
     private ProxyRenderer() {
@@ -296,11 +279,6 @@ public final class ProxyRenderer {
         }
         bufferPool.clear();
         uploadBacklog = false;
-        if (voidQuad != null) {
-            voidQuad.close();
-            voidQuad = null;
-            voidQuadSize = 0;
-        }
         if (edgeBuffer != null) {
             edgeBuffer.close();
             edgeBuffer = null;
@@ -323,10 +301,9 @@ public final class ProxyRenderer {
 
     /**
      * Derive the per-dimension geometry constants from the current level. Overworld: sea level 63, water
-     * classification + the overworld water tint, void plane at y=0. Any other dimension (nether, end,
-     * modded): water classification is disabled — cells render with the server's representative block
-     * texture/tint, never the overworld blue — and the void plane is only kept where the dimension has a
-     * negative min build height (i.e. actual void below y=0). Walls always bottom out at the level's min
+     * classification + the overworld water tint. Any other dimension (nether, end, modded): water
+     * classification is disabled — cells render with the server's representative block texture/tint,
+     * never the overworld blue. Walls always bottom out at the level's min
      * build height. The client clears meshes + the renderer on a dimension change, so geometry baked here
      * is never drawn under another dimension's constants.
      */
@@ -337,9 +314,6 @@ public final class ProxyRenderer {
         waterEnabled = overworld;
         waterTint = 0x3F76E4;
         seaLevel = overworld ? Math.min(63, maxY) : Integer.MIN_VALUE;
-        // The flat y=0 void-filler quad showed up as a "floor under the map"; disabled everywhere.
-        voidPlaneEnabled = false;
-        voidPlaneY = 0.0f;
     }
 
     public static void render(RenderLevelStageEvent event) {
@@ -361,8 +335,8 @@ public final class ProxyRenderer {
                 perfWorstFrameNanos = dt;
             }
             if (dt >= HITCH_MS * 1_000_000L) {
-                LOGGER.warn("render hitch: {} ms frame | prev sync {} ms ({} uploads), void {} ms, morphs {}, store-handle {} ms/{} chunks",
-                    ms(dt), ms(lastSyncNanos), lastUploadChunks, ms(lastVoidBuildNanos), lastActiveAnims,
+                LOGGER.warn("render hitch: {} ms frame | prev sync {} ms ({} uploads), morphs {}, store-handle {} ms/{} chunks",
+                    ms(dt), ms(lastSyncNanos), lastUploadChunks, lastActiveAnims,
                     ms(handleNanos), handleChunks);
             }
         }
@@ -370,7 +344,6 @@ public final class ProxyRenderer {
         lastSyncNanos = 0L;
         lastUploadNanos = 0L;
         lastUploadChunks = 0;
-        lastVoidBuildNanos = 0L;
         long renderStart = frameNanos;
         try {
             Minecraft mc = Minecraft.getInstance();
@@ -406,14 +379,7 @@ public final class ProxyRenderer {
                 }
                 lastWireframe = wireframe;
             }
-            if (voidPlaneEnabled && voidQuad == null) {
-                long t0 = System.nanoTime();
-                ensureVoidQuad(drawRadius());
-                lastVoidBuildNanos = System.nanoTime() - t0;
-                perfVoidBuilds++;
-                perfVoidBuildNanos += lastVoidBuildNanos;
-            }
-            if (gpu.isEmpty() && voidQuad == null) {
+            if (gpu.isEmpty()) {
                 return;
             }
             // NOTE: at this stage NeoForge passes a null PoseStack -> getPoseStack() is an IDENTITY stack
@@ -430,12 +396,6 @@ public final class ProxyRenderer {
                 RenderSystem.setShader(GameRenderer::getPositionColorShader);
                 RenderSystem.disableCull();
                 RenderSystem.disableBlend();
-                if (ClientFeatures.voidQuad && voidQuad != null) {
-                    scratch.set(base);
-                    scratch.translate((float) camPos.x, voidPlaneY, (float) camPos.z);
-                    voidQuad.bind();
-                    voidQuad.drawWithShader(scratch, event.getProjectionMatrix(), GameRenderer.getPositionColorShader());
-                }
                 // proxy chunks are textured: bind the block atlas and use the position_tex_color shader
                 RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
                 // proxy terrain is lit by sky light 15 only (no block light): multiply the baked biome tint by
@@ -503,13 +463,12 @@ public final class ProxyRenderer {
         long gcMsDelta = lastGcTime < 0L ? 0L : gcTime - lastGcTime;
         lastGcCount = gcCount;
         lastGcTime = gcTime;
-        LOGGER.info("render perf: {} ms/frame ({} fps, worst {} ms), render() {} ms avg | syncs {}/{} frames ({} ms avg), {} uploads ({} ms avg) | {} draws/frame | void quad {} builds ({} ms avg) | morphs {} avg, {}% frames | handle {} ms/{} chunks | gc {}/{} ms | store {}",
+        LOGGER.info("render perf: {} ms/frame ({} fps, worst {} ms), render() {} ms avg | syncs {}/{} frames ({} ms avg), {} uploads ({} ms avg) | {} draws/frame | morphs {} avg, {}% frames | handle {} ms/{} chunks | gc {}/{} ms | store {}",
             fmt(avgFrame), fmt(avgFrame > 0 ? 1000.0 / avgFrame : 0), fmt(perfWorstFrameNanos / 1e6),
             fmt(perfRenderNanos / 1e6 / perfFrames),
             perfSyncs, perfFrames, fmt(perfSyncs > 0 ? perfSyncNanos / 1e6 / perfSyncs : 0),
             perfUploads, fmt(perfUploads > 0 ? perfUploadNanos / 1e6 / perfUploads : 0),
             perfDraws / Math.max(1, perfFrames),
-            perfVoidBuilds, fmt(perfVoidBuilds > 0 ? perfVoidBuildNanos / 1e6 / perfVoidBuilds : 0),
             fmt(perfAnimSum / (double) perfFrames), perfAnimFrames * 100 / Math.max(1, perfFrames),
             fmt(perfHandleNanos / 1e6), perfHandleChunks, gcDelta, gcMsDelta, ClientMeshStore.size());
         perfFrames = 0;
@@ -519,8 +478,6 @@ public final class ProxyRenderer {
         perfUploadNanos = 0L;
         perfSyncs = 0;
         perfSyncNanos = 0L;
-        perfVoidBuilds = 0;
-        perfVoidBuildNanos = 0L;
         perfDraws = 0;
         perfAnimSum = 0L;
         perfAnimFrames = 0;
@@ -690,37 +647,6 @@ public final class ProxyRenderer {
         perfUploads++;
         perfUploadNanos += lastUploadNanos;
         lastUploadChunks++;
-    }
-
-    /**
-     * Build the single void-filler quad once (rebuilt only if the view size changes). It is centred at
-     * the origin and translated under the camera by its draw matrix, so it never needs rebuilding as the
-     * player moves.
-     */
-    private static void ensureVoidQuad(int renderDistance) {
-        int size = Math.max(renderDistance * 32, VOID_MIN_SIZE);
-        if (voidQuad != null && voidQuadSize == size) {
-            return;
-        }
-        float h = size * 0.5f;
-        float r = 0.30f;
-        float g = 0.32f;
-        float b = 0.36f;
-        BufferBuilder builder = Tesselator.getInstance().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_COLOR);
-        builder.addVertex(-h, 0.0f, -h).setColor(r, g, b, 1.0f);
-        builder.addVertex(-h, 0.0f, h).setColor(r, g, b, 1.0f);
-        builder.addVertex(h, 0.0f, h).setColor(r, g, b, 1.0f);
-        builder.addVertex(h, 0.0f, -h).setColor(r, g, b, 1.0f);
-        MeshData data = builder.buildOrThrow();
-        VertexBuffer target = voidQuad;
-        if (target == null) {
-            target = new VertexBuffer(VertexBuffer.Usage.STATIC);
-        }
-        target.bind();
-        target.upload(data);
-        VertexBuffer.unbind();
-        voidQuad = target;
-        voidQuadSize = size;
     }
 
     /** debug wireframe: one DEBUG_LINES buffer over every visible proxy chunk's lattice. */

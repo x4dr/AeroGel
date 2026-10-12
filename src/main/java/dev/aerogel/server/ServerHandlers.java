@@ -1,5 +1,6 @@
 package dev.aerogel.server;
 
+import dev.aerogel.common.AeroGelConfig;
 import dev.aerogel.common.ProxyTopology;
 import dev.aerogel.net.ClientSettingPayload;
 import dev.aerogel.net.ClientSwitchPayload;
@@ -11,7 +12,6 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
-import java.nio.file.Files;
 import java.util.HashMap;
 import java.util.Map;
 import net.minecraft.commands.CommandSourceStack;
@@ -40,7 +40,7 @@ public final class ServerHandlers {
     private static final String[] TIER_NAMES = { "5", "9", "25", "81" };
     /** client bisect switches plus the server-side toggles, all under {@code /aerogel switch}. */
     private static final String[] SWITCH_FEATURES = {
-        "proxy", "travel", "void", "anim", "sync", "store", "clamp", "reconcile", "wireframe", "neighbors",
+        "proxy", "travel", "anim", "sync", "store", "clamp", "reconcile", "wireframe", "neighbors",
         "colors", "movecheck", "promote", "gate", "stream", "resend", "adaptive"
     };
 
@@ -50,26 +50,9 @@ public final class ServerHandlers {
     @SubscribeEvent
     public static void onServerStarted(ServerStartedEvent event) {
         MinecraftServer server = event.getServer();
+        AeroGelConfig.validate(); // cross-field config sanity, before anything reads a value
         ProxyStreamer.init(server);
-        boolean probe = Files.exists(server.getServerDirectory().resolve("aerogel.probe"))
-            || Files.exists(server.getServerDirectory().resolve("aerogel.promote"))
-            || Files.exists(server.getServerDirectory().resolve("aerogel.promotestress"));
-        if (probe) {
-            AdaptiveMode.debugAlwaysOn(); // headless probes have no players to opt in
-        }
-        if (Files.exists(server.getServerDirectory().resolve("aerogel.probe"))) {
-            server.execute(() -> new GenerationProbe(server.overworld()).run());
-        }
-        if (Files.exists(server.getServerDirectory().resolve("aerogel.promote"))) {
-            server.execute(() -> PromotionProbe.start(server));
-        }
-        if (Files.exists(server.getServerDirectory().resolve("aerogel.promotestress"))) {
-            server.execute(() -> PromotionStressProbe.start(server));
-        }
-        // flight harness: keeps the REAL adaptive path (no debugAlwaysOn) and waits for a player.
-        if (Files.exists(server.getServerDirectory().resolve("aerogel.flight"))) {
-            FlightProbe.start(server);
-        }
+        DevProbes.onServerStarted(server);
     }
 
     private static long tickStartNanos;
@@ -85,10 +68,8 @@ public final class ServerHandlers {
         if (dt >= 100_000_000L) {
             LOGGER.warn("server tick stall: {} ms", String.format("%.2f", dt / 1e6));
         }
-        FlightProbe.tick(event.getServer()); // move the pilot first, so the streamer sees the new position
+        DevProbes.onServerTick(event.getServer());
         ProxyStreamer.onServerTick(event);
-        PromotionProbe.tick(event.getServer());
-        PromotionStressProbe.tick(event.getServer());
     }
 
     @SubscribeEvent

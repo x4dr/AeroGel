@@ -12,7 +12,7 @@ import net.minecraft.resources.ResourceLocation;
  */
 public record ClientSwitchPayload(String feature, boolean on) implements CustomPacketPayload {
     public static final String[] FEATURES = {
-        "proxy", "travel", "void", "anim", "sync", "store", "clamp", "reconcile", "wireframe", "neighbors"
+        "proxy", "travel", "anim", "sync", "store", "clamp", "reconcile", "wireframe", "neighbors"
     };
 
     public static final Type<ClientSwitchPayload> TYPE =

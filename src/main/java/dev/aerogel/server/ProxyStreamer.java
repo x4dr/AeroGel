@@ -79,6 +79,12 @@ public final class ProxyStreamer {
     private static final int MAX_DRAIN_PER_TICK = 1024;
 
     private static MinecraftServer server;
+    /** how many chunks go into one outgoing packet. Must stay under the client's MeshBatchPayload read cap. */
+    private static final int MAX_BATCH_CHUNKS = 2048;
+    /** per-player reconciliation rate limit: sustained mesh_request grants per second, and the burst. */
+    private static final double REQUEST_TOKENS_PER_SEC = 2.0;
+    private static final double REQUEST_BURST = 4.0;
+
     private static final Map<ResourceKey<Level>, State> STATES = new HashMap<>();
 
     /** the finest tier, used within {@link #nearDistance} chunks of a player. */
@@ -774,14 +780,38 @@ public final class ProxyStreamer {
             if (batch.pos.isEmpty()) {
                 continue; // tier retained from an earlier tick, already reset
             }
-            MeshBatchPayload packet = new MeshBatchPayload(batch.tier, batch.pos.toLongArray(),
-                batch.heights.toShortArray(), batch.biomes.toIntArray(), batch.blocks.toIntArray());
-            int n = batch.pos.size();
+            sent += flushBatch(player, batch);
             batch.reset();
-            PacketDistributor.sendToPlayer(player, packet);
-            sent += n;
         }
         return sent;
+    }
+
+    /**
+     * Send one tier's accumulated batch as packets of at most {@link #MAX_BATCH_CHUNKS} chunks. A single
+     * batch can otherwise be arbitrarily large — the near-band refinement sweep alone adds a whole
+     * {@code (2*r+1)^2} band in one tick — and the client rejects a batch over
+     * {@code MeshBatchPayload.MAX_CHUNKS} at decode time, which drops the connection.
+     */
+    private static int flushBatch(ServerPlayer player, Batch batch) {
+        int total = batch.pos.size();
+        int heightsPer = ProxyTopology.count(batch.tier);
+        for (int start = 0; start < total; start += MAX_BATCH_CHUNKS) {
+            int n = Math.min(MAX_BATCH_CHUNKS, total - start);
+            long[] pos = new long[n];
+            short[] heights = new short[n * heightsPer];
+            int[] biomes = new int[n];
+            int[] blocks = new int[n];
+            for (int i = 0; i < n; i++) {
+                pos[i] = batch.pos.getLong(start + i);
+                System.arraycopy(batch.heights.elements(), (start + i) * heightsPer,
+                    heights, i * heightsPer, heightsPer);
+                biomes[i] = batch.biomes.getInt(start + i);
+                blocks[i] = batch.blocks.getInt(start + i);
+            }
+            PacketDistributor.sendToPlayer(player,
+                new MeshBatchPayload(batch.tier, pos, heights, biomes, blocks));
+        }
+        return total;
     }
 
     /**
@@ -852,6 +882,9 @@ public final class ProxyStreamer {
         /** membership mirror of {@code wanted[wantedIndex..]}: O(1) dedup without scanning the queue. */
         final LongOpenHashSet queued = new LongOpenHashSet();
         int wantedIndex;
+        /** reconciliation rate limit: tokens for urgent mesh_request grants, and the last refill time. */
+        double requestTokens = REQUEST_BURST;
+        long requestRefillNanos;
 
         Stream() {
             sent.defaultReturnValue((byte) 0);
@@ -879,10 +912,30 @@ public final class ProxyStreamer {
         }
     }
 
+    /** per-player token bucket for the reconciliation request path (see {@link #onMeshRequest}). */
+    private static boolean allowRequest(Stream stream) {
+        long now = System.nanoTime();
+        if (stream.requestRefillNanos == 0L) {
+            stream.requestRefillNanos = now;
+            return true;
+        }
+        double elapsedSec = (now - stream.requestRefillNanos) / 1_000_000_000.0;
+        stream.requestRefillNanos = now;
+        stream.requestTokens = Math.min(REQUEST_BURST, stream.requestTokens + elapsedSec * REQUEST_TOKENS_PER_SEC);
+        if (stream.requestTokens < 1.0) {
+            return false;
+        }
+        stream.requestTokens -= 1.0;
+        return true;
+    }
+
     /**
      * Client reconciliation: the client asks for meshes it is missing (join drops, reconnects, ...).
-     * Cached grids go out immediately (one reply batch per tier), uncached ones jump the wanted queue via
-     * `urgent`.
+     * Cached grids go out immediately (one reply batch per tier), uncached ones jump the wanted queue.
+     *
+     * <p>Rate-limited per player: the request path can enqueue sampler work, and the pending queue it feeds
+     * is shared by the whole level, so an unbounded request rate would let one client starve sampling for
+     * everyone else. The buckets are sized well above what a real client does (one pass per second).</p>
      */
     public static void onMeshRequest(ServerPlayer player, MeshRequestPayload payload) {
         State state = state(player.level());
@@ -890,6 +943,9 @@ public final class ProxyStreamer {
             return;
         }
         Stream stream = state.streams.computeIfAbsent(player.getUUID(), id -> new Stream());
+        if (!allowRequest(stream)) {
+            return; // over the limit: the client retries on its next reconciliation pass
+        }
         ChunkPos center = player.chunkPosition();
         Map<Byte, Batch> batches = new HashMap<>();
         int urgentAdded = 0;

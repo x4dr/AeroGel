@@ -28,9 +28,12 @@ public final class MeshMath {
             return fan(lx, lz, grid);
         }
         if (!ProxyTopology.valid(topology)) {
-            // Only FIVE and the square-grid tiers have a defined layout here. Fail loudly instead of
-            // guessing (the old code silently ran the NINE path for any other byte).
-            throw new IllegalArgumentException("MeshMath.surfaceAt: unsupported topology " + topology);
+            // Unreachable through the network path: MeshBatchPayload rejects an unknown topology before a
+            // mesh can be stored, and the sampler only ever emits valid tiers. If it ever were reached
+            // (a caller passing a raw byte), fall back on the grid's own shape rather than throwing: this
+            // runs on the client tick / render path, where a crash is worse than a wrong surface.
+            int side = (int) Math.round(Math.sqrt(grid.length));
+            return side >= 2 && side * side == grid.length ? gridN(lx, lz, grid, side) : fan(lx, lz, grid);
         }
         // Explicit square-grid dispatch: NINE (3x3) and the finer tiers use their real side, so a 25/81
         // grid is not read through the hardcoded NINE window.

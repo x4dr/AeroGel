@@ -42,7 +42,7 @@ public final class OffThreadSampler implements AutoCloseable {
     private final ConcurrentLinkedQueue<Result> done = new ConcurrentLinkedQueue<>();
     private volatile boolean running = true;
 
-    public OffThreadSampler(RandomState state, NoiseGeneratorSettings settings, BiomeSource biomeSource,
+    public OffThreadSampler(int index, RandomState state, NoiseGeneratorSettings settings, BiomeSource biomeSource,
             net.minecraft.core.Registry<net.minecraft.world.level.biome.Biome> biomeRegistry, int maxCache) {
         this.sampler = new PointSurfaceSampler(state, settings, maxCache);
         this.seaLevel = settings.seaLevel();
@@ -52,7 +52,7 @@ public final class OffThreadSampler implements AutoCloseable {
         this.tint = biomeSource != null && biomeRegistry != null
             ? new BiomeTint(biomeSource, biomeRegistry, state.sampler(), seaLevel)
             : null;
-        this.thread = new Thread(this::loop, "aerogel-sampler");
+        this.thread = new Thread(this::loop, "aerogel-sampler-" + index);
         this.thread.setDaemon(true);
         this.thread.start();
     }

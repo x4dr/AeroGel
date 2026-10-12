@@ -3,6 +3,8 @@ package dev.aerogel.common;
 import java.util.Arrays;
 import net.neoforged.neoforge.common.ModConfigSpec;
 import org.apache.commons.lang3.tuple.Pair;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Server/shared configuration ({@code config/aerogel-common.toml}). Every tunable that used to be a
@@ -16,6 +18,7 @@ import org.apache.commons.lang3.tuple.Pair;
  * and {@code gate} is the virtual-proxy gate itself. See the generated TOML comments for each key.</p>
  */
 public final class AeroGelConfig {
+    private static final Logger LOGGER = LoggerFactory.getLogger("aerogel");
     public static final AeroGelConfig CFG;
     public static final ModConfigSpec SPEC;
 
@@ -159,5 +162,49 @@ public final class AeroGelConfig {
         resendEnabled = b.comment("Resend the chunk packet when a proxy is promoted.")
             .define("resend", true);
         b.pop();
+    }
+
+    /**
+     * Cross-field sanity pass, run whenever the config is loaded or reloaded. The spec range-checks each key
+     * on its own; these are the relationships between keys that it cannot express. A violation is corrected
+     * in memory and logged, so a hand-edited file can never leave the server in a degenerate state — e.g.
+     * {@code idleTickMs == busyTickMs} would make the load interpolation a division by zero, which would
+     * read as "fully loaded" and promote every proxy at once.
+     *
+     * <p>The {@code /aerogel} commands already normalise their own arguments; this covers the file.</p>
+     */
+    public static void validate() {
+        AeroGelConfig cfg = CFG;
+        if (cfg.busyTickMs.get() <= cfg.idleTickMs.get()) {
+            double fixed = Math.min(cfg.idleTickMs.get() + 1.0, 200.0);
+            LOGGER.warn("aerogel: busyTickMs ({}) must be above idleTickMs ({}); using {}",
+                cfg.busyTickMs.get(), cfg.idleTickMs.get(), fixed);
+            cfg.busyTickMs.set(fixed);
+        }
+        if (cfg.adaptiveDeactivateTickMs.get() >= cfg.adaptiveActivateTickMs.get()) {
+            double fixed = Math.max(cfg.adaptiveActivateTickMs.get() - 1.0, 1.0);
+            LOGGER.warn("aerogel: deactivateTickMs ({}) must be below activateTickMs ({}); using {}",
+                cfg.adaptiveDeactivateTickMs.get(), cfg.adaptiveActivateTickMs.get(), fixed);
+            cfg.adaptiveDeactivateTickMs.set(fixed);
+        }
+        if (cfg.adaptiveBacklogDeactivate.get() >= cfg.adaptiveBacklogActivate.get()) {
+            int fixed = Math.max(cfg.adaptiveBacklogActivate.get() / 2, 0);
+            LOGGER.warn("aerogel: backlogDeactivate ({}) must be below backlogActivate ({}); using {}",
+                cfg.adaptiveBacklogDeactivate.get(), cfg.adaptiveBacklogActivate.get(), fixed);
+            cfg.adaptiveBacklogDeactivate.set(fixed);
+        }
+        // linger endpoints must be non-decreasing, or the distance interpolation inverts.
+        int minIdle = cfg.lingerMinIdleSeconds.get();
+        int minBusy = Math.max(minIdle, cfg.lingerMinBusySeconds.get());
+        int maxIdle = Math.max(minBusy, cfg.lingerMaxIdleSeconds.get());
+        int maxBusy = Math.max(maxIdle, cfg.lingerMaxBusySeconds.get());
+        if (minBusy != cfg.lingerMinBusySeconds.get() || maxIdle != cfg.lingerMaxIdleSeconds.get()
+            || maxBusy != cfg.lingerMaxBusySeconds.get()) {
+            LOGGER.warn("aerogel: linger endpoints must be non-decreasing ({} {} {} {}); clamping",
+                minIdle, cfg.lingerMinBusySeconds.get(), cfg.lingerMaxIdleSeconds.get(), cfg.lingerMaxBusySeconds.get());
+            cfg.lingerMinBusySeconds.set(minBusy);
+            cfg.lingerMaxIdleSeconds.set(maxIdle);
+            cfg.lingerMaxBusySeconds.set(maxBusy);
+        }
     }
 }

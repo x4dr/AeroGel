@@ -28,7 +28,7 @@ public final class SamplerPool implements AutoCloseable {
         int maxCache = PointSurfaceSampler.workerCacheCap(n);
         workers = new OffThreadSampler[n];
         for (int i = 0; i < n; i++) {
-            workers[i] = new OffThreadSampler(states.get(i), settings, biomeSource, biomeRegistry, maxCache);
+            workers[i] = new OffThreadSampler(i, states.get(i), settings, biomeSource, biomeRegistry, maxCache);
         }
     }
 

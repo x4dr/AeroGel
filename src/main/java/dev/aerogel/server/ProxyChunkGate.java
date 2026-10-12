@@ -329,6 +329,12 @@ public final class ProxyChunkGate {
         return loadedNow(state(lvl), pos);
     }
 
+    /** true when this level currently has a visible holder for the position (a promotion can start). */
+    public static boolean hasHolder(ServerLevel lvl, long pos) {
+        State state = state(lvl);
+        return state != null && state.chunkMap.getVisibleChunkIfPresent(pos) != null;
+    }
+
     /** EMA of the main-thread cost of finishing one promotion (push + replay + resend), in ms. */
     public static double postCostMs(ServerLevel lvl) {
         State state = state(lvl);
@@ -456,7 +462,7 @@ public final class ProxyChunkGate {
      * A chunk can generate with real blocks where an entity already is (the proxy surface was a diagonal
      * approximation). Push anything overlapping the new geometry straight up until its bounding box is free.
      */
-    static void pushOutOfTerrain(ServerLevel lvl, ChunkPos pos) {
+    public static void pushOutOfTerrain(ServerLevel lvl, ChunkPos pos) {
         AABB area = new AABB(pos.getMinBlockX(), lvl.getMinBuildHeight(), pos.getMinBlockZ(),
             pos.getMaxBlockX() + 1, lvl.getMaxBuildHeight(), pos.getMaxBlockZ() + 1);
         List<Entity> targets = new ArrayList<>(lvl.getEntitiesOfClass(Entity.class, area));

@@ -16,7 +16,6 @@ public final class AeroGelClientConfig {
     public final ModConfigSpec.BooleanValue proxy;
     /** per-player request: "I want to travel without generating chunks" (use the linger gate). */
     public final ModConfigSpec.BooleanValue travel;
-    public final ModConfigSpec.BooleanValue voidQuad;
     public final ModConfigSpec.BooleanValue anim;
     public final ModConfigSpec.BooleanValue sync;
     public final ModConfigSpec.BooleanValue store;
@@ -40,13 +39,11 @@ public final class AeroGelClientConfig {
             .define("proxy", true);
         travel = b.comment("Request proxy travel from the server: don't generate chunks until you linger/touch.")
             .define("travel", false);
-        voidQuad = b.comment("The single flat void-filler quad.")
-            .define("void", true);
         anim = b.comment("The rise/sink draw-matrix animation.")
             .define("anim", false);
         sync = b.comment("The periodic sync: wall re-bakes, real-chunk takeover, chunk uploads.")
             .define("sync", true);
-        store = b.comment("Store incoming mesh payloads (off = the client ignores meshes).")
+        store = b.comment("Store incoming mesh payloads (off: stop accepting new meshes; stored ones keep rendering).")
             .define("store", true);
         clamp = b.comment("The client-side walking clamp.")
             .define("clamp", true);

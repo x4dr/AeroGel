@@ -13,6 +13,13 @@ java {
     toolchain.languageVersion = JavaLanguageVersion.of(java_version)
 }
 
+// Dev-only source set: the headless probes (see server/DevProbe). Compiled for development runs only and
+// never packaged into a published artifact, so production code never references a probe class and needs no
+// runtime JVM flag to decide whether they exist. The default directories are src/dev/java + src/dev/resources.
+sourceSets {
+    dev
+}
+
 neoForge {
     version = neoforge_version
 
@@ -44,19 +51,27 @@ neoForge {
     mods {
         "${mod_id}" {
             sourceSet sourceSets.main
+            // The headless probes. Registered for development runs only; the jar task takes sourceSets.main
+            // output alone, so no probe class is ever packaged into a published build.
+            sourceSet sourceSets.dev
         }
     }
 }
 
 sourceSets.main.resources { srcDir 'src/generated/resources' }
 
-// Build + copy the mod jar into the AeroGelDemo Prism instance's mods folder.
+// Build + copy the mod jar into a Prism Launcher instance's mods folder. Override the instance with
+// -PaerogelInstance=<name> or AEROGEL_INSTANCE=<name> (default: AeroGelDemo).
 tasks.register('deployDemo', Copy) {
     dependsOn tasks.named('assemble')
     from(layout.buildDirectory.dir('libs')) {
         include "aerogel-${minecraft_version}-${mod_version}.jar"
     }
-    into "${System.getProperty('user.home')}/.local/share/PrismLauncher/instances/AeroGelDemo/.minecraft/mods"
+    String instance = providers.gradleProperty('aerogelInstance')
+        .orElse(providers.environmentVariable('AEROGEL_INSTANCE'))
+        .orElse('AeroGelDemo')
+        .get()
+    into "${System.getProperty('user.home')}/.local/share/PrismLauncher/instances/${instance}/.minecraft/mods"
 }
 
 repositories {
@@ -132,3 +147,8 @@ tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release = java_version.toInteger()
 }
+
+// The dev source set (headless probes) compiles against main's output and everything main compiles against.
+// Wired after the dependency blocks so the NeoForge/Minecraft classpath moddev installs is already in place.
+sourceSets.dev.compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+sourceSets.dev.runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath

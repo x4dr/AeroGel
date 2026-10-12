@@ -10,13 +10,11 @@ public final class ClientFeatures {
     public static volatile boolean proxy = true;
     /** per-player request: "I want to travel without generating chunks" (use the linger gate). */
     public static volatile boolean travel = false;
-    /** the single flat void-filler quad. */
-    public static volatile boolean voidQuad = true;
     /** the rise/sink draw-matrix animation; off by default so proxies pop in with no morph. */
     public static volatile boolean anim = false;
     /** the periodic sync: wall re-bakes, real-chunk takeover, chunk uploads. */
     public static volatile boolean sync = true;
-    /** storing incoming mesh payloads (off = the client ignores meshes). */
+    /** storing incoming mesh payloads (off: stop accepting new meshes; already-stored ones keep rendering). */
     public static volatile boolean store = true;
     /** the client-side walking clamp. */
     public static volatile boolean clamp = true;
@@ -33,7 +31,6 @@ public final class ClientFeatures {
         AeroGelClientConfig cfg = AeroGelClientConfig.CFG;
         proxy = cfg.proxy.get();
         travel = cfg.travel.get();
-        voidQuad = cfg.voidQuad.get();
         anim = cfg.anim.get();
         sync = cfg.sync.get();
         store = cfg.store.get();
@@ -55,10 +52,6 @@ public final class ClientFeatures {
             case "travel" -> {
                 travel = on;
                 cfg.travel.set(on);
-            }
-            case "void" -> {
-                voidQuad = on;
-                cfg.voidQuad.set(on);
             }
             case "anim" -> {
                 anim = on;
@@ -98,7 +91,6 @@ public final class ClientFeatures {
         return switch (feature) {
             case "proxy" -> proxy;
             case "travel" -> travel;
-            case "void" -> voidQuad;
             case "anim" -> anim;
             case "sync" -> sync;
             case "store" -> store;

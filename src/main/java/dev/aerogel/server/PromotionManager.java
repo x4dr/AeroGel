@@ -37,33 +37,35 @@ import org.slf4j.LoggerFactory;
  * moment it is walked into range.</p>
  *
  * <p><b>Immediate.</b> Touching the surface (descending/landing within {@code landingMargin} above the
- * sampled height) and any runtime block write queue the chunk at once. Players who have opted out of proxy
- * travel also have their nearby leftovers forced to real terrain.</p>
+ * sampled height), any runtime block write, and the nearby leftovers of a player who opted out of proxy
+ * travel are not queued at all: the chunk is handed straight to vanilla generation the moment it is
+ * triggered, with no budget, hard gate or concurrency cap. That is the "let vanilla do it" path — the only
+ * limit is that the same chunk is not started twice while it is still generating, so a mass block write
+ * starts one promotion per chunk rather than one per write.</p>
  *
- * <p><b>Rate limiting.</b> A token bucket holds a wall-clock budget that refills at {@code maxGenFraction}
- * ms per ms (default 0.5, i.e. at most half the server's time); each promotion start costs
- * {@code chunkCostMs}. Ordinary linger promotions need the budget and are also blocked while the smoothed
- * tick time is above {@code hardGateMs}. Immediate (touch/write/opt-out) promotions bypass the budget
- * check and the hard gate but still debit the bucket, slowing ordinary promotion down. {@code maxInFlight}
- * bounds how many regenerations run concurrently for every class.</p>
+ * <p><b>Rate limiting.</b> Only <em>linger</em> promotion is paced. A token bucket holds a wall-clock
+ * budget that refills at {@code maxGenFraction} ms per ms (default 0.5, i.e. at most half the server's
+ * time) and each linger promotion start costs {@code chunkCostMs}; linger starts are also blocked while the
+ * smoothed tick time is above {@code hardGateMs}. {@code maxInFlight} bounds how many linger regenerations
+ * run concurrently. Immediate promotions are deliberately outside all of this: a player action is a player
+ * action.</p>
  *
  * <p><b>Per-dimension.</b> The queue/linger/budget state lives in a {@link State} per {@code ServerLevel};
  * scalar config stays global. Every method resolves the state from the {@link ServerLevel} in scope, so an
  * overworld position is never treated as a proxy in the nether/end.</p>
  *
- * <p><b>Bounded queue.</b> The pending-promotion queue is capped at {@code (2*range+1)^2 / 4}, clamped to
- * [256, 4096], where {@code range} is {@link #effectiveMaxRange}. When a non-urgent entry is added at the
- * cap, the oldest non-urgent entry (FIFO) is evicted, together with its linger counters. Urgent entries
- * (touch, block write, opted-out leftovers) are never evicted by the cap: they may exceed it briefly, and a
- * non-urgent addition is refused outright while the queue is full of urgent work, so a deferred block write
- * can never be silently lost. Separately, a periodic sweep drops any non-urgent entry no player has been
- * within {@code range} of for {@link #QUEUE_GRACE_TICKS}; a chunk with a pending deferred write is exempt
- * (the write must be replayed). This keeps a departed player's backlog from accumulating forever.</p>
+ * <p><b>Bounded queue.</b> The pending linger-promotion queue is capped at {@code (2*range+1)^2 / 4},
+ * clamped to [256, 4096], where {@code range} is {@link #effectiveMaxRange}. At the cap the oldest entry is
+ * evicted together with its linger counters; an entry with a pending deferred write is never evicted and a
+ * addition that cannot evict anything is refused, so the queue can neither grow without bound nor silently
+ * lose a player's edit. Separately, a periodic sweep drops any entry no player has been within
+ * {@code range} of for {@link #QUEUE_GRACE_TICKS}; a chunk with a pending deferred write is exempt (the
+ * write must be replayed). This keeps a departed player's backlog from accumulating forever.</p>
  *
  * <p><b>In-flight safety.</b> A promotion handed to {@link ProxyChunkGate#promote} is timed: if its
  * completion callback never fires within {@link #IN_FLIGHT_TIMEOUT_TICKS}, the slot is reclaimed (with a
  * warn), so one stuck future can never stall all promotion. A timed-out chunk with pending deferred writes
- * is re-queued urgent; otherwise it is dropped (the gate has already allowed the chunk, so vanilla will
+ * is re-promoted; otherwise it is dropped (the gate has already allowed the chunk, so vanilla will
  * generate it).</p>
  *
  * <p>All state is touched on the server thread (tick / player-tick / block-write events).</p>
@@ -129,8 +131,6 @@ public final class PromotionManager {
         final Long2ObjectOpenHashMap<List<DeferredWrite>> deferredWrites = new Long2ObjectOpenHashMap<>();
         /** reused per tick so the tick path does not allocate a fresh player list. */
         final List<ServerPlayer> playersScratch = new ArrayList<>();
-        /** number of queued entries with {@code urgent == true} (urgent is never cap-evicted). */
-        int urgentCount;
         /** effective queue cap for this level, refreshed each tick. */
         int queueCap = MIN_QUEUE_CAP;
         /** tick the last promotion started; drives the progress guarantee (see FORCE_START_TICKS). */
@@ -326,16 +326,10 @@ public final class PromotionManager {
     public static String status(MinecraftServer server, float tickMs) {
         int range = effectiveMaxRange(server);
         int queued = 0;
-        int urgent = 0;
         int inFlight = 0;
         for (State state : STATES.values()) {
             queued += state.queue.size();
             inFlight += state.inFlight.size();
-            for (Promotion promotion : state.queue.values()) {
-                if (promotion.urgent) {
-                    urgent++;
-                }
-            }
         }
         return "promote: " + (enabled ? "on" : "off")
             + ", range " + range + "ch, linger " + lingerMinIdleSeconds() + ".." + lingerMaxIdleSeconds() + "s idle / "
@@ -345,7 +339,7 @@ public final class PromotionManager {
             + ", landing " + fmt(landingMargin) + " blocks"
             + ", concurrency " + maxInFlight + ", budget " + fmt(budgetOfFirst()) + "/" + (int) (maxGenFraction * 1000) + " ms/s"
             + ", cost " + fmt(chunkCostMs) + " ms, hard gate " + fmt(hardGateMs) + " ms"
-            + ", queued " + queued + " (" + urgent + " immediate), in flight " + inFlight;
+            + ", queued " + queued + ", in flight " + inFlight;
     }
 
     private static double budgetOfFirst() {
@@ -445,7 +439,7 @@ public final class PromotionManager {
                     for (int dz = -range; dz <= range; dz++) {
                         long pos = ChunkPos.asLong(center.x + dx, center.z + dz);
                         if (ProxyChunkGate.isProxy(state.level, pos)) {
-                            enqueue(state, pos, true);
+                            promoteImmediate(state, pos);
                         }
                     }
                 }
@@ -473,7 +467,7 @@ public final class PromotionManager {
             long pos = entry.getLongKey();
             int distance = entry.getByteValue();
             if (state.lingerTicks.get(pos) >= thresholdTicks(distance, range, minTicks, maxTicks)) {
-                enqueue(state, pos, false);
+                enqueue(state, pos);
             }
         }
     }
@@ -511,9 +505,9 @@ public final class PromotionManager {
             state.inFlight.remove(pos);
             List<DeferredWrite> writes = state.deferredWrites.get(pos);
             if (writes != null && !writes.isEmpty()) {
-                LOGGER.warn("promotion of proxy chunk {} stalled for {} ticks; re-queueing with {} deferred write(s)",
+                LOGGER.warn("promotion of proxy chunk {} stalled for {} ticks; re-promoting with {} deferred write(s)",
                     new ChunkPos(pos), IN_FLIGHT_TIMEOUT_TICKS, writes.size());
-                enqueue(state, pos, true, true);
+                promoteImmediate(state, pos);
             } else {
                 LOGGER.warn("promotion of proxy chunk {} stalled for {} ticks; dropping it (vanilla will generate)",
                     new ChunkPos(pos), IN_FLIGHT_TIMEOUT_TICKS);
@@ -561,7 +555,7 @@ public final class PromotionManager {
             return;
         }
         if (player.getY() - surface <= landingMargin && player.getDeltaMovement().y <= 0.08) {
-            enqueue(state, chunkPos, true);
+            promoteImmediate(state, chunkPos);
         }
     }
 
@@ -589,7 +583,7 @@ public final class PromotionManager {
         } else {
             LOGGER.warn("proxy chunk {} has more than {} deferred writes; dropping the newest", new ChunkPos(chunkPos), MAX_WRITE_LOG);
         }
-        enqueue(promotion, chunkPos, true);
+        promoteImmediate(promotion, chunkPos);
         return true;
     }
 
@@ -598,55 +592,77 @@ public final class PromotionManager {
         return state.inFlight.contains(chunkPos) || ProxyChunkGate.isProxy(state.level, chunkPos);
     }
 
-    /** test hook: queue a chunk as if it had lingered (headless stress probe). */
-    static void debugEnqueue(ServerLevel lvl, long chunkPos) {
+    /** test hook: queue a chunk as if it had lingered (used by the dev-only headless stress probe). */
+    public static void debugEnqueue(ServerLevel lvl, long chunkPos) {
         State state = state(lvl);
         if (state != null) {
             enqueue(state, chunkPos, false);
         }
     }
 
-    private static void enqueue(State state, long chunkPos, boolean urgent) {
-        enqueue(state, chunkPos, urgent, false);
+    /** queue a chunk for paced linger promotion (the only path that is rate-limited). */
+    private static void enqueue(State state, long chunkPos) {
+        enqueue(state, chunkPos, false);
     }
 
     /**
-     * Queue a chunk for promotion. {@code force} bypasses the "is it still a proxy" check, for positions the
-     * gate has already allowed (mid-promotion retries and deferred-write replays). Urgent entries are never
-     * cap-evicted; when the queue is full of urgent work a new non-urgent entry is refused rather than
-     * dropping an urgent one.
+     * Queue a chunk for linger promotion. {@code force} bypasses the "is it still a proxy" check, for a
+     * position the gate has already allowed (a retry after a failed start). At the cap the oldest evictable
+     * entry is dropped; when nothing is evictable the addition is refused rather than growing without bound.
      */
-    private static void enqueue(State state, long chunkPos, boolean urgent, boolean force) {
-        if (!enabled || state.inFlight.contains(chunkPos)) {
-            return;
-        }
-        Promotion existing = state.queue.get(chunkPos);
-        if (existing != null) {
-            if (urgent) {
-                markUrgent(state, existing);
-            }
+    private static void enqueue(State state, long chunkPos, boolean force) {
+        if (!enabled || state.inFlight.contains(chunkPos) || state.queue.containsKey(chunkPos)) {
             return;
         }
         if (!force && !ProxyChunkGate.isProxy(state.level, chunkPos)) {
             return; // already real (or the proxy is inactive)
         }
-        if (state.queue.size() >= state.queueCap) {
-            boolean evicted = evictOldestNonUrgent(state);
-            if (!evicted && !urgent) {
-                return; // full of urgent work: do not add more non-urgent backlog
-            }
+        if (state.queue.size() >= state.queueCap && !evictOldest(state)) {
+            return;
         }
-        Promotion promotion = new Promotion(chunkPos, urgent);
+        Promotion promotion = new Promotion(chunkPos);
         promotion.lastNearTick = state.tickCounter;
-        if (urgent) {
-            state.urgentCount++;
-        }
         state.queue.put(chunkPos, promotion);
         state.order.addLast(promotion);
     }
 
-    /** evict the oldest non-urgent queue entry; returns false when there is none. */
-    private static boolean evictOldestNonUrgent(State state) {
+    /**
+     * Start a promotion now, outside the queue and its rate limit. The trigger was a player action (touching
+     * the ground, a block write, or walking into an opted-out zone), so the chunk goes to the vanilla
+     * generation pipeline immediately: not capped by the budget, the hard gate or {@code maxInFlight}. The
+     * only guard is that the same chunk is not started twice while it is still generating. If the gate
+     * cannot start it yet (no loaded holder), it falls back to the linger queue so the trigger is not lost.
+     */
+    private static void promoteImmediate(State state, long chunkPos) {
+        if (!enabled || state.inFlight.contains(chunkPos)) {
+            return;
+        }
+        if (!ProxyChunkGate.isProxy(state.level, chunkPos)) {
+            return; // already real (or the proxy is inactive)
+        }
+        if (!ProxyChunkGate.hasHolder(state.level, chunkPos)) {
+            enqueue(state, chunkPos); // holder not loaded yet: queue it rather than dropping the trigger
+            return;
+        }
+        state.inFlight.add(chunkPos);
+        state.inFlightSince.put(chunkPos, state.tickCounter);
+        boolean started;
+        try {
+            started = ProxyChunkGate.promote(state.level, new ChunkPos(chunkPos), () -> onComplete(state, chunkPos));
+        } catch (Throwable t) {
+            LOGGER.error("failed to start regeneration of proxy chunk {}", new ChunkPos(chunkPos), t);
+            started = false;
+        }
+        if (started) {
+            return;
+        }
+        state.inFlight.remove(chunkPos);
+        state.inFlightSince.remove(chunkPos);
+        enqueue(state, chunkPos);
+    }
+
+    /** evict the oldest queue entry with no pending deferred write; false when there is none. */
+    private static boolean evictOldest(State state) {
         var it = state.order.iterator();
         while (it.hasNext()) {
             Promotion promotion = it.next();
@@ -654,12 +670,8 @@ public final class PromotionManager {
                 it.remove(); // lazy cleanup of stale FIFO entries
                 continue;
             }
-            if (promotion.urgent) {
-                continue; // urgent entries are never evicted by the cap
-            }
             if (state.deferredWrites.containsKey(promotion.pos)) {
-                markUrgent(state, promotion); // a pending write makes it urgent; keep it
-                continue;
+                continue; // a pending write must be replayed: keep it
             }
             it.remove();
             state.queue.remove(promotion.pos);
@@ -672,25 +684,15 @@ public final class PromotionManager {
         return false;
     }
 
-    private static void markUrgent(State state, Promotion promotion) {
-        if (!promotion.urgent) {
-            promotion.urgent = true;
-            state.urgentCount++;
-        }
-    }
-
-    /** unlink a promotion from the queue/FIFO and clear its flags (caller must not be iterating the FIFO). */
+    /** unlink a promotion from the queue/FIFO (caller must not be iterating the FIFO). */
     private static void removeQueued(State state, Promotion promotion) {
         state.queue.remove(promotion.pos);
         forget(state, promotion);
     }
 
-    /** FIFO/flag cleanup without touching the queue map (safe while iterating the map). */
+    /** FIFO cleanup without touching the queue map (safe while iterating the map). */
     private static void forget(State state, Promotion promotion) {
         state.order.remove(promotion);
-        if (promotion.urgent) {
-            state.urgentCount--;
-        }
         promotion.removed = true;
     }
 
@@ -706,15 +708,13 @@ public final class PromotionManager {
         // resend), so an idle server starts as fast as the concurrency cap allows while a lagging one backs
         // off. A long dry spell forces one start anyway, so queued chunks always eventually generate.
         double cost = Math.clamp(ProxyChunkGate.postCostMs(state.level), 2.0, 2000.0);
-        if (!promotion.urgent) {
-            boolean starved = state.tickCounter - state.lastStartTick >= FORCE_START_TICKS;
-            if (!starved) {
-                if (hardGateMs > 0.0 && tickMs >= hardGateMs) {
-                    return; // server already over budget: queue, do not start ordinary work
-                }
-                if (state.budgetMs < cost) {
-                    return; // no generation time left this window
-                }
+        boolean starved = state.tickCounter - state.lastStartTick >= FORCE_START_TICKS;
+        if (!starved) {
+            if (hardGateMs > 0.0 && tickMs >= hardGateMs) {
+                return; // server already over budget: queue, do not start linger work
+            }
+            if (state.budgetMs < cost) {
+                return; // no generation time left this window
             }
         }
         state.budgetMs -= cost;
@@ -733,23 +733,20 @@ public final class PromotionManager {
             state.inFlight.remove(pos);
             state.inFlightSince.remove(pos);
             state.budgetMs += cost; // the promotion never ran: refund the budget
-            enqueue(state, pos, promotion.urgent, true);
+            enqueue(state, pos, true);
         } else {
             state.lastStartTick = state.tickCounter;
         }
     }
 
     /**
-     * Immediate (touch / write / opt-out) first, then <b>strictly nearest</b> to a player. The queue is
-     * bounded by {@link #queueCap}, so the full scan is cheap; urgent work is never starved. A chunk whose
-     * holder is not loaded is skipped (left queued) so we do not stall on it.
+     * Strictly nearest to a player. The queue is bounded by {@link #queueCap}, so the full scan is cheap. A
+     * chunk whose holder is not loaded is skipped (left queued) so we do not stall on it.
      */
     private static Promotion pickNext(State state, List<ServerPlayer> players) {
         ChunkMap chunkMap = state.level.getChunkSource().chunkMap;
-        Promotion bestUrgent = null;
-        int bestUrgentDist = Integer.MAX_VALUE;
-        Promotion bestNormal = null;
-        int bestNormalDist = Integer.MAX_VALUE;
+        Promotion best = null;
+        int bestDist = Integer.MAX_VALUE;
         for (Promotion promotion : state.order) {
             if (promotion.removed) {
                 continue;
@@ -758,17 +755,12 @@ public final class PromotionManager {
                 continue; // holder not loaded yet; leave it queued
             }
             int distance = nearestDistance(promotion.pos, players);
-            if (promotion.urgent) {
-                if (distance < bestUrgentDist) {
-                    bestUrgent = promotion;
-                    bestUrgentDist = distance;
-                }
-            } else if (distance < bestNormalDist) {
-                bestNormal = promotion;
-                bestNormalDist = distance;
+            if (distance < bestDist) {
+                best = promotion;
+                bestDist = distance;
             }
         }
-        return bestUrgent != null ? bestUrgent : bestNormal;
+        return best;
     }
 
     private static int nearestDistance(long pos, List<ServerPlayer> players) {
@@ -806,7 +798,7 @@ public final class PromotionManager {
             // queued for a retry rather than silently dropping the player's edit. The gate already allowed
             // this position, so the normal enqueue guard would refuse it; force the retry through.
             LOGGER.warn("proxy chunk {} not real after promotion; keeping {} deferred write(s)", new ChunkPos(pos), writes.size());
-            enqueue(state, pos, true, true);
+            promoteImmediate(state, pos);
             return;
         }
         state.deferredWrites.remove(pos);
@@ -817,7 +809,11 @@ public final class PromotionManager {
     }
 
     private static double loadFactor(float tickMs) {
-        return Math.clamp((tickMs - idleTickMs) / (busyTickMs - idleTickMs), 0.0, 1.0);
+        double span = busyTickMs - idleTickMs;
+        if (span <= 0.0) {
+            return 1.0; // degenerate hand-edited config; assume fully loaded (see AeroGelConfig.validate)
+        }
+        return Math.clamp((tickMs - idleTickMs) / span, 0.0, 1.0);
     }
 
     private static int clamp(int value, int min, int max) {
@@ -829,15 +825,13 @@ public final class PromotionManager {
 
     private static final class Promotion {
         final long pos;
-        boolean urgent;
         /** set when the entry is unlinked, so lazy FIFO/sweep scans can skip it. */
         boolean removed;
         /** last tick a player was within {@code maxRange} of this chunk (for departure eviction). */
         long lastNearTick;
 
-        Promotion(long pos, boolean urgent) {
+        Promotion(long pos) {
             this.pos = pos;
-            this.urgent = urgent;
         }
     }
 }
