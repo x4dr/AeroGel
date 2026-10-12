@@ -30,7 +30,7 @@ and nothing coordinates the handover.
   there. That handoff should be explicit rather than incidental.
 - We should be able to ask **whether DH has an LOD for a chunk** and fill only where it does not.
 - `streamRadius` and DH's LOD distance are unrelated numbers, and matching them is not achievable with
-  on-demand sampling and one `VertexBuffer` per chunk (see the radius forecast in `../AGENTS.md`). The useful
+  on-demand sampling and one `VertexBuffer` per chunk (see the radius forecast in `AGENTS.md`). The useful
   question is what each layer should own, not how to make ours as large as theirs.
 - Both are expensive at the same moment: DH generating its LOD backlog while we try to stream the same gap.
 
@@ -47,4 +47,4 @@ The draw decision is no longer involved; this is sampling and delivery latency. 
 ## Also open
 
 Longer-running items are in `plans/README.md` (collider PoC; in-game verification of detail tiers and
-automatic promotion) and the "Next session" list in `../AGENTS.md`.
+automatic promotion) and the "Next session" list in `AGENTS.md`.
