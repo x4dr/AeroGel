@@ -6,6 +6,16 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-13 (late) — switch permissions, movecheck default, server-owner notes (#1, #11, #9)
+
+- `/aerogel switch` now refuses the server-wide features (`gate`, `promote`, `stream`, `resend`, `adaptive`,
+  `movecheck`, `colors`) below permission level 2; the per-player client toggles stay open to everyone.
+- `stream.bypassMoveCheck` defaults to **false** (was true): skipping vanilla's move check is an opt-in.
+- `README.md` created with notes for server owners (pregenerators vs. the gate; ships vs. proxy terrain).
+- The gate probe (`aerogel.probe`) now also checks the switch permission split and the movecheck default.
+
+---
+
 ## 2026-10-13 — hardening pass + release prep
 
 A review of the whole mod, aimed at making a build that is either working or loudly broken. Compiles; the mod

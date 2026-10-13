@@ -199,7 +199,8 @@ all** (server must not choke at ~80 chunks/s swept).
 - **Fast-flight move check**: vanilla `ServerGamePacketListenerImpl.handleMovePlayer` rejects moves with
   `d10 - d9 > 100` (≈10 blocks/packet) and teleports the player back, exempting only the singleplayer owner —
   on a dedicated server this rubber-bands ~3×/s at speed. `mixin/ServerGamePacketListenerImplMixin` exempts
-  fast creative flight / elytra (`/aerogel switch movecheck`).
+  fast creative flight / elytra (`/aerogel switch movecheck`; **off by default** — on a server with untrusted
+  players it is a speed-hack hole, so the admin opts in via `stream.bypassMoveCheck` in `aerogel-common.toml`).
 - **Renderer**: `ProxyRenderer` — **one static `VertexBuffer` per chunk** (POSITION_TEX_COLOR), uploaded once on
   mesh arrival and re-uploaded only when its geometry actually changes (grid update, or a neighbour
   gains/loses a proxy so its seam walls change). The "coming up from the bottom" rise / sink is a per-chunk
@@ -244,7 +245,8 @@ all** (server must not choke at ~80 chunks/s swept).
   - `/aerogel flyspeed <0.05-10>`, `/aerogel generate` (real chunk at the player's position),
     `/aerogel biomes` (dump the server's `Biome -> block` cache).
   - `/aerogel switch <feature> [true|false]` — **all toggles**, client + server (the argument is a Brigadier
-    `bool`, so `true`/`false`, not `on`/`off`; omit it to toggle): client `proxy` (master: draw + clamp +
+    `bool`, so `true`/`false`, not `on`/`off`; omit it to toggle; the client features are open to every player,
+    the server-wide ones need permission level 2): client `proxy` (master: draw + clamp +
     reconcile + neighbour override), `travel` (request proxy travel from the server), `anim`, `sync`,
     `store`, `clamp`, `reconcile`, `wireframe`, `neighbors` (count a proxy neighbour as an existing chunk for
     vanilla's render visibility graph), `colors` (biome tint on the wire; the block texture is always sent);

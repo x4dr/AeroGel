@@ -95,7 +95,7 @@ public final class ProxyStreamer {
     private static boolean biomeColors = true;
     /** bisect switch: when off, proxy meshes are neither sampled nor sent (the gate still runs). */
     private static boolean streamEnabled = true;
-    private static boolean bypassMoveCheck = true;
+    private static boolean bypassMoveCheck = false;
     private static int samplerThreads = 1;
 
     private static int statTicks;

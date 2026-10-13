@@ -151,8 +151,9 @@ public final class AeroGelConfig {
             .define("biomeColors", true);
         samplerThreads = b.comment("Off-thread sampler worker count.")
             .defineInRange("threads", 1, 1, 64);
-        bypassMoveCheck = b.comment("Exempt fast creative flight / elytra from vanilla's 'moved too quickly' rubber-band.")
-            .define("bypassMoveCheck", true);
+        bypassMoveCheck = b.comment("Exempt fast creative flight / elytra from vanilla's 'moved too quickly' rubber-band.\n"
+                + "Off by default: on a server with untrusted players it is a speed-hack hole.")
+            .define("bypassMoveCheck", false);
         b.pop();
 
         b.comment("The virtual-proxy chunk gate.")

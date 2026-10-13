@@ -352,6 +352,11 @@ public final class ServerHandlers {
             ctx.getSource().sendFailure(Component.literal("AeroGel: unknown feature '" + feature + "'"));
             return 0;
         }
+        // per-player client toggles stay open to everyone; server-wide features need op level 2
+        if (!client && !ctx.getSource().hasPermission(2)) {
+            ctx.getSource().sendFailure(Component.literal("AeroGel: '" + feature + "' is server-wide and needs permission level 2"));
+            return 0;
+        }
         ServerPlayer actor = ctx.getSource().getEntity() instanceof ServerPlayer player ? player : null;
         boolean on = requested != null ? requested : !currentSwitch(ctx, feature, client);
         if (actor != null) {

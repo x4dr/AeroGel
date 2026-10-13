@@ -63,7 +63,27 @@ final class GenerationProbe {
                 ProxyStreamer.probeSampleBlocking(level, probe, tier));
         }
 
+        checkSwitchPermission();
+
         // wait a few ticks so the classification probe and placeholder path are exercised under ticking
         ProxyStreamer.scheduleHalt(300);
+    }
+
+    /** #1/#11: a non-op cannot flip a server-wide switch, an op can; movecheck bypass defaults off. */
+    private void checkSwitchPermission() {
+        net.minecraft.server.MinecraftServer server = this.level.getServer();
+        net.minecraft.commands.CommandSourceStack op = server.createCommandSourceStack().withSuppressedOutput();
+        net.minecraft.commands.CommandSourceStack guest = op.withPermission(0);
+        boolean before = ProxyChunkGate.gateEnabled();
+        server.getCommands().performPrefixedCommand(guest, "aerogel switch gate " + !before);
+        boolean guestBlocked = ProxyChunkGate.gateEnabled() == before;
+        server.getCommands().performPrefixedCommand(op, "aerogel switch gate " + !before);
+        boolean opAllowed = ProxyChunkGate.gateEnabled() != before;
+        server.getCommands().performPrefixedCommand(op, "aerogel switch gate " + before);
+        boolean moveCheckDefaultOff = !dev.aerogel.common.AeroGelConfig.CFG.bypassMoveCheck.getDefault();
+        LOGGER.info(guestBlocked && opAllowed && moveCheckDefaultOff && ProxyChunkGate.gateEnabled() == before
+            ? "VERDICT: PASS — switch permissions (non-op cannot flip gate, op can; bypassMoveCheck default false)"
+            : "VERDICT: FAIL — switch permissions guestBlocked=" + guestBlocked + " opAllowed=" + opAllowed
+                + " moveCheckDefaultOff=" + moveCheckDefaultOff);
     }
 }
