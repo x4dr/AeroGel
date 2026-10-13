@@ -31,6 +31,8 @@ import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.EmptyLevelChunk;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.level.chunk.status.ChunkType;
+import net.minecraft.world.level.chunk.storage.ChunkSerializer;
 import net.minecraft.world.phys.AABB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -351,25 +353,29 @@ public final class ProxyChunkGate {
     }
 
     /**
-     * True when a not-loaded proxy position exists on disk at FULL; it is then {@code real}, because loading is
-     * not generation. Decided once per position: the EMPTY load is one IOWorker read (pending writes
-     * included) that never generates, and the result is cached in {@code real}/{@code proxy} exactly as the
-     * ticket probe would. A position already classified {@code proxy} is not re-read.
+     * Classifies a not-loaded, unclassified position from disk without blocking: one async IOWorker read
+     * (pending writes included, never generates); on the next tick it lands in {@code real} (FULL on disk:
+     * loading is not generation) or {@code proxy}. Until then reads get the placeholder (Maric 2026-10-13: a
+     * tick or two is fine). A synchronous EMPTY load here queued behind worldgen on the main thread: 1-8 s
+     * stalls per new position during fast flight.
      */
-    public static boolean isRealOnDisk(ServerLevel lvl, int x, int z) {
+    public static void probeDisk(ServerLevel lvl, int x, int z) {
         State state = state(lvl);
         long pos = ChunkPos.asLong(x, z);
-        if (state == null || state.proxy.contains(pos)) {
-            return false;
+        if (state == null || state.proxy.contains(pos) || state.probing.contains(pos)) {
+            return;
         }
-        ChunkStatus persisted = lvl.getChunkSource().getChunk(x, z, ChunkStatus.EMPTY, true).getPersistedStatus();
-        if (persisted.isOrAfter(ChunkStatus.FULL)) {
-            state.real.add(pos);
-            return true;
-        }
-        state.proxy.add(pos);
-        state.anyProxy = true;
-        return false;
+        state.probing.add(pos);
+        lvl.getChunkSource().chunkMap.read(new ChunkPos(pos)).whenComplete((tag, error) -> state.deferred.add(() -> {
+            state.probing.remove(pos);
+            if (tag != null && tag.isPresent()
+                && ChunkSerializer.getChunkTypeFromTag(tag.get()) == ChunkType.LEVELCHUNK) {
+                state.real.add(pos);
+            } else {
+                state.proxy.add(pos);
+                state.anyProxy = true;
+            }
+        }));
     }
 
     /** test hook (dev probe): forget a position's classification, as if this session never touched it. */

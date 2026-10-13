@@ -78,6 +78,7 @@ final class GenerationProbe {
     private static ServerLevel diskLevel;
     private static ChunkPos disk;
     private static int diskTicks;
+    private static int readTicks = -1;
 
     private static BlockPos marker(ChunkPos pos) {
         return new BlockPos(pos.getMinBlockX() + 3, 200, pos.getMinBlockZ() + 3);
@@ -97,24 +98,35 @@ final class GenerationProbe {
 
     /** waits for the marked chunk to unload, then reads it back while the gate is engaged. */
     static void tick(net.minecraft.server.MinecraftServer server) {
-        if (disk == null || (holder(disk) && ++diskTicks < 200)) {
+        if (disk == null || (readTicks < 0 && holder(disk) && ++diskTicks < 200)) {
             return;
         }
         ChunkPos pos = disk;
-        disk = null;
-        boolean unloaded = !holder(pos);
-        ProxyChunkGate.debugForget(diskLevel, pos.toLong()); // as if this session never touched it
-        // (a) a main-thread read of an on-disk, unloaded chunk is the real chunk, not a placeholder
+        if (readTicks < 0) {
+            readTicks = 0;
+            ProxyChunkGate.debugForget(diskLevel, pos.toLong()); // as if this session never touched it
+            diskLevel.getBlockState(marker(pos)); // first read: may be the placeholder, kicks the async disk read
+            return;
+        }
+        // (a) an on-disk, unloaded chunk reads back real within a few ticks (Maric: placeholder briefly is fine)
         boolean readBack = diskLevel.getBlockState(marker(pos)).is(Blocks.DIAMOND_BLOCK);
+        if (!readBack && ++readTicks < 40) {
+            return;
+        }
+        disk = null;
+        boolean unloaded = diskTicks < 200;
         // (b) a peek (requireChunk=false) at a never-generated engaged position is null, not a placeholder
         ChunkPos fresh = new ChunkPos(pos.x, pos.z + 2000);
         boolean peekNull = diskLevel.getChunkSource().getChunk(fresh.x, fresh.z, ChunkStatus.FULL, false) == null;
-        // structure lookups (STRUCTURE_STARTS) of a never-generated chunk go to vanilla, not to a placeholder
-        boolean structures = !(diskLevel.getChunkSource().getChunk(fresh.x, fresh.z, ChunkStatus.STRUCTURE_STARTS,
-            true) instanceof EmptyLevelChunk);
+        // (c) a structure lookup of a never-generated chunk gets the placeholder: no blocking structure generation
+        long t0 = System.nanoTime();
+        boolean structures = diskLevel.getChunkSource().getChunk(fresh.x, fresh.z, ChunkStatus.STRUCTURE_STARTS,
+            true) instanceof EmptyLevelChunk;
+        double ms = (System.nanoTime() - t0) / 1e6;
         LOGGER.info(unloaded && readBack && peekNull && structures
-            ? "VERDICT: PASS — on-disk read (unloaded chunk " + pos + " read back real after " + diskTicks
-                + " ticks; requireChunk=false peek null; STRUCTURE_STARTS vanilla)"
+            ? "VERDICT: PASS — on-disk read (unloaded chunk " + pos + " read back real " + readTicks
+                + " tick(s) after the first read; requireChunk=false peek null; STRUCTURE_STARTS placeholder in "
+                + String.format("%.3f", ms) + " ms)"
             : "VERDICT: FAIL — on-disk read unloaded=" + unloaded + " readBack=" + readBack + " peekNull="
                 + peekNull + " structures=" + structures);
     }
