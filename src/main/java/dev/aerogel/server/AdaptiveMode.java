@@ -2,11 +2,14 @@ package dev.aerogel.server;
 
 import dev.aerogel.common.AeroGelConfig;
 import dev.aerogel.net.ClientSwitchPayload;
+import dev.aerogel.net.MeshBatchPayload;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.Util;
@@ -35,6 +38,11 @@ import org.slf4j.LoggerFactory;
  * opted-out player inside an opted-in zone forces vanilla locally. The client {@code proxy} switch controls
  * whether that player receives/renders proxy meshes at all.</p>
  *
+ * <p><b>Clients without AeroGel</b> (#7) are recorded once at login ({@link #onLogin}) and treated as opted
+ * out, even while the server enforces: they get no meshes (the streamer does no work for them) and their zone
+ * is vanilla, because a vanilla client has no proxy layer and would otherwise stand at the edge of terrain it
+ * can never receive.</p>
+ *
  * <p>All state is touched on the server thread.</p>
  */
 public final class AdaptiveMode {
@@ -52,6 +60,8 @@ public final class AdaptiveMode {
 
     private static final Map<UUID, Boolean> travel = new HashMap<>();
     private static final Map<UUID, Boolean> proxy = new HashMap<>();
+    /** players whose connection lacks the AeroGel channels, cached at login so no send path looks it up. */
+    private static final Set<UUID> vanilla = new HashSet<>();
     private static int optInCount;
     private static int optOutCount;
 
@@ -71,6 +81,7 @@ public final class AdaptiveMode {
         WINDOW.clear();
         travel.clear();
         proxy.clear();
+        vanilla.clear();
         optInCount = 0;
         optOutCount = 0;
         LOGGER.info("adaptive: {} (activate {} ms / backlog {}, deactivate {} ms / backlog {}, hold {} s, window {} s)",
@@ -83,6 +94,7 @@ public final class AdaptiveMode {
         WINDOW.clear();
         travel.clear();
         proxy.clear();
+        vanilla.clear();
         optInCount = 0;
         optOutCount = 0;
     }
@@ -175,7 +187,7 @@ public final class AdaptiveMode {
             }
             ResourceKey<Level> key = player.level().dimension();
             long center = player.chunkPosition().toLong();
-            if (travel.getOrDefault(player.getUUID(), false)) {
+            if (optsIn(player)) {
                 in.computeIfAbsent(key, k -> new ArrayList<>()).add(center);
             } else {
                 out.computeIfAbsent(key, k -> new ArrayList<>()).add(center);
@@ -220,12 +232,36 @@ public final class AdaptiveMode {
 
     /** true when this player should use the lingering gate (server-enforced, or they opted in). */
     public static boolean isOptIn(ServerPlayer player) {
-        return enforcing || travel.getOrDefault(player.getUUID(), false);
+        return hasAeroGel(player) && (enforcing || travel.getOrDefault(player.getUUID(), false));
     }
 
-    /** true when this player wants proxy meshes streamed/rendered. */
+    private static boolean optsIn(ServerPlayer player) {
+        return hasAeroGel(player) && travel.getOrDefault(player.getUUID(), false);
+    }
+
+    /** true when this player wants proxy meshes streamed/rendered (and its client can receive them). */
     public static boolean renders(ServerPlayer player) {
-        return proxy.getOrDefault(player.getUUID(), true);
+        return hasAeroGel(player) && proxy.getOrDefault(player.getUUID(), true);
+    }
+
+    /** true when this player's client has the AeroGel channels; guard every server-to-client payload with it. */
+    public static boolean hasAeroGel(ServerPlayer player) {
+        return !vanilla.contains(player.getUUID());
+    }
+
+    /** login: cache whether the connection negotiated the AeroGel channels (#7). */
+    public static void onLogin(ServerPlayer player) {
+        setHasAeroGel(player, player.connection.hasChannel(MeshBatchPayload.TYPE));
+    }
+
+    /** split from {@link #onLogin} so the dev probe can drive it without a real connection. */
+    public static void setHasAeroGel(ServerPlayer player, boolean has) {
+        if (has) {
+            vanilla.remove(player.getUUID());
+        } else if (vanilla.add(player.getUUID())) {
+            LOGGER.info("adaptive: {} joined without AeroGel: no proxy meshes, their zone stays vanilla",
+                player.getGameProfile().getName());
+        }
     }
 
     /** current per-player switch value (falls back to the client default). */
@@ -336,5 +372,6 @@ public final class AdaptiveMode {
     public static void removePlayer(UUID id) {
         travel.remove(id);
         proxy.remove(id);
+        vanilla.remove(id);
     }
 }

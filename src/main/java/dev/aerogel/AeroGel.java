@@ -42,15 +42,18 @@ public final class AeroGel {
      */
     @SubscribeEvent
     void onRegisterPayloads(RegisterPayloadHandlersEvent event) {
-        event.registrar("1").playToClient(MeshBatchPayload.TYPE, MeshBatchPayload.STREAM_CODEC,
+        // optional (#7): a vanilla client can join a server with AeroGel and an AeroGel client a server without
+        // it; every send is guarded per connection (AdaptiveMode.hasAeroGel / ClientHandlers.serverHasAeroGel)
+        var registrar = event.registrar("1").optional();
+        registrar.playToClient(MeshBatchPayload.TYPE, MeshBatchPayload.STREAM_CODEC,
             (payload, context) -> context.enqueueWork(() -> ClientMeshStore.handle(payload)));
-        event.registrar("1").playToServer(MeshRequestPayload.TYPE, MeshRequestPayload.STREAM_CODEC,
+        registrar.playToServer(MeshRequestPayload.TYPE, MeshRequestPayload.STREAM_CODEC,
             (payload, context) -> context.enqueueWork(() -> ProxyStreamer.onMeshRequest((ServerPlayer) context.player(), payload)));
-        event.registrar("1").playBidirectional(ClientSwitchPayload.TYPE, ClientSwitchPayload.STREAM_CODEC,
+        registrar.playBidirectional(ClientSwitchPayload.TYPE, ClientSwitchPayload.STREAM_CODEC,
             new net.neoforged.neoforge.network.handling.DirectionalPayloadHandler<>(
                 (payload, context) -> context.enqueueWork(() -> dev.aerogel.client.ClientFeatures.set(payload.feature(), payload.on())),
                 (payload, context) -> context.enqueueWork(() -> ServerHandlers.onClientSwitch((ServerPlayer) context.player(), payload))));
-        event.registrar("1").playToClient(ClientSettingPayload.TYPE, ClientSettingPayload.STREAM_CODEC,
+        registrar.playToClient(ClientSettingPayload.TYPE, ClientSettingPayload.STREAM_CODEC,
             (payload, context) -> context.enqueueWork(() -> dev.aerogel.client.ClientHandlers.applySetting(payload)));
     }
 }

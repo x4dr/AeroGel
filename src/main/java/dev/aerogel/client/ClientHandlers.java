@@ -41,6 +41,7 @@ public final class ClientHandlers {
     private static boolean reconcileFound;
     private static boolean configLoaded;
     private static boolean syncedToServer;
+    private static boolean serverHasAeroGel;
 
     private ClientHandlers() {
     }
@@ -91,8 +92,14 @@ public final class ClientHandlers {
         }
         if (!syncedToServer) {
             syncedToServer = true;
-            for (String feature : ClientSwitchPayload.FEATURES) {
-                PacketDistributor.sendToServer(new ClientSwitchPayload(feature, ClientFeatures.get(feature)));
+            // #7: a server without AeroGel has no channels; checked once per join, then nothing is ever sent
+            serverHasAeroGel = mc.getConnection() != null && mc.getConnection().hasChannel(ClientSwitchPayload.TYPE);
+            if (!serverHasAeroGel) {
+                LOGGER.info("server has no AeroGel: proxy layer idle for this session");
+            } else {
+                for (String feature : ClientSwitchPayload.FEATURES) {
+                    PacketDistributor.sendToServer(new ClientSwitchPayload(feature, ClientFeatures.get(feature)));
+                }
             }
         }
         // reconciliation: ask the server for meshes we are missing (heals join drops / reconnects / races).
@@ -101,7 +108,7 @@ public final class ClientHandlers {
         // changed chunk and travel is off: that is the dormant vanilla case (the server pushes its own window
         // on login and chunk-cross), and re-running the O(r^2) scan every second would only allocate + call
         // isAirStub. A client that opted into travel always keeps reconciling.
-        if (ClientFeatures.proxy && ClientFeatures.reconcile && ++reconcileTicks % 20 == 0) {
+        if (serverHasAeroGel && ClientFeatures.proxy && ClientFeatures.reconcile && ++reconcileTicks % 20 == 0) {
             ChunkPos center = player.chunkPosition();
             boolean moved = center.toLong() != reconcileCenter;
             boolean dormant = ClientMeshStore.size() == 0 && !reconcileFound && !moved && !ClientFeatures.travel;

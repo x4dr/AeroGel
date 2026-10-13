@@ -172,7 +172,10 @@ all** (server must not choke at ~80 chunks/s swept).
   deactivate values, `holdSeconds` (10) have passed since the last activating sample, **and no linger counters
   remain** (so switching to vanilla never bursts instant generation, and the state no longer flaps per tick). While not enforcing, a player whose client `travel` switch is on is still gated around them; an
   opted-out player's zone is vanilla (their leftovers are forced to real terrain), and if both overlap the
-  opted-out zone wins. A player whose client `proxy` switch is off receives no meshes at all. See
+  opted-out zone wins. A player whose client `proxy` switch is off receives no meshes at all. A client without
+  AeroGel can join (the payloads are registered `optional()`, #7): it is recorded once at login and treated as
+  opted out even while the server enforces (no meshes, no streamer work, vanilla zone, client switches refused),
+  and an AeroGel client on a server without the mod sends nothing and leaves the proxy layer idle. See
   `plans/proxy-chunk-state-machine.md` §Adaptive enforcement.
 - **Promotion**: `server/PromotionManager` + `ProxyChunkGate.promote`. One cumulative per-chunk counter; the
   threshold interpolates with distance `t(d) = min + (d/maxRange)*(max - min)` (Chebyshev distance to the nearest

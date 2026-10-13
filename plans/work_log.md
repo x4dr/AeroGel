@@ -6,6 +6,23 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-13 (night) — server-only mode: optional channels, vanilla clients can join (#7)
+
+- **#7 (Maric's decision: server-only support where it costs nothing).** The four payloads are registered on an
+  `optional()` registrar, so a vanilla client can join an AeroGel server and an AeroGel client a server without it.
+- Server: `AdaptiveMode.onLogin` caches per player whether the connection has the `mesh_batch` channel. A player
+  without it is `!renders` (the streamer skips it before any stream/sampling work) and `!isOptIn` even while the
+  server enforces, so `PromotionManager` treats them as opted out and forces their nearby leftovers to real terrain;
+  they also count as opt-out in the adaptive zones. Reason: a vanilla client has no proxy layer and will not move
+  into a chunk it was never sent (#10), so a gated zone around it would be a wall. `/aerogel diag`, `detail draw`
+  and the client `switch` features answer "your client does not have AeroGel installed" instead of sending.
+- Client: `ClientHandlers` checks once per join whether the server has the channel; without it the switch sync and
+  the 1 s mesh-request reconciliation never run.
+- Probe: `aerogel.probe` adds a `vanilla client` verdict (flag alone turns `renders`/`isOptIn` off, the switch
+  command is refused, with the channel the player opts in). A real vanilla join is not covered headlessly.
+
+---
+
 ## 2026-10-13 (night) — promotions never block the main thread; in-flight writes kept and budgeted (#13, #5, #12)
 
 - **#13.** A promoted chunk left the proxy set while its FULL future was still generating, so the player's own

@@ -66,6 +66,7 @@ final class GenerationProbe {
         }
 
         checkSwitchPermission();
+        checkVanillaClient();
         checkAdaptiveWindow();
         startDiskCheck();
 
@@ -165,5 +166,29 @@ final class GenerationProbe {
             ? "VERDICT: PASS — switch permissions (non-op cannot flip gate, op can; bypassMoveCheck default false)"
             : "VERDICT: FAIL — switch permissions guestBlocked=" + guestBlocked + " opAllowed=" + opAllowed
                 + " moveCheckDefaultOff=" + moveCheckDefaultOff);
+    }
+
+    /**
+     * #7: the login-cached "no AeroGel channel" flag alone turns streaming and opt-in off (the streamer skips a
+     * player on {@code renders}, linger/zones use {@code isOptIn}), and a client switch command sends nothing.
+     */
+    private void checkVanillaClient() {
+        net.minecraft.server.MinecraftServer server = this.level.getServer();
+        net.minecraft.server.level.ServerPlayer fake = net.neoforged.neoforge.common.util.FakePlayerFactory.getMinecraft(this.level);
+        net.minecraft.commands.CommandSourceStack src = fake.createCommandSourceStack().withSuppressedOutput();
+        AdaptiveMode.setHasAeroGel(fake, false);
+        AdaptiveMode.setPlayerSwitch(fake, "travel", true);
+        boolean flagDrives = !AdaptiveMode.renders(fake) && !AdaptiveMode.isOptIn(fake);
+        AdaptiveMode.setPlayerSwitch(fake, "travel", false);
+        server.getCommands().performPrefixedCommand(src, "aerogel switch travel true");
+        boolean switchRefused = !AdaptiveMode.playerSwitch(fake, "travel");
+        AdaptiveMode.setHasAeroGel(fake, true);
+        server.getCommands().performPrefixedCommand(src, "aerogel switch travel true");
+        boolean moddedIn = AdaptiveMode.renders(fake) && AdaptiveMode.isOptIn(fake);
+        AdaptiveMode.removePlayer(fake.getUUID());
+        LOGGER.info(flagDrives && switchRefused && moddedIn
+            ? "VERDICT: PASS — vanilla client (no channel: no meshes, never opted in, switch refused; with channel: opted in)"
+            : "VERDICT: FAIL — vanilla client flagDrives=" + flagDrives + " switchRefused=" + switchRefused
+                + " moddedIn=" + moddedIn);
     }
 }

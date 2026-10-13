@@ -109,6 +109,9 @@ public final class ServerHandlers {
                 .then(Commands.literal("diag")
                     .executes(ctx -> {
                         ServerPlayer player = ctx.getSource().getPlayerOrException();
+                        if (!clientHasAeroGel(ctx, player)) {
+                            return 0;
+                        }
                         PacketDistributor.sendToPlayer(player, new ClientSettingPayload(ClientSettingPayload.DIAG, 0));
                         ctx.getSource().sendSuccess(() -> Component.literal(
                             "AeroGel: client proxy diagnostic written to the client log"), false);
@@ -231,6 +234,9 @@ public final class ServerHandlers {
     /** client-only: extend the proxy draw range beyond the vanilla render-distance option (0 = option). */
     private static int setDraw(CommandContext<CommandSourceStack> ctx, int chunks) throws CommandSyntaxException {
         ServerPlayer player = ctx.getSource().getPlayerOrException();
+        if (!clientHasAeroGel(ctx, player)) {
+            return 0;
+        }
         PacketDistributor.sendToPlayer(player, new ClientSettingPayload(ClientSettingPayload.DRAW_RADIUS, chunks));
         ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: client proxy draw radius = "
             + (chunks == 0 ? "vanilla option" : chunks + " chunks")), false);
@@ -388,6 +394,9 @@ public final class ServerHandlers {
             return 0;
         }
         ServerPlayer actor = ctx.getSource().getEntity() instanceof ServerPlayer player ? player : null;
+        if (client && !clientHasAeroGel(ctx, ctx.getSource().getPlayerOrException())) {
+            return 0;
+        }
         boolean on = requested != null ? requested : !currentSwitch(ctx, feature, client);
         if (actor != null) {
             switchState.computeIfAbsent(actor.getUUID(), id -> new HashMap<>()).put(feature, on);
@@ -456,6 +465,22 @@ public final class ServerHandlers {
     @SubscribeEvent
     public static void onPlayerTick(PlayerTickEvent.Post event) {
         ProxyStreamer.onPlayerTick(event);
+    }
+
+    /** client-only settings need AeroGel on the client (#7); a vanilla client gets a message, not a packet. */
+    private static boolean clientHasAeroGel(CommandContext<CommandSourceStack> ctx, ServerPlayer player) {
+        if (AdaptiveMode.hasAeroGel(player)) {
+            return true;
+        }
+        ctx.getSource().sendFailure(Component.literal("AeroGel: your client does not have AeroGel installed"));
+        return false;
+    }
+
+    @SubscribeEvent
+    public static void onPlayerLogin(net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerLoggedInEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            AdaptiveMode.onLogin(player);
+        }
     }
 
     @SubscribeEvent
