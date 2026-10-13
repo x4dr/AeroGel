@@ -176,6 +176,9 @@ public final class ServerHandlers {
                     .then(Commands.literal("hardgate")
                         .then(Commands.argument("ms", DoubleArgumentType.doubleArg(0.0, 1000.0))
                             .executes(ctx -> setHardGate(ctx, DoubleArgumentType.getDouble(ctx, "ms")))))
+                    .then(Commands.literal("replay")
+                        .then(Commands.argument("ms", DoubleArgumentType.doubleArg(0.1, 50.0))
+                            .executes(ctx -> setReplay(ctx, DoubleArgumentType.getDouble(ctx, "ms")))))
                     .then(Commands.literal("status")
                         .executes(ServerHandlers::promoteStatus)))
                 .then(Commands.literal("adaptive")
@@ -299,6 +302,13 @@ public final class ServerHandlers {
         PromotionManager.setHardGateMs(ms);
         ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: promotion hard gate = "
             + String.format("%.1f", PromotionManager.hardGateMs()) + " ms"), false);
+        return 1;
+    }
+
+    private static int setReplay(CommandContext<CommandSourceStack> ctx, double ms) {
+        PromotionManager.setReplayBudgetMs(ms);
+        ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: deferred-write replay budget = "
+            + String.format("%.1f", PromotionManager.replayBudgetMs()) + " ms/tick"), false);
         return 1;
     }
 

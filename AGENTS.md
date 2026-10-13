@@ -196,7 +196,12 @@ all** (server must not choke at ~80 chunks/s swept).
 - **Block-write guard**: `mixin/LevelWriteGuardMixin` intercepts `Level.setBlock`; for a proxy it cancels the
   write, records it, and starts the promotion immediately, then `PromotionManager.replayWrites` re-applies it after promotion
   (returning true preserves the client's prediction). `mixin/FlowingFluidMixin` cancels fluid spread into
-  proxies (fluid does not promote). Bounded write log (`MAX_WRITE_LOG=256`).
+  proxies (fluid does not promote). Only a proxy whose promotion has not started is capped (`MAX_WRITE_LOG=256`);
+  writes into a generating chunk, or a real one with replay pending, are logged uncapped and replayed in order
+  under `promotion.rate.replayBudgetMs` (1.5 ms/tick, `/aerogel promote replay`), the rest carried to the next tick.
+- **Promotion in flight reads like a proxy**: until the promoted chunk's FULL future completes
+  (`ProxyChunkGate.isPromoting`), main-thread reads get the placeholder (`requireChunk=false`: `null`), fluid
+  spread is cancelled and the clamp net stays on; vanilla `getChunk` would `managedBlock` on the generation (#13).
 - **Clamp**: client `ClientTickEvent.Post` owns standing (snap + onGround claim → sprint/jump work); server
   `PlayerTickEvent.Post` is a through-floor net only (2-block deadzone, skipped over REAL chunks so you can
   cave underground). Per-tick server teleports caused rubber-banding — don't reintroduce.
@@ -267,6 +272,7 @@ all** (server must not choke at ~80 chunks/s swept).
     proxy surface; default 8), `promote concurrency <1-16>` (concurrent **linger** regenerations; default 2),
     `promote budget <0.05-1.0>` (fraction of wall time for linger; default 0.5), `promote cost <ms>` (budget
     charged per linger promotion; default 100), `promote hardgate <ms>` (linger tick-time brake; default 60),
+    `promote replay <ms>` (per-tick wall time for replaying deferred writes; default 1.5),
     `promote status` (effective thresholds, budget, queue/in-flight). Every setter writes the COMMON config.
     Immediate (touch / write / opt-out) promotion ignores `concurrency`, `budget` and `hardgate` by design.
   - `/aerogel adaptive status` (backlog/tick now + window max, hold left, opt-in/opt-out/linger),

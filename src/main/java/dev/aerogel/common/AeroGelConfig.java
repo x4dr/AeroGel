@@ -35,6 +35,7 @@ public final class AeroGelConfig {
     public final ModConfigSpec.DoubleValue chunkCostMs;
     public final ModConfigSpec.DoubleValue burstMs;
     public final ModConfigSpec.DoubleValue hardGateMs;
+    public final ModConfigSpec.DoubleValue replayBudgetMs;
     public final ModConfigSpec.DoubleValue idleTickMs;
     public final ModConfigSpec.DoubleValue busyTickMs;
 
@@ -108,6 +109,9 @@ public final class AeroGelConfig {
             .defineInRange("burstMs", 200.0, 0.0, 10000.0);
         hardGateMs = b.comment("No ordinary linger promotion starts while smoothed tick time is at or above this (0 = off).")
             .defineInRange("hardGateMs", 60.0, 0.0, 1000.0);
+        replayBudgetMs = b.comment("Wall time per tick (ms) for replaying writes deferred while a chunk was a proxy or still")
+            .comment("generating; the rest carries to the next tick. Writes into a generating chunk are never dropped.")
+            .defineInRange("replayBudgetMs", 1.5, 0.1, 50.0);
         b.pop();
 
         b.comment("How server load is measured for the load-adaptive linger endpoints.")

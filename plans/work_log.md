@@ -6,6 +6,29 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-13 (night) — promotions never block the main thread; in-flight writes kept and budgeted (#13, #5, #12)
+
+- **#13.** A promoted chunk left the proxy set while its FULL future was still generating, so the player's own
+  entity tick (fluid state at its feet) and `getNoiseBiome` peeks went to vanilla `getChunk` and `managedBlock`ed
+  until it finished (12-13 s per linger promotion in the real pack). `ProxyChunkGate` now tracks `promoting` (set in
+  `promote`, cleared in the completion callback); the read mixin answers those positions like a proxy (placeholder,
+  `null` for `requireChunk=false`, vanilla once the requested status is in memory), `mayHaveProxy` stays true while
+  any is promoting, fluid spread into them is cancelled and the server clamp net stays on.
+- **#5 (Maric's decision).** Writes into a chunk whose promotion is running are logged uncapped and never dropped;
+  only a proxy whose promotion has not started (no holder) keeps the 256 cap. Logged writes replay oldest first once
+  the chunk is real, under `promotion.rate.replayBudgetMs` (1.5 ms/tick, `/aerogel promote replay <ms>`), the rest
+  carried to the next tick; later writes into a chunk with replay pending queue behind it so order holds. A promoted
+  chunk already real in memory takes writes directly (its own post-processing wrote hundreds of blocks into the log
+  in the stress probe). The replay is decoupled from the completion callback, so manual and timed-out promotions
+  replay too.
+- **#12.** `pickNext` takes the first candidate when no player is online (every distance is `MAX_VALUE`).
+- Probes: `aerogel.promote` times a `getChunk(FULL)` of the generating chunk (placeholder, no block), peeks it with
+  `requireChunk=false` (null), writes 6144 blocks into it and checks all land over more than one tick and the read is
+  real afterwards; `aerogel.promotestress` walks to a still-fresh 5x5 (a persisted one passed instantly) and logs
+  that no player is online.
+
+---
+
 ## 2026-10-13 (night) — placeholders only for generation, never for existing chunks (#3, #4)
 
 - `ServerChunkCachePlaceholderMixin` serves a placeholder only when the main-thread read would have to generate:

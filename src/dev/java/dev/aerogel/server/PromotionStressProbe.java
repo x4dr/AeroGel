@@ -9,7 +9,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Headless stress test of {@link PromotionManager} (flag file: &lt;serverDir&gt;/aerogel.promotestress).
  * Force-loads a dense 5x5 of fresh proxy chunks and queues them all at once; the manager must promote them
- * without lag. Halts when every chunk is real (PASS) or after a timeout (FAIL).
+ * without lag, with no player online (#12). Halts when every chunk is real (PASS) or after a timeout (FAIL).
  */
 final class PromotionStressProbe {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.stressprobe");
@@ -28,18 +28,45 @@ final class PromotionStressProbe {
     static void start(MinecraftServer server) {
         level = server.overworld();
         ChunkPos spawn = new ChunkPos(level.getSharedSpawnPos());
-        center = new ChunkPos(spawn.x + OFFSET, spawn.z + OFFSET);
+        // a previous run persists its 5x5, so walk along +x to a block that is still all fresh proxies;
+        // a persisted block would read as an instant PASS and hide a stuck queue
+        for (int i = 0; i < 64 && center == null; i++) {
+            ChunkPos candidate = new ChunkPos(spawn.x + OFFSET + i * 32, spawn.z + OFFSET);
+            if (allFresh(candidate, true)) {
+                center = candidate;
+            } else {
+                allFresh(candidate, false);
+            }
+        }
+        if (center == null) {
+            LOGGER.error("promote stress: VERDICT FAIL — no fresh 5x5 found near offset {}", OFFSET);
+            level = null;
+            server.halt(false);
+            return;
+        }
         for (int dx = -RADIUS; dx <= RADIUS; dx++) {
             for (int dz = -RADIUS; dz <= RADIUS; dz++) {
-                int x = center.x + dx;
-                int z = center.z + dz;
-                level.setChunkForced(x, z, true);
-                level.getChunk(x, z); // instant placeholder
-                PromotionManager.debugEnqueue(level, ChunkPos.asLong(x, z));
+                PromotionManager.debugEnqueue(level, ChunkPos.asLong(center.x + dx, center.z + dz));
                 expected++;
             }
         }
-        LOGGER.info("promote stress: enqueued {} chunks around {}", expected, center);
+        LOGGER.info("promote stress: enqueued {} chunks around {} with {} player(s) online",
+            expected, center, server.getPlayerCount());
+    }
+
+    /** force (or unforce) the 5x5 around {@code c}; when forcing, true if none of it is real yet. */
+    private static boolean allFresh(ChunkPos c, boolean force) {
+        boolean fresh = true;
+        for (int dx = -RADIUS; dx <= RADIUS; dx++) {
+            for (int dz = -RADIUS; dz <= RADIUS; dz++) {
+                level.setChunkForced(c.x + dx, c.z + dz, force);
+                if (force) {
+                    level.getChunk(c.x + dx, c.z + dz); // instant placeholder, or loads an on-disk chunk
+                    fresh &= level.getChunkSource().getChunkNow(c.x + dx, c.z + dz) == null;
+                }
+            }
+        }
+        return fresh;
     }
 
     static void tick(MinecraftServer server) {

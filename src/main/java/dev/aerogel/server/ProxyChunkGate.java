@@ -118,6 +118,11 @@ public final class ProxyChunkGate {
         final LongOpenHashSet proxy = new LongOpenHashSet();
         /** positions with an EMPTY classification probe in flight. */
         final LongOpenHashSet probing = new LongOpenHashSet();
+        /**
+         * promoted positions whose FULL future has not completed yet. Reads keep getting the placeholder until
+         * it has, so a main-thread read never {@code managedBlock}s on the generation (#13).
+         */
+        final LongOpenHashSet promoting = new LongOpenHashSet();
         /** in-memory read-only placeholders handed to chunk reads while the proxy is active. */
         final Long2ObjectOpenHashMap<EmptyLevelChunk> placeholders = new Long2ObjectOpenHashMap<>();
         /** classification completions that must not run inline inside {@code updateFutures}. */
@@ -285,7 +290,7 @@ public final class ProxyChunkGate {
         if (state == null || !active || !gateEnabled) {
             return false;
         }
-        if (state.anyProxy) {
+        if (state.anyProxy || !state.promoting.isEmpty()) {
             return true;
         }
         if (!state.adaptiveEnabled || state.enforcing) {
@@ -329,6 +334,15 @@ public final class ProxyChunkGate {
         return true;
     }
 
+    /**
+     * true while a promotion of this position is generating (FULL future not complete). It is no longer a
+     * proxy, but reads and writes must still treat it as one: vanilla would block the main thread on it.
+     */
+    public static boolean isPromoting(ServerLevel lvl, long pos) {
+        State state = state(lvl);
+        return state != null && state.promoting.contains(pos);
+    }
+
     /** true when the holder already has this position in memory at {@code status} (no generation needed). */
     public static boolean isAvailable(ServerLevel lvl, long pos, ChunkStatus status) {
         State state = state(lvl);
@@ -366,6 +380,7 @@ public final class ProxyChunkGate {
             state.real.remove(pos);
             state.proxy.remove(pos);
             state.probing.remove(pos);
+            state.promoting.remove(pos);
         }
     }
 
@@ -505,10 +520,12 @@ public final class ProxyChunkGate {
             return false;
         }
         forcePrepare(holder, state.chunkMap);
+        state.promoting.add(p);
         holder.getFullChunkFuture().whenComplete((result, error) -> server.execute(() -> {
             // This runs inline on the chunk-task completion (main thread). Do NOT read/collide/load chunks
             // here: Level.getChunk would managedBlock the task queue it is running on (watchdog deadlock).
             // Only enqueue the post-promotion work; ProxyChunkGate.tick runs it as a normal tick task.
+            state.promoting.remove(p);
             if (error != null) {
                 LOGGER.error("proxy chunk {} promotion failed", pos, error);
             } else {

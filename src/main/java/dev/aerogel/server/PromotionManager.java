@@ -5,6 +5,7 @@ import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -21,7 +22,6 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.chunk.LevelChunk;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -105,10 +105,14 @@ public final class PromotionManager {
     private static double chunkCostMs = 100.0;
     private static double burstMs = 200.0;
     private static double hardGateMs = 60.0;
+    private static double replayBudgetMs = 1.5;
     private static double idleTickMs = 10.0;
     private static double busyTickMs = 45.0;
     private static boolean enabled = true;
     private static long lastStatusLog;
+    /** the chunk whose deferred writes are being replayed right now: its own writes must not re-defer. */
+    private static long replayingPos;
+    private static boolean replaying;
 
     /** per-{@code ServerLevel} promotion state. */
     private static final class State {
@@ -126,8 +130,10 @@ public final class PromotionManager {
         final LongOpenHashSet inFlight = new LongOpenHashSet();
         /** in-flight chunk -> tick it was started, so a stuck future can be timed out. */
         final Long2LongOpenHashMap inFlightSince = new Long2LongOpenHashMap();
-        /** chunk -> writes cancelled while it was a proxy, to be replayed once it is real. */
-        final Long2ObjectOpenHashMap<List<DeferredWrite>> deferredWrites = new Long2ObjectOpenHashMap<>();
+        /** chunk -> writes cancelled while it was a proxy or generating, replayed in order once it is real. */
+        final Long2ObjectOpenHashMap<WriteLog> deferredWrites = new Long2ObjectOpenHashMap<>();
+        /** per-tick scratch: chunks whose write log can be replayed now. */
+        final LongArrayList replayScratch = new LongArrayList();
         /** reused per tick so the tick path does not allocate a fresh player list. */
         final List<ServerPlayer> playersScratch = new ArrayList<>();
         /** effective queue cap for this level, refreshed each tick. */
@@ -164,6 +170,7 @@ public final class PromotionManager {
         chunkCostMs = cfg.chunkCostMs.get();
         burstMs = cfg.burstMs.get();
         hardGateMs = cfg.hardGateMs.get();
+        replayBudgetMs = cfg.replayBudgetMs.get();
         idleTickMs = cfg.idleTickMs.get();
         busyTickMs = cfg.busyTickMs.get();
         State state = new State(lvl);
@@ -289,6 +296,16 @@ public final class PromotionManager {
         AeroGelConfig.SPEC.save();
     }
 
+    public static double replayBudgetMs() {
+        return replayBudgetMs;
+    }
+
+    public static void setReplayBudgetMs(double ms) {
+        replayBudgetMs = Math.clamp(ms, 0.1, 50.0);
+        AeroGelConfig.CFG.replayBudgetMs.set(replayBudgetMs);
+        AeroGelConfig.SPEC.save();
+    }
+
     /** the linger range actually in use (resolves the auto value). */
     public static int effectiveMaxRange(MinecraftServer server) {
         if (maxRange > 0) {
@@ -338,6 +355,7 @@ public final class PromotionManager {
             + ", landing " + fmt(landingMargin) + " blocks"
             + ", concurrency " + maxInFlight + ", budget " + fmt(budgetOfFirst()) + "/" + (int) (maxGenFraction * 1000) + " ms/s"
             + ", cost " + fmt(chunkCostMs) + " ms, hard gate " + fmt(hardGateMs) + " ms"
+            + ", replay " + fmt(replayBudgetMs) + " ms/tick"
             + ", queued " + queued + ", in flight " + inFlight;
     }
 
@@ -355,7 +373,10 @@ public final class PromotionManager {
     // ---- tick ----
 
     public static void tick(MinecraftServer server) {
+        // one wall-time budget per tick for all levels' deferred-write replay (#5)
+        long deadline = System.nanoTime() + (long) (replayBudgetMs * 1_000_000.0);
         for (State state : STATES.values()) {
+            replayWrites(state, deadline);
             tickState(server, state);
         }
     }
@@ -502,10 +523,10 @@ public final class PromotionManager {
             }
             it.remove();
             state.inFlight.remove(pos);
-            List<DeferredWrite> writes = state.deferredWrites.get(pos);
-            if (writes != null && !writes.isEmpty()) {
+            WriteLog log = state.deferredWrites.get(pos);
+            if (log != null && !log.writes.isEmpty()) {
                 LOGGER.warn("promotion of proxy chunk {} stalled for {} ticks; re-promoting with {} deferred write(s)",
-                    new ChunkPos(pos), IN_FLIGHT_TIMEOUT_TICKS, writes.size());
+                    new ChunkPos(pos), IN_FLIGHT_TIMEOUT_TICKS, log.writes.size());
                 promoteImmediate(state, pos);
             } else {
                 LOGGER.warn("promotion of proxy chunk {} stalled for {} ticks; dropping it (vanilla will generate)",
@@ -560,9 +581,11 @@ public final class PromotionManager {
 
     /**
      * Runtime block-write guard. Called from {@code Level.setBlock} for every server-side write; returns
-     * true when the write must be cancelled because it targets a proxy (the write is remembered and
-     * replayed after promotion). The fast bail keeps the dormant case to one state lookup + one volatile
-     * flag read.
+     * true when the write must be cancelled because it targets a proxy, a chunk still generating, or a real
+     * chunk whose earlier writes are not all replayed yet (so the order is kept). The write is remembered and
+     * replayed under the per-tick budget once the chunk is real. Only a proxy whose promotion has not started
+     * (no holder yet) is capped at {@link #MAX_WRITE_LOG}; once it is promoting nothing is dropped (#5). The
+     * fast bail keeps the dormant case to one state lookup + one volatile flag read.
      */
     public static boolean tryDeferWrite(ServerLevel serverLevel, BlockPos pos, BlockState state, int flags) {
         if (!enabled) {
@@ -573,22 +596,30 @@ public final class PromotionManager {
             return false;
         }
         long chunkPos = ChunkPos.asLong(pos);
-        if (!isStubTarget(promotion, chunkPos)) {
+        if ((replaying && chunkPos == replayingPos) || !isStubTarget(promotion, chunkPos)) {
             return false;
         }
-        List<DeferredWrite> writes = promotion.deferredWrites.computeIfAbsent(chunkPos, k -> new ArrayList<>());
-        if (writes.size() < MAX_WRITE_LOG) {
-            writes.add(new DeferredWrite(pos.immutable(), state, flags));
+        promoteImmediate(promotion, chunkPos); // no-op once it is generating or real
+        WriteLog log = promotion.deferredWrites.computeIfAbsent(chunkPos, k -> new WriteLog());
+        if (log.writes.size() < MAX_WRITE_LOG || !ProxyChunkGate.isProxy(serverLevel, chunkPos)) {
+            log.writes.add(new DeferredWrite(pos.immutable(), state, flags));
         } else {
             LOGGER.warn("proxy chunk {} has more than {} deferred writes; dropping the newest", new ChunkPos(chunkPos), MAX_WRITE_LOG);
         }
-        promoteImmediate(promotion, chunkPos);
         return true;
     }
 
-    /** true while the position is a proxy placeholder (tagged, or untagged-but-air) or mid-promotion. */
+    /**
+     * true while the position is a proxy, still generating, or has deferred writes waiting for replay (a later
+     * write must queue behind them). A promoted chunk that is already real in memory takes writes directly,
+     * even before its completion callback ran (its own post-processing writes land here).
+     */
     private static boolean isStubTarget(State state, long chunkPos) {
-        return state.inFlight.contains(chunkPos) || ProxyChunkGate.isProxy(state.level, chunkPos);
+        if (state.deferredWrites.containsKey(chunkPos) || ProxyChunkGate.isProxy(state.level, chunkPos)) {
+            return true;
+        }
+        return (state.inFlight.contains(chunkPos) || ProxyChunkGate.isPromoting(state.level, chunkPos))
+            && !ProxyChunkGate.isLoadedReal(state.level, chunkPos);
     }
 
     /** test hook: queue a chunk as if it had lingered (used by the dev-only headless stress probe). */
@@ -753,7 +784,7 @@ public final class PromotionManager {
                 continue; // holder not loaded yet; leave it queued
             }
             int distance = nearestDistance(promotion.pos, players);
-            if (distance < bestDist) {
+            if (best == null || distance < bestDist) { // no player online: every distance is MAX_VALUE (#12)
                 best = promotion;
                 bestDist = distance;
             }
@@ -781,29 +812,60 @@ public final class PromotionManager {
         state.inFlightSince.remove(pos);
         state.lingerTicks.remove(pos);
         state.lingerSeen.remove(pos);
-        replayWrites(state, pos);
+        WriteLog log = state.deferredWrites.get(pos);
+        if (log != null && state.level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos)) == null) {
+            // regeneration did not produce real terrain (or the chunk unloaded): the writes stay logged and
+            // replay whenever the chunk is real, rather than silently dropping the player's edit.
+            LOGGER.warn("proxy chunk {} not real after promotion; keeping {} deferred write(s)", new ChunkPos(pos), log.writes.size());
+        }
     }
 
-    private static void replayWrites(State state, long pos) {
-        List<DeferredWrite> writes = state.deferredWrites.get(pos);
-        if (writes == null || writes.isEmpty()) {
-            state.deferredWrites.remove(pos);
+    /**
+     * Replay deferred writes, oldest first, into every chunk that is real now, until the per-tick wall-time
+     * budget is spent; the rest carries to the next tick (#5). At least one write runs per level and tick, so
+     * a tiny budget cannot starve the replay.
+     * ponytail: scans every logged chunk each tick; a ready-queue if the log ever holds thousands of chunks.
+     */
+    private static void replayWrites(State state, long deadline) {
+        if (state.deferredWrites.isEmpty()) {
             return;
         }
-        LevelChunk chunk = state.level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos));
-        if (chunk == null) {
-            // regeneration did not actually produce real terrain (or the chunk unloaded): keep the writes
-            // queued for a retry rather than silently dropping the player's edit. The gate already allowed
-            // this position, so the normal enqueue guard would refuse it; force the retry through.
-            LOGGER.warn("proxy chunk {} not real after promotion; keeping {} deferred write(s)", new ChunkPos(pos), writes.size());
-            promoteImmediate(state, pos);
-            return;
+        LongArrayList ready = state.replayScratch;
+        ready.clear();
+        for (long pos : state.deferredWrites.keySet()) {
+            if (!ProxyChunkGate.isPromoting(state.level, pos)
+                && state.level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos)) != null) {
+                ready.add(pos);
+            }
         }
-        state.deferredWrites.remove(pos);
-        for (DeferredWrite write : writes) {
-            state.level.setBlock(write.pos(), write.state(), write.flags());
+        // setBlock below may defer writes into other chunks, so the map is not iterated while replaying
+        for (int i = 0; i < ready.size(); i++) {
+            long pos = ready.getLong(i);
+            WriteLog log = state.deferredWrites.get(pos);
+            replaying = true;
+            replayingPos = pos;
+            try {
+                DeferredWrite write;
+                while ((write = log.writes.pollFirst()) != null) {
+                    state.level.setBlock(write.pos(), write.state(), write.flags());
+                    log.replayed++;
+                    if (System.nanoTime() >= deadline) {
+                        break;
+                    }
+                }
+            } finally {
+                replaying = false;
+            }
+            log.ticks++;
+            if (log.writes.isEmpty()) {
+                state.deferredWrites.remove(pos);
+                LOGGER.info("replayed {} deferred write(s) into promoted chunk {} over {} tick(s)",
+                    log.replayed, new ChunkPos(pos), log.ticks);
+            }
+            if (System.nanoTime() >= deadline) {
+                return;
+            }
         }
-        LOGGER.info("replayed {} deferred write(s) into promoted chunk {}", writes.size(), new ChunkPos(pos));
     }
 
     private static double loadFactor(float tickMs) {
@@ -819,6 +881,13 @@ public final class PromotionManager {
     }
 
     private record DeferredWrite(BlockPos pos, BlockState state, int flags) {
+    }
+
+    /** one chunk's deferred writes in arrival order, plus replay progress for the log line. */
+    private static final class WriteLog {
+        final ArrayDeque<DeferredWrite> writes = new ArrayDeque<>();
+        int replayed;
+        int ticks;
     }
 
     private static final class Promotion {

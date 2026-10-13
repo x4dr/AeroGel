@@ -35,7 +35,8 @@ public class FlowingFluidMixin {
         if (!ProxyChunkGate.mayHaveProxy(serverLevel)) {
             return; // dormant level: no proxy and not engaged -> vanilla spread
         }
-        if (ProxyChunkGate.isProxy(serverLevel, ChunkPos.asLong(pos))) {
+        long chunk = ChunkPos.asLong(pos);
+        if (ProxyChunkGate.isProxy(serverLevel, chunk) || ProxyChunkGate.isPromoting(serverLevel, chunk)) {
             ci.cancel();
         }
     }

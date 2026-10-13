@@ -6,25 +6,37 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.EmptyLevelChunk;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Headless smoke test of {@link PromotionManager} (flag file: &lt;serverDir&gt;/aerogel.promote). Loads a fresh
  * proxy chunk, writes a block into it (must be cancelled + deferred), lets the manager promote the chunk,
- * then verifies the write was replayed onto the real terrain. Self-halting.
+ * then verifies the write was replayed onto the real terrain. While the promotion is generating it also checks
+ * that a main-thread read returns the placeholder at once instead of blocking (#13), and writes more than the
+ * 256-per-chunk cap into the chunk, which must all land, replayed over more than one tick (#5). Self-halting.
  */
 final class PromotionProbe {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.promoteprobe");
     private static final int OFFSET = 3000;
     private static final int MAX_TICKS = 600;
+    /** in-flight writes: 16x16 columns x 24 layers, far above the 256 cap and above one tick's replay budget. */
+    private static final int BULK_Y = 101;
+    private static final int BULK_LAYERS = 24;
+    private static final int BULK = 16 * 16 * BULK_LAYERS;
 
     private static ServerLevel level;
     private static ChunkPos probe;
     private static BlockPos writePos;
     private static int ticks;
     private static boolean written;
+    private static String inFlightRead = "not checked";
+    private static boolean inFlightOk;
+    private static int bulkFirstTick = -1;
 
     private PromotionProbe() {
     }
@@ -60,6 +72,43 @@ final class PromotionProbe {
         LevelChunk after = level.getChunkSource().getChunkNow(probe.x, probe.z);
         LOGGER.info("promote probe: write into proxy -> deferred={}, still proxy={}", deferred, after == null);
         written = true;
+        if (!ProxyChunkGate.isPromoting(level, probe.toLong())) {
+            inFlightRead = "promotion not in flight after the write";
+            return;
+        }
+        // #13: a read of the generating chunk must not managedBlock on its FULL future
+        long t0 = System.nanoTime();
+        ChunkAccess read = level.getChunk(probe.x, probe.z, ChunkStatus.FULL, true);
+        double ms = (System.nanoTime() - t0) / 1_000_000.0;
+        ChunkAccess peek = level.getChunkSource().getChunk(probe.x, probe.z, ChunkStatus.FULL, false);
+        inFlightOk = read instanceof EmptyLevelChunk && peek == null && ms < 5.0;
+        inFlightRead = String.format("placeholder=%s in %.3f ms, peek null=%s", read instanceof EmptyLevelChunk, ms, peek == null);
+        // #5: more than the cap into the generating chunk; none may be dropped
+        for (int y = BULK_Y; y < BULK_Y + BULK_LAYERS; y++) {
+            for (int dx = 0; dx < 16; dx++) {
+                for (int dz = 0; dz < 16; dz++) {
+                    level.setBlock(new BlockPos(probe.getMinBlockX() + dx, y, probe.getMinBlockZ() + dz),
+                        Blocks.GOLD_BLOCK.defaultBlockState(), 3);
+                }
+            }
+        }
+        LOGGER.info("promote probe: in-flight read {}; {} writes into the generating chunk", inFlightRead, BULK);
+    }
+
+    private static int bulkPresent() {
+        int present = 0;
+        BlockPos.MutableBlockPos at = new BlockPos.MutableBlockPos();
+        for (int y = BULK_Y; y < BULK_Y + BULK_LAYERS; y++) {
+            for (int dx = 0; dx < 16; dx++) {
+                for (int dz = 0; dz < 16; dz++) {
+                    if (level.getBlockState(at.set(probe.getMinBlockX() + dx, y, probe.getMinBlockZ() + dz))
+                        .is(Blocks.GOLD_BLOCK)) {
+                        present++;
+                    }
+                }
+            }
+        }
+        return present;
     }
 
     static void tick(MinecraftServer server) {
@@ -69,15 +118,21 @@ final class PromotionProbe {
         if (!written && ProxyChunkGate.hasHolder(level, probe.toLong())) {
             write();
         }
-        if (++ticks % 10 != 0) {
-            return;
-        }
+        ++ticks;
         LevelChunk chunk = level.getChunkSource().getChunkNow(probe.x, probe.z);
-        if (chunk != null) {
+        int present = chunk == null ? 0 : bulkPresent();
+        if (present > 0 && bulkFirstTick < 0) {
+            bulkFirstTick = ticks;
+        }
+        if (chunk != null && (present == BULK || ticks > MAX_TICKS)) {
             BlockState at = level.getBlockState(writePos);
             boolean replayed = at.is(Blocks.STONE);
-            LOGGER.info("promote probe: VERDICT {} — chunk {} real after {} ticks, deferred write replayed={} (block {})",
-                replayed ? "PASS" : "PARTIAL", probe, ticks, replayed, at.getBlock());
+            int spread = present > 0 ? ticks - bulkFirstTick + 1 : 0;
+            boolean realAfter = !(level.getChunk(probe.x, probe.z) instanceof EmptyLevelChunk);
+            boolean pass = replayed && inFlightOk && present == BULK && spread > 1 && realAfter;
+            LOGGER.info("promote probe: VERDICT {} — chunk {} real after {} ticks, deferred write replayed={} (block {}); "
+                    + "in-flight read {}; {}/{} in-flight writes landed over {} tick(s); real read after={}",
+                pass ? "PASS" : "FAIL", probe, ticks, replayed, at.getBlock(), inFlightRead, present, BULK, spread, realAfter);
             testPushUp();
             finish(server);
         } else if (ticks > MAX_TICKS) {

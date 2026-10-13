@@ -569,7 +569,8 @@ public final class ProxyStreamer {
         // a promoted/real chunk at the player's position has real collision; clamping there would fight it
         int cx = ChunkPos.getX(chunkPos);
         int cz = ChunkPos.getZ(chunkPos);
-        boolean realHere = !ProxyChunkGate.isProxy(state.level, chunkPos);
+        boolean realHere = !ProxyChunkGate.isProxy(state.level, chunkPos)
+            && !ProxyChunkGate.isPromoting(state.level, chunkPos); // still generating: no collision yet
         double surface = MeshMath.surfaceAt(chunkPos, grid.tier(), grid.heights(), player.getX(), player.getZ());
         if (realHere) {
             return;

@@ -19,7 +19,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * promoted/known-real position falls through to vanilla (which loads/generates it forward). Only a request
  * that would have to GENERATE terrain is deferred: a chunk on disk at FULL is loaded, a chunk already in
  * memory at the requested status is returned, {@code requireChunk=false} gets {@code null} (never a
- * placeholder), and statuses below {@code BIOMES} (structure starts/references) go to vanilla. We deliberately
+ * placeholder), and statuses below {@code BIOMES} (structure starts/references) go to vanilla. A promoted chunk
+ * whose FULL future is still generating is answered the same way until it is ready. We deliberately
  * do NOT route proxies through {@code getChunkFutureMainThread}: that would add a {@code TicketType.UNKNOWN}
  * ticket and create a task.
  *
@@ -46,7 +47,9 @@ public class ServerChunkCachePlaceholderMixin {
             return; // structure lookups (/locate, maps) and the EMPTY load never build terrain: vanilla
         }
         long pos = ChunkPos.asLong(x, z);
-        if (!ProxyChunkGate.isProxy(level, pos)) {
+        // a promotion still generating is read like a proxy: vanilla would managedBlock on its FULL future
+        boolean promoting = ProxyChunkGate.isPromoting(level, pos);
+        if (!promoting && !ProxyChunkGate.isProxy(level, pos)) {
             return; // real / promoted / disengaged: vanilla loads or generates it
         }
         if (ProxyChunkGate.isAvailable(level, pos, status)) {
@@ -56,7 +59,7 @@ public class ServerChunkCachePlaceholderMixin {
             cir.setReturnValue(null); // a peek: vanilla's answer for a not-loaded chunk, never a placeholder
             return;
         }
-        if (ProxyChunkGate.isRealOnDisk(level, x, z)) {
+        if (!promoting && ProxyChunkGate.isRealOnDisk(level, x, z)) {
             return; // exists on disk at FULL: loading is not generation
         }
         cir.setReturnValue(ProxyChunkGate.placeholder(level, x, z));
