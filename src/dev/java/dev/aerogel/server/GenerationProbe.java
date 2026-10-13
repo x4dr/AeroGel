@@ -64,9 +64,41 @@ final class GenerationProbe {
         }
 
         checkSwitchPermission();
+        checkAdaptiveWindow();
 
         // wait a few ticks so the classification probe and placeholder path are exercised under ticking
         ProxyStreamer.scheduleHalt(300);
+    }
+
+    /**
+     * #2: the issue's backlog swing (558 -> 0 -> 234 -> 0 -> 74 -> 2, one sample per tick) must turn enforcing
+     * on once and keep it on; it may drop only after the window has cleared and the hold has run out.
+     */
+    private void checkAdaptiveWindow() {
+        AdaptiveMode.Window window = new AdaptiveMode.Window();
+        int[] swing = { 558, 0, 234, 0, 74, 2 };
+        boolean on = false;
+        int flips = 0;
+        long t = 0;
+        long lastSpike = 0;
+        for (int i = 0; i < swing.length * 4; i++, t += 50) {
+            int backlog = swing[i % swing.length];
+            lastSpike = backlog >= AdaptiveMode.backlogActivate() ? t : lastSpike;
+            boolean next = window.decide(on, t, backlog, 0.0, false);
+            flips += next != on ? 1 : 0;
+            on = next;
+        }
+        boolean heldOn = on && flips == 1;
+        long holdMs = Math.max(AdaptiveMode.holdSeconds(), AdaptiveMode.windowSeconds()) * 1000L;
+        boolean stillOnBeforeHold = window.decide(on, lastSpike + holdMs - 50, 0, 0.0, false);
+        boolean offAfter = !window.decide(true, lastSpike + holdMs + 50, 0, 0.0, false);
+        boolean lingerKeepsOn = window.decide(true, lastSpike + holdMs + 100, 0, 0.0, true);
+        boolean pass = heldOn && stillOnBeforeHold && offAfter && lingerKeepsOn;
+        LOGGER.info(pass
+            ? "VERDICT: PASS — adaptive window (558/0/234/0 swing flips on once, holds " + holdMs / 1000
+                + " s, then off; linger keeps it on)"
+            : "VERDICT: FAIL — adaptive window flips=" + flips + " heldOn=" + heldOn + " stillOnBeforeHold="
+                + stillOnBeforeHold + " offAfter=" + offAfter + " lingerKeepsOn=" + lingerKeepsOn);
     }
 
     /** #1/#11: a non-op cannot flip a server-wide switch, an op can; movecheck bypass defaults off. */

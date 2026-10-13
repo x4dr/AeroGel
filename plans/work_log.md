@@ -6,6 +6,18 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-13 (night) — adaptive enforcement stops flapping; backlog from every level (#2, #8)
+
+- `AdaptiveMode` decides on the max backlog and max tick time over the last `adaptive.windowSeconds` (5) instead
+  of one sample, and keeps enforcing for `adaptive.holdSeconds` (10) after the last activating sample. A single
+  sample swung 558 → 0 → 234 → 0 between ticks, so the hysteresis never held (123 on/off lines in 10 min).
+- The backlog input is the max over all gated levels, not the overworld only: lag in any dimension counts.
+- New commands `/aerogel adaptive hold|window`; `adaptive status` shows the windowed values and hold left.
+- The gate probe (`aerogel.probe`) feeds the decision the issue's swing and checks it flips on once, holds,
+  then turns off (and that a linger counter still keeps it on).
+
+---
+
 ## 2026-10-13 (late) — switch permissions, movecheck default, server-owner notes (#1, #11, #9)
 
 - `/aerogel switch` now refuses the server-wide features (`gate`, `promote`, `stream`, `resend`, `adaptive`,

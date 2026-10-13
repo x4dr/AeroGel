@@ -2,12 +2,14 @@ package dev.aerogel.server;
 
 import dev.aerogel.common.AeroGelConfig;
 import dev.aerogel.net.ClientSwitchPayload;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.Util;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
@@ -20,9 +22,11 @@ import org.slf4j.LoggerFactory;
  * Decides when the proxy gate is enforced at all, so AeroGel is inert when it is not needed.
  *
  * <p><b>Server-authoritative.</b> The gate is enforced globally while the server is struggling — the
- * main-thread chunk-task backlog ({@link ServerChunkCache#getPendingTasksCount()}) is at or above
- * {@code backlogActivate}, or the smoothed tick time is at or above {@code activateTickMs}. It stops only
- * once the backlog and tick time have fallen back below the deactivate values <b>and no chunk is
+ * main-thread chunk-task backlog ({@link ServerChunkCache#getPendingTasksCount()}, max over every gated level)
+ * is at or above {@code backlogActivate}, or the smoothed tick time is at or above {@code activateTickMs}.
+ * Both inputs are the max over the last {@code windowSeconds}, because a single sample swings across the
+ * whole band within a tick (#2). It stops only once both windowed values are back below the deactivate
+ * values, {@code holdSeconds} have passed since the last activating sample, <b>and no chunk is
  * mid-linger</b>, so switching to vanilla can never trigger a burst of instant generation.</p>
  *
  * <p><b>Per-player opt-in.</b> While the server is not enforcing, a player whose client {@code travel}
@@ -42,6 +46,9 @@ public final class AdaptiveMode {
     private static double deactivateTickMs = 22.0;
     private static int backlogActivate = 64;
     private static int backlogDeactivate = 16;
+    private static int holdSeconds = 10;
+    private static int windowSeconds = 5;
+    private static final Window WINDOW = new Window();
 
     private static final Map<UUID, Boolean> travel = new HashMap<>();
     private static final Map<UUID, Boolean> proxy = new HashMap<>();
@@ -58,17 +65,22 @@ public final class AdaptiveMode {
         deactivateTickMs = cfg.adaptiveDeactivateTickMs.get();
         backlogActivate = cfg.adaptiveBacklogActivate.get();
         backlogDeactivate = cfg.adaptiveBacklogDeactivate.get();
+        holdSeconds = cfg.adaptiveHoldSeconds.get();
+        windowSeconds = cfg.adaptiveWindowSeconds.get();
         enforcing = false;
+        WINDOW.clear();
         travel.clear();
         proxy.clear();
         optInCount = 0;
         optOutCount = 0;
-        LOGGER.info("adaptive: {} (activate {} ms / backlog {}, deactivate {} ms / backlog {})",
-            enabled ? "on" : "off", activateTickMs, backlogActivate, deactivateTickMs, backlogDeactivate);
+        LOGGER.info("adaptive: {} (activate {} ms / backlog {}, deactivate {} ms / backlog {}, hold {} s, window {} s)",
+            enabled ? "on" : "off", activateTickMs, backlogActivate, deactivateTickMs, backlogDeactivate,
+            holdSeconds, windowSeconds);
     }
 
     public static void shutdown() {
         enforcing = false;
+        WINDOW.clear();
         travel.clear();
         proxy.clear();
         optInCount = 0;
@@ -78,23 +90,79 @@ public final class AdaptiveMode {
     public static void tick(MinecraftServer server) {
         if (!enabled) {
             enforcing = false;
+            WINDOW.clear();
             pushZones(server);
             return;
         }
-        int backlog = server.overworld().getChunkSource().getPendingTasksCount();
-        float tickMs = server.getCurrentSmoothedTickTime();
-        if (enforcing) {
-            if (backlog <= backlogDeactivate && tickMs <= deactivateTickMs && !PromotionManager.hasLinger()) {
-                enforcing = false;
-                LOGGER.info("adaptive: enforcing off (backlog {}, tick {} ms, no linger)",
-                    backlog, String.format("%.1f", tickMs));
-            }
-        } else if (backlog >= backlogActivate || tickMs >= activateTickMs) {
-            enforcing = true;
-            LOGGER.info("adaptive: enforcing on (backlog {}, tick {} ms)",
-                backlog, String.format("%.1f", tickMs));
+        boolean was = enforcing;
+        enforcing = WINDOW.decide(enforcing, Util.getMillis(), backlog(server), server.getCurrentSmoothedTickTime(),
+            PromotionManager.hasLinger());
+        if (enforcing != was) {
+            LOGGER.info(enforcing ? "adaptive: enforcing on (backlog {}, tick {} ms over {} s)"
+                    : "adaptive: enforcing off (backlog {}, tick {} ms over {} s, no linger)",
+                WINDOW.maxBacklog, String.format("%.1f", WINDOW.maxTickMs), windowSeconds);
         }
         pushZones(server);
+    }
+
+    /** #8: lag from any gated level counts, not just the overworld. */
+    private static int backlog(MinecraftServer server) {
+        int max = 0;
+        for (ServerLevel level : server.getAllLevels()) {
+            if (ProxyChunkGate.isActive(level)) {
+                max = Math.max(max, level.getChunkSource().getPendingTasksCount());
+            }
+        }
+        return max;
+    }
+
+    /**
+     * The enforcing decision over a sliding window of samples, kept free of the server so a probe can feed it a
+     * synthetic sequence. On: the window's max backlog or max tick time reaches its activate value. Off: both
+     * window maxima are at or below the deactivate values, {@code holdSeconds} have passed since the last
+     * activating sample, and no linger counter remains.
+     */
+    static final class Window {
+        private record Sample(long ms, int backlog, double tickMs) {
+        }
+
+        private final ArrayDeque<Sample> samples = new ArrayDeque<>();
+        private long lastActivatingMs = Long.MIN_VALUE;
+        int maxBacklog;
+        double maxTickMs;
+
+        void clear() {
+            samples.clear();
+            lastActivatingMs = Long.MIN_VALUE;
+            maxBacklog = 0;
+            maxTickMs = 0;
+        }
+
+        boolean decide(boolean enforcingNow, long nowMs, int backlog, double tickMs, boolean linger) {
+            samples.addLast(new Sample(nowMs, backlog, tickMs));
+            while (samples.peekFirst().ms() < nowMs - windowSeconds * 1000L) {
+                samples.removeFirst();
+            }
+            maxBacklog = 0;
+            maxTickMs = 0;
+            for (Sample s : samples) {
+                maxBacklog = Math.max(maxBacklog, s.backlog());
+                maxTickMs = Math.max(maxTickMs, s.tickMs());
+            }
+            if (backlog >= backlogActivate || tickMs >= activateTickMs) {
+                lastActivatingMs = nowMs;
+            }
+            if (!enforcingNow) {
+                return maxBacklog >= backlogActivate || maxTickMs >= activateTickMs;
+            }
+            return maxBacklog > backlogDeactivate || maxTickMs > deactivateTickMs || linger
+                || holdRemainingMs(nowMs) > 0;
+        }
+
+        long holdRemainingMs(long nowMs) {
+            return lastActivatingMs == Long.MIN_VALUE ? 0
+                : Math.max(0, lastActivatingMs + holdSeconds * 1000L - nowMs);
+        }
     }
 
     private static void pushZones(MinecraftServer server) {
@@ -201,6 +269,26 @@ public final class AdaptiveMode {
         AeroGelConfig.SPEC.save();
     }
 
+    public static void setHoldSeconds(int seconds) {
+        holdSeconds = Math.clamp(seconds, 0, 600);
+        AeroGelConfig.CFG.adaptiveHoldSeconds.set(holdSeconds);
+        AeroGelConfig.SPEC.save();
+    }
+
+    public static void setWindowSeconds(int seconds) {
+        windowSeconds = Math.clamp(seconds, 0, 60);
+        AeroGelConfig.CFG.adaptiveWindowSeconds.set(windowSeconds);
+        AeroGelConfig.SPEC.save();
+    }
+
+    public static int holdSeconds() {
+        return holdSeconds;
+    }
+
+    public static int windowSeconds() {
+        return windowSeconds;
+    }
+
     public static double activateTickMs() {
         return activateTickMs;
     }
@@ -218,11 +306,14 @@ public final class AdaptiveMode {
     }
 
     public static String status(MinecraftServer server, float tickMs) {
-        int backlog = server.overworld().getChunkSource().getPendingTasksCount();
         return "adaptive: " + (enabled ? "on" : "off") + (enforcing ? " ENFORCING" : "")
-            + ", backlog " + backlog + " (act " + backlogActivate + " / deact " + backlogDeactivate + ")"
-            + ", tick " + String.format("%.1f", tickMs) + " ms (act "
+            + ", backlog " + backlog(server) + " now / " + WINDOW.maxBacklog + " max " + windowSeconds + " s (act "
+            + backlogActivate + " / deact " + backlogDeactivate + ")"
+            + ", tick " + String.format("%.1f", tickMs) + " ms now / " + String.format("%.1f", WINDOW.maxTickMs)
+            + " ms max (act "
             + String.format("%.1f", activateTickMs) + " / deact " + String.format("%.1f", deactivateTickMs) + ")"
+            + ", hold " + String.format("%.1f", WINDOW.holdRemainingMs(Util.getMillis()) / 1000.0) + " s left of "
+            + holdSeconds + " s"
             + ", opt-in " + optInCount + ", opt-out " + optOutCount
             + ", linger " + (PromotionManager.hasLinger() ? "yes" : "no");
     }

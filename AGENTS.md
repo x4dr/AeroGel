@@ -163,10 +163,11 @@ all** (server must not choke at ~80 chunks/s swept).
   old proxy save guards are **deleted** (they existed only for the old all-air FULL stubs). See
   `plans/proxy-chunk-state-machine.md` §6.
 - **Adaptive enforcement**: `server/AdaptiveMode` decides whether the gate applies at all. The server enforces
-  globally while the main-thread chunk-task backlog (`ServerChunkCache.getPendingTasksCount()`) is ≥
-  `backlogActivate` (64) or smoothed tick time ≥ `activateTickMs` (35 ms); it stops only once both fall back
-  below the deactivate values **and no linger counters remain** (so switching to vanilla never bursts instant
-  generation). While not enforcing, a player whose client `travel` switch is on is still gated around them; an
+  globally while the main-thread chunk-task backlog (`ServerChunkCache.getPendingTasksCount()`, max over every
+  gated level) is ≥ `backlogActivate` (64) or smoothed tick time ≥ `activateTickMs` (35 ms), both taken as
+  the max over the last `windowSeconds` (5); it stops only once both windowed values fall back below the
+  deactivate values, `holdSeconds` (10) have passed since the last activating sample, **and no linger counters
+  remain** (so switching to vanilla never bursts instant generation, and the state no longer flaps per tick). While not enforcing, a player whose client `travel` switch is on is still gated around them; an
   opted-out player's zone is vanilla (their leftovers are forced to real terrain), and if both overlap the
   opted-out zone wins. A player whose client `proxy` switch is off receives no meshes at all. See
   `plans/proxy-chunk-state-machine.md` §Adaptive enforcement.
@@ -265,8 +266,9 @@ all** (server must not choke at ~80 chunks/s swept).
     charged per linger promotion; default 100), `promote hardgate <ms>` (linger tick-time brake; default 60),
     `promote status` (effective thresholds, budget, queue/in-flight). Every setter writes the COMMON config.
     Immediate (touch / write / opt-out) promotion ignores `concurrency`, `budget` and `hardgate` by design.
-  - `/aerogel adaptive status` (backlog/tick/opt-in/opt-out/linger), `adaptive activate <1-200 ms>`,
-    `adaptive deactivate <1-200 ms>`, `adaptive backlog <activate> <deactivate>` (default 64/16).
+  - `/aerogel adaptive status` (backlog/tick now + window max, hold left, opt-in/opt-out/linger),
+    `adaptive activate <1-200 ms>`, `adaptive deactivate <1-200 ms>`, `adaptive backlog <activate>
+    <deactivate>` (default 64/16), `adaptive hold <0-600 s>` (default 10), `adaptive window <0-60 s>` (default 5).
   - `draw` is client-only: the server command relays a `ClientSettingPayload` to the player.
 - **Diagnostics**: client `proxy diag` (a `proxy diag:` log line every 5 s, now carrying the renderer signal —
   `visible drawn=N` or `visible unavailable(sodium)`), a one-shot dump relayed by **`/aerogel diag`**

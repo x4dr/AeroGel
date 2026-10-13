@@ -44,6 +44,8 @@ public final class AeroGelConfig {
     public final ModConfigSpec.DoubleValue adaptiveDeactivateTickMs;
     public final ModConfigSpec.IntValue adaptiveBacklogActivate;
     public final ModConfigSpec.IntValue adaptiveBacklogDeactivate;
+    public final ModConfigSpec.IntValue adaptiveHoldSeconds;
+    public final ModConfigSpec.IntValue adaptiveWindowSeconds;
 
     // stream
     public final ModConfigSpec.BooleanValue streamEnabled;
@@ -127,10 +129,14 @@ public final class AeroGelConfig {
             .defineInRange("activateTickMs", 35.0, 1.0, 200.0);
         adaptiveDeactivateTickMs = b.comment("Stop enforcing once tick time falls back to this (must be below the activate value).")
             .defineInRange("deactivateTickMs", 22.0, 1.0, 200.0);
-        adaptiveBacklogActivate = b.comment("Enforce when the main-thread chunk-task backlog reaches this many tasks.")
+        adaptiveBacklogActivate = b.comment("Enforce when the main-thread chunk-task backlog (max over all gated levels) reaches this many tasks.")
             .defineInRange("backlogActivate", 64, 1, 100000);
         adaptiveBacklogDeactivate = b.comment("Stop enforcing once the backlog falls back to this.")
             .defineInRange("backlogDeactivate", 16, 0, 100000);
+        adaptiveHoldSeconds = b.comment("Keep enforcing at least this many seconds after the last activating sample.")
+            .defineInRange("holdSeconds", 10, 0, 600);
+        adaptiveWindowSeconds = b.comment("Decide on the max backlog and tick time over this many seconds, not one sample (0 = one sample).")
+            .defineInRange("windowSeconds", 5, 0, 60);
         b.pop();
 
         b.comment("Proxy mesh sampling and streaming. Streaming is per-player: a player receives proxies only while")

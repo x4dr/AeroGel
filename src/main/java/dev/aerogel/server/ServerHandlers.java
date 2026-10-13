@@ -188,6 +188,12 @@ public final class ServerHandlers {
                     .then(Commands.literal("deactivate")
                         .then(Commands.argument("ms", DoubleArgumentType.doubleArg(1.0, 200.0))
                             .executes(ctx -> setAdaptiveDeactivate(ctx, DoubleArgumentType.getDouble(ctx, "ms")))))
+                    .then(Commands.literal("hold")
+                        .then(Commands.argument("seconds", IntegerArgumentType.integer(0, 600))
+                            .executes(ctx -> setAdaptiveHold(ctx, IntegerArgumentType.getInteger(ctx, "seconds")))))
+                    .then(Commands.literal("window")
+                        .then(Commands.argument("seconds", IntegerArgumentType.integer(0, 60))
+                            .executes(ctx -> setAdaptiveWindow(ctx, IntegerArgumentType.getInteger(ctx, "seconds")))))
                     .then(Commands.literal("backlog")
                         .then(Commands.argument("activate", IntegerArgumentType.integer(1, 100000))
                             .then(Commands.argument("deactivate", IntegerArgumentType.integer(0, 100000))
@@ -322,6 +328,20 @@ public final class ServerHandlers {
         AdaptiveMode.setDeactivateTickMs(ms);
         ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: adaptive deactivate = "
             + String.format("%.1f", AdaptiveMode.deactivateTickMs()) + " ms"), false);
+        return 1;
+    }
+
+    private static int setAdaptiveHold(CommandContext<CommandSourceStack> ctx, int seconds) {
+        AdaptiveMode.setHoldSeconds(seconds);
+        ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: adaptive hold = "
+            + AdaptiveMode.holdSeconds() + " s"), false);
+        return 1;
+    }
+
+    private static int setAdaptiveWindow(CommandContext<CommandSourceStack> ctx, int seconds) {
+        AdaptiveMode.setWindowSeconds(seconds);
+        ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: adaptive window = "
+            + AdaptiveMode.windowSeconds() + " s"), false);
         return 1;
     }
 
