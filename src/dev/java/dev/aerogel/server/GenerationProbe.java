@@ -106,13 +106,17 @@ final class GenerationProbe {
             readTicks = 0;
             ProxyChunkGate.debugForget(diskLevel, pos.toLong()); // as if this session never touched it
             diskLevel.getBlockState(marker(pos)); // first read: may be the placeholder, kicks the async disk read
+            diskLevel.setChunkForced(pos.x, pos.z, true); // a ticket arriving while the disk read is in flight
             return;
         }
+        // the forced ticket must load the chunk once it classifies real (no read here: that would load it itself)
+        boolean ticketLoaded = diskLevel.getChunkSource().getChunkNow(pos.x, pos.z) != null;
+        if (!ticketLoaded && ++readTicks < 40) {
+            return;
+        }
+        diskLevel.setChunkForced(pos.x, pos.z, false);
         // (a) an on-disk, unloaded chunk reads back real within a few ticks (Maric: placeholder briefly is fine)
         boolean readBack = diskLevel.getBlockState(marker(pos)).is(Blocks.DIAMOND_BLOCK);
-        if (!readBack && ++readTicks < 40) {
-            return;
-        }
         disk = null;
         boolean unloaded = diskTicks < 200;
         // (b) a peek (requireChunk=false) at a never-generated engaged position is null, not a placeholder
@@ -123,12 +127,13 @@ final class GenerationProbe {
         boolean structures = diskLevel.getChunkSource().getChunk(fresh.x, fresh.z, ChunkStatus.STRUCTURE_STARTS,
             true) instanceof EmptyLevelChunk;
         double ms = (System.nanoTime() - t0) / 1e6;
-        LOGGER.info(unloaded && readBack && peekNull && structures
-            ? "VERDICT: PASS — on-disk read (unloaded chunk " + pos + " read back real " + readTicks
-                + " tick(s) after the first read; requireChunk=false peek null; STRUCTURE_STARTS placeholder in "
+        LOGGER.info(unloaded && ticketLoaded && readBack && peekNull && structures
+            ? "VERDICT: PASS — on-disk read (unloaded chunk " + pos + ": forced ticket during the async disk read"
+                + " loaded it after " + readTicks
+                + " tick(s), read back real; requireChunk=false peek null; STRUCTURE_STARTS placeholder in "
                 + String.format("%.3f", ms) + " ms)"
-            : "VERDICT: FAIL — on-disk read unloaded=" + unloaded + " readBack=" + readBack + " peekNull="
-                + peekNull + " structures=" + structures);
+            : "VERDICT: FAIL — on-disk read unloaded=" + unloaded + " ticketLoaded=" + ticketLoaded + " readBack="
+                + readBack + " peekNull=" + peekNull + " structures=" + structures);
     }
 
     /**

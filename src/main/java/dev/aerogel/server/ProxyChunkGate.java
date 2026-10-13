@@ -371,6 +371,11 @@ public final class ProxyChunkGate {
             if (tag != null && tag.isPresent()
                 && ChunkSerializer.getChunkTypeFromTag(tag.get()) == ChunkType.LEVELCHUNK) {
                 state.real.add(pos);
+                // a ticket that arrived meanwhile was gated (probing): rebuild its futures, as finishProbe does
+                ChunkHolder holder = state.chunkMap.getVisibleChunkIfPresent(pos);
+                if (holder != null) {
+                    forcePrepare(holder, state.chunkMap);
+                }
             } else {
                 state.proxy.add(pos);
                 state.anyProxy = true;
