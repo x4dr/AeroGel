@@ -15,7 +15,6 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ChunkLevel;
-import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.FullChunkStatus;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -744,14 +743,13 @@ public final class PromotionManager {
      * chunk whose holder is not loaded is skipped (left queued) so we do not stall on it.
      */
     private static Promotion pickNext(State state, List<ServerPlayer> players) {
-        ChunkMap chunkMap = state.level.getChunkSource().chunkMap;
         Promotion best = null;
         int bestDist = Integer.MAX_VALUE;
         for (Promotion promotion : state.order) {
             if (promotion.removed) {
                 continue;
             }
-            if (chunkMap.getVisibleChunkIfPresent(promotion.pos) == null) {
+            if (!ProxyChunkGate.hasHolder(state.level, promotion.pos)) {
                 continue; // holder not loaded yet; leave it queued
             }
             int distance = nearestDistance(promotion.pos, players);

@@ -19,6 +19,7 @@ import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ChunkLevel;
 import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ChunkResult;
+import net.minecraft.server.level.FullChunkStatus;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
@@ -328,6 +329,46 @@ public final class ProxyChunkGate {
         return true;
     }
 
+    /** true when the holder already has this position in memory at {@code status} (no generation needed). */
+    public static boolean isAvailable(ServerLevel lvl, long pos, ChunkStatus status) {
+        State state = state(lvl);
+        ChunkHolder holder = state == null ? null : state.chunkMap.getVisibleChunkIfPresent(pos);
+        return holder != null && holder.getChunkIfPresent(status) != null;
+    }
+
+    /**
+     * True when a not-loaded proxy position exists on disk at FULL; it is then {@code real}, because loading is
+     * not generation. Decided once per position: the EMPTY load is one IOWorker read (pending writes
+     * included) that never generates, and the result is cached in {@code real}/{@code proxy} exactly as the
+     * ticket probe would. A position already classified {@code proxy} is not re-read.
+     */
+    public static boolean isRealOnDisk(ServerLevel lvl, int x, int z) {
+        State state = state(lvl);
+        long pos = ChunkPos.asLong(x, z);
+        if (state == null || state.proxy.contains(pos)) {
+            return false;
+        }
+        ChunkStatus persisted = lvl.getChunkSource().getChunk(x, z, ChunkStatus.EMPTY, true).getPersistedStatus();
+        if (persisted.isOrAfter(ChunkStatus.FULL)) {
+            state.real.add(pos);
+            return true;
+        }
+        state.proxy.add(pos);
+        state.anyProxy = true;
+        return false;
+    }
+
+    /** test hook (dev probe): forget a position's classification, as if this session never touched it. */
+    public static void debugForget(ServerLevel lvl, long pos) {
+        State state = state(lvl);
+        if (state != null) {
+            state.allowed.remove(pos);
+            state.real.remove(pos);
+            state.proxy.remove(pos);
+            state.probing.remove(pos);
+        }
+    }
+
     private static boolean loadedNow(State state, long pos) {
         return state != null
             && state.level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos)) != null;
@@ -338,10 +379,21 @@ public final class ProxyChunkGate {
         return loadedNow(state(lvl), pos);
     }
 
-    /** true when this level currently has a visible holder for the position (a promotion can start). */
+    /** true when this level has a holder for the position whose ticket reaches FULL (a promotion can start). */
     public static boolean hasHolder(ServerLevel lvl, long pos) {
         State state = state(lvl);
-        return state != null && state.chunkMap.getVisibleChunkIfPresent(pos) != null;
+        return state != null && fullHolder(state, pos) != null;
+    }
+
+    /**
+     * The visible holder, only if its ticket level reaches FULL. A lower holder (a border chunk, or the EMPTY
+     * load of a read) cannot build a FULL future: {@link #forcePrepare} would leave the unloaded sentinel,
+     * which completes at once and reads as a finished promotion.
+     */
+    private static ChunkHolder fullHolder(State state, long pos) {
+        ChunkHolder holder = state.chunkMap.getVisibleChunkIfPresent(pos);
+        return holder != null && ChunkLevel.fullStatus(holder.getTicketLevel()).isOrAfter(FullChunkStatus.FULL)
+            ? holder : null;
     }
 
     /** EMA of the main-thread cost of finishing one promotion (push + replay + resend), in ms. */
@@ -438,7 +490,7 @@ public final class ProxyChunkGate {
         state.allowed.add(p);
         state.proxy.remove(p);
         state.anyProxy = !state.proxy.isEmpty();
-        ChunkHolder holder = state.chunkMap.getVisibleChunkIfPresent(p);
+        ChunkHolder holder = fullHolder(state, p);
         if (holder == null) {
             if (manual) {
                 lvl.getChunk(pos.x, pos.z);

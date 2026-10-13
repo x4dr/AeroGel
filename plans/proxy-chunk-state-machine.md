@@ -177,7 +177,8 @@ client-side, gated on `ClientFeatures.neighbors` (client mixin config `aerogel.m
 3. **Unclassified chunks read as placeholders.** The read intercept returns a placeholder for anything not
    `real`/`allowed`, including the one-tick window before classification. Expected; if a real chunk visibly
    fails to load, check the classification actually completes (`aerogel.gate` has no log yet — add one if
-   needed).
+   needed). *Superseded 2026-10-13 (#3/#4):* a main-thread read classifies an unclassified position itself by
+   an EMPTY load, so an on-disk FULL chunk loads real; only a read that would generate gets the placeholder.
 4. **Placeholder is an `EmptyLevelChunk` reporting FULL.** Acceptable for now (plan §4); the read-only
    collision getter for landing/Sable is still the separate collider PoC.
 5. **Partial proxies now persist** (save guards deleted). If an all-air EMPTY chunk ever hits disk, that is

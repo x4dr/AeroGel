@@ -119,7 +119,10 @@ all** (server must not choke at ~80 chunks/s swept).
   `mixin/ServerChunkCachePlaceholderMixin`. A proxy never builds its own FULL task; reads are served from an
   `EmptyLevelChunk` placeholder; disk-FULL vs proxy is classified with a cheap EMPTY probe
   (`getPersistedStatus` is the source of truth). `ProxyStreamer.init` no longer swaps the generator — the real
-  generator stays. Verified headless: disk chunks load real, fresh chunks are instant placeholders.
+  generator stays. Only a read that would have to **generate** gets the placeholder: a not-loaded chunk on disk
+  at FULL is classified once by an EMPTY load (one IOWorker read, pending writes included) and loaded real,
+  `requireChunk=false` gets vanilla's `null`, and statuses below `BIOMES` (structure lookups) go to vanilla.
+  Verified headless: disk chunks load real, fresh chunks are instant placeholders.
 - **Sampling (off-thread)**: `SamplerPool` owns N `OffThreadSampler` workers (`aerogel-sampler-<i>`), each
   with its own `RandomState`, `PointSurfaceSampler` and `BiomeTint`; the main thread only submits
   (pos, tier) and drains grids. Chunks are routed by an 8x8-chunk region so neighbours share the corner

@@ -24,6 +24,7 @@ final class PromotionProbe {
     private static ChunkPos probe;
     private static BlockPos writePos;
     private static int ticks;
+    private static boolean written;
 
     private PromotionProbe() {
     }
@@ -50,15 +51,23 @@ final class PromotionProbe {
         }
         writePos = new BlockPos(probe.getMinBlockX() + 8, 100, probe.getMinBlockZ() + 8);
         LOGGER.info("promote probe: chunk {} loaded as proxy (no FULL future)", probe);
+    }
+
+    /** the write, once the forced ticket has reached the holder (as it has under a player who writes). */
+    private static void write() {
         // the write must be intercepted (cancelled + remembered) because the chunk is a proxy
         boolean deferred = level.setBlock(writePos, Blocks.STONE.defaultBlockState(), 3);
         LevelChunk after = level.getChunkSource().getChunkNow(probe.x, probe.z);
         LOGGER.info("promote probe: write into proxy -> deferred={}, still proxy={}", deferred, after == null);
+        written = true;
     }
 
     static void tick(MinecraftServer server) {
         if (level == null || probe == null) {
             return;
+        }
+        if (!written && ProxyChunkGate.hasHolder(level, probe.toLong())) {
+            write();
         }
         if (++ticks % 10 != 0) {
             return;

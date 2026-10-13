@@ -5,7 +5,9 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.EmptyLevelChunk;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -65,9 +67,55 @@ final class GenerationProbe {
 
         checkSwitchPermission();
         checkAdaptiveWindow();
+        startDiskCheck();
 
         // wait a few ticks so the classification probe and placeholder path are exercised under ticking
         ProxyStreamer.scheduleHalt(300);
+    }
+
+    /** #3/#4 check: a chunk generated + marked while disengaged, then read back after it unloaded. */
+    private static ServerLevel diskLevel;
+    private static ChunkPos disk;
+    private static int diskTicks;
+
+    private static BlockPos marker(ChunkPos pos) {
+        return new BlockPos(pos.getMinBlockX() + 3, 200, pos.getMinBlockZ() + 3);
+    }
+
+    private void startDiskCheck() {
+        disk = new ChunkPos(control.x - 300, control.z);
+        ProxyChunkGate.setAdaptiveAll(false, true); // disengaged: plain vanilla generation + write
+        this.level.setBlock(marker(disk), Blocks.DIAMOND_BLOCK.defaultBlockState(), 3);
+        ProxyChunkGate.setAdaptiveAll(false, false); // back to the probes' always-engaged gate
+        diskLevel = this.level;
+    }
+
+    private static boolean holder(ChunkPos pos) {
+        return diskLevel.getChunkSource().chunkMap.getVisibleChunkIfPresent(pos.toLong()) != null;
+    }
+
+    /** waits for the marked chunk to unload, then reads it back while the gate is engaged. */
+    static void tick(net.minecraft.server.MinecraftServer server) {
+        if (disk == null || (holder(disk) && ++diskTicks < 200)) {
+            return;
+        }
+        ChunkPos pos = disk;
+        disk = null;
+        boolean unloaded = !holder(pos);
+        ProxyChunkGate.debugForget(diskLevel, pos.toLong()); // as if this session never touched it
+        // (a) a main-thread read of an on-disk, unloaded chunk is the real chunk, not a placeholder
+        boolean readBack = diskLevel.getBlockState(marker(pos)).is(Blocks.DIAMOND_BLOCK);
+        // (b) a peek (requireChunk=false) at a never-generated engaged position is null, not a placeholder
+        ChunkPos fresh = new ChunkPos(pos.x, pos.z + 2000);
+        boolean peekNull = diskLevel.getChunkSource().getChunk(fresh.x, fresh.z, ChunkStatus.FULL, false) == null;
+        // structure lookups (STRUCTURE_STARTS) of a never-generated chunk go to vanilla, not to a placeholder
+        boolean structures = !(diskLevel.getChunkSource().getChunk(fresh.x, fresh.z, ChunkStatus.STRUCTURE_STARTS,
+            true) instanceof EmptyLevelChunk);
+        LOGGER.info(unloaded && readBack && peekNull && structures
+            ? "VERDICT: PASS — on-disk read (unloaded chunk " + pos + " read back real after " + diskTicks
+                + " ticks; requireChunk=false peek null; STRUCTURE_STARTS vanilla)"
+            : "VERDICT: FAIL — on-disk read unloaded=" + unloaded + " readBack=" + readBack + " peekNull="
+                + peekNull + " structures=" + structures);
     }
 
     /**

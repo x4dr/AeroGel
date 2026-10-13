@@ -6,6 +6,23 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-13 (night) — placeholders only for generation, never for existing chunks (#3, #4)
+
+- `ServerChunkCachePlaceholderMixin` serves a placeholder only when the main-thread read would have to generate:
+  a not-loaded, unclassified chunk is classified once by an EMPTY load (`ProxyChunkGate.isRealOnDisk`; one IOWorker
+  read incl. pending writes, never generation) and a FULL one on disk loads real. Before, every engaged position not
+  yet probed read as void air (teleport targets, far mod reads).
+- `requireChunk=false` returns `null` instead of a placeholder; a chunk already in memory at the requested status is
+  returned; statuses below `BIOMES` (`/locate`, explorer maps: structure starts/references) go to vanilla, since they
+  never build terrain. The dormant fast bail stays first.
+- `promote`/`hasHolder`/`pickNext` require a holder whose ticket reaches FULL: a lower holder (now also left by the
+  EMPTY load) made `forcePrepare` keep the completed unloaded sentinel, which read as an instant finished promotion.
+- Probes: `aerogel.probe` adds an on-disk read-back, a `requireChunk=false` peek and a `STRUCTURE_STARTS` check;
+  `aerogel.promote` writes once its forced ticket reached the holder (its candidate scan now skips on-disk chunks,
+  which it used to take for proxies).
+
+---
+
 ## 2026-10-13 (night) — adaptive enforcement stops flapping; backlog from every level (#2, #8)
 
 - `AdaptiveMode` decides on the max backlog and max tick time over the last `adaptive.windowSeconds` (5) instead

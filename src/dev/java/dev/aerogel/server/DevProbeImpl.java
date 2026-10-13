@@ -41,6 +41,7 @@ public final class DevProbeImpl implements DevProbe {
     public void onServerTick(MinecraftServer server) {
         FlightProbe.tick(server); // move the pilot first, so the streamer sees the new position
         PromotionProbe.tick(server);
+        GenerationProbe.tick(server);
         PromotionStressProbe.tick(server);
     }
 }

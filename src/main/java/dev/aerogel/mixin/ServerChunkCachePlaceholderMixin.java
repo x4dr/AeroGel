@@ -16,7 +16,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * {@code Level.getChunkForCollisions}, {@code Entity.setPosRaw}'s ensure-loaded, dependency lookups — funnels
  * through {@code ServerChunkCache.getChunk}, which would otherwise {@code managedBlock} on a generation
  * future that a proxy never builds. For a proxy position we hand back a cached read-only placeholder; a
- * promoted/known-real position falls through to vanilla (which loads/generates it forward). We deliberately
+ * promoted/known-real position falls through to vanilla (which loads/generates it forward). Only a request
+ * that would have to GENERATE terrain is deferred: a chunk on disk at FULL is loaded, a chunk already in
+ * memory at the requested status is returned, {@code requireChunk=false} gets {@code null} (never a
+ * placeholder), and statuses below {@code BIOMES} (structure starts/references) go to vanilla. We deliberately
  * do NOT route proxies through {@code getChunkFutureMainThread}: that would add a {@code TicketType.UNKNOWN}
  * ticket and create a task.
  *
@@ -39,9 +42,22 @@ public class ServerChunkCachePlaceholderMixin {
         if (!ProxyChunkGate.mayHaveProxy(level)) {
             return; // dormant level: no proxy and not engaged -> vanilla
         }
+        if (!status.isOrAfter(ChunkStatus.BIOMES)) {
+            return; // structure lookups (/locate, maps) and the EMPTY load never build terrain: vanilla
+        }
         long pos = ChunkPos.asLong(x, z);
         if (!ProxyChunkGate.isProxy(level, pos)) {
             return; // real / promoted / disengaged: vanilla loads or generates it
+        }
+        if (ProxyChunkGate.isAvailable(level, pos, status)) {
+            return; // already in memory at that status: a lookup, not generation
+        }
+        if (!requireChunk) {
+            cir.setReturnValue(null); // a peek: vanilla's answer for a not-loaded chunk, never a placeholder
+            return;
+        }
+        if (ProxyChunkGate.isRealOnDisk(level, x, z)) {
+            return; // exists on disk at FULL: loading is not generation
         }
         cir.setReturnValue(ProxyChunkGate.placeholder(level, x, z));
     }
