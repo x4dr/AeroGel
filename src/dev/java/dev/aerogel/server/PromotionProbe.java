@@ -44,16 +44,15 @@ final class PromotionProbe {
     static void start(MinecraftServer server) {
         level = server.overworld();
         ChunkPos spawn = new ChunkPos(level.getSharedSpawnPos());
-        // a previous run persists the promoted chunk, so scan along +x for a chunk that is still a fresh
-        // proxy, keeping the probe repeatable without wiping the world
+        // a previous run persists the promoted chunk, so scan along +x for a chunk that is not on disk yet,
+        // keeping the probe repeatable without wiping the world (asked from disk directly: the first read of an
+        // on-disk chunk may be the placeholder while the async disk check runs)
         for (int i = 0; i < 64 && probe == null; i++) {
             ChunkPos candidate = new ChunkPos(spawn.x + OFFSET + i * 32, spawn.z + OFFSET);
-            level.setChunkForced(candidate.x, candidate.z, true);
-            level.getChunk(candidate.x, candidate.z);
-            if (level.getChunkSource().getChunkNow(candidate.x, candidate.z) == null) {
+            if (level.getChunkSource().chunkMap.read(candidate).join().isEmpty()) {
+                level.setChunkForced(candidate.x, candidate.z, true);
+                level.getChunk(candidate.x, candidate.z);
                 probe = candidate;
-            } else {
-                level.setChunkForced(candidate.x, candidate.z, false);
             }
         }
         if (probe == null) {

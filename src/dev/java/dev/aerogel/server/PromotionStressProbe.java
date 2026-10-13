@@ -61,8 +61,8 @@ final class PromotionStressProbe {
             for (int dz = -RADIUS; dz <= RADIUS; dz++) {
                 level.setChunkForced(c.x + dx, c.z + dz, force);
                 if (force) {
-                    level.getChunk(c.x + dx, c.z + dz); // instant placeholder, or loads an on-disk chunk
-                    fresh &= level.getChunkSource().getChunkNow(c.x + dx, c.z + dz) == null;
+                    level.getChunk(c.x + dx, c.z + dz); // instant placeholder (on-disk: async check runs first)
+                    fresh &= level.getChunkSource().chunkMap.read(new ChunkPos(c.x + dx, c.z + dz)).join().isEmpty();
                 }
             }
         }
