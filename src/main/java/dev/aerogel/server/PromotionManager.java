@@ -584,6 +584,27 @@ public final class PromotionManager {
     }
 
     /**
+     * A Sable physics body (ship, coaster, any sub-level or physics object) asks for the terrain section
+     * {@code sectionY} of this chunk (#9). Sable would bake the placeholder's air into its collision world and
+     * keep it, so the body sinks into proxy terrain. Returns true while the chunk is a stub target: the caller
+     * must not register the section yet (Sable asks again next tick and gets the real terrain once it exists).
+     * A section within {@code landingMargin} of the sampled proxy surface, or of an unsampled chunk, is
+     * promoted at once (Maric 2026-10-14: "ships colliding should force generate the collided chunk"); a ship
+     * flying higher over proxy terrain generates nothing. Only Sable's first request for a section lands here.
+     */
+    public static boolean onBodySection(ServerLevel level, long chunkPos, int sectionY) {
+        State state = state(level);
+        if (state == null || !ProxyChunkGate.mayHaveProxy(level) || !isStubTarget(state, chunkPos)) {
+            return false;
+        }
+        // ponytail: the coarse grid max ignores trees/overhangs above it; sample per section if a hull clips them
+        if ((sectionY << 4) <= ProxyStreamer.surfaceMax(level, chunkPos) + landingMargin) {
+            promoteImmediate(state, chunkPos); // no-op while generating or with the promote switch off
+        }
+        return true;
+    }
+
+    /**
      * Runtime block-write guard. Called from {@code Level.setBlock} for every server-side write; returns
      * true when the write must be cancelled because it targets a proxy, a chunk still generating, or a real
      * chunk whose earlier writes are not all replayed yet (so the order is kept). The write is remembered and

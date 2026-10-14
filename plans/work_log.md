@@ -6,6 +6,28 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-14 (night) — Sable bodies promote the proxy terrain they reach (#9, physics part)
+
+- **#9 item 2 (Maric's decision: "ships colliding should force generate the collided chunk").** Sable (ships,
+  Create: Coasters Simulated coasters, any sub-level or physics object) reads each terrain section around a body
+  once in `PhysicsChunkTicketManager.addTicket` via `level.getChunk(x, z)` and bakes it into Rapier; for a proxy that
+  was the air placeholder, kept while the body stayed, so bodies sank. `sable/PhysicsChunkTicketManagerMixin` hooks
+  that read: for a stub chunk (`PromotionManager.onBodySection`) the section is left unregistered (Sable asks again
+  next tick, real terrain once generated) and, when the section is within `landingMargin` of the sampled proxy
+  surface (or the chunk has no grid), the chunk is promoted immediately (same path as landing/block-write). A body
+  flying higher generates nothing. Only Sable's first request per section reaches the hook, behind `mayHaveProxy`.
+- Optional dependency: the mixin lives in its own config `aerogel.sable.mixins.json`, declared in
+  `neoforge.mods.toml` with `requiredMods = ["sable"]` (FML 4.0.44 skips it when Sable is absent; checked by
+  pointing it at a missing mod id: the server ran, the hook was off).
+- Probe `aerogel.sablebody`: two `/sable spawn block` bodies, no player. A above an unsampled proxy: promotion starts
+  within 15 ticks and the body comes to rest on the generated floor (3/3 PASS); B 80 blocks above a sampled proxy:
+  stays a proxy. FAILs with the mixin config off. One early run dropped A from y=250 and it fell through real
+  terrain at ~40 m/s (likely tunnelling; not investigated), so A now drops 60 blocks.
+- Not proven: a real Aeronautics ship or coaster landing in game; the edge-voxel faces Rapier bakes against a
+  proxy neighbour (read through the placeholder, per the decompiled code) are not refreshed when it promotes.
+
+---
+
 ## 2026-10-14 (evening) — player placement into a proxy refused; pending writes finished on stop (#6)
 
 - **#6 (Maric's decision: refuse player placement into a proxy + finish pending writes on stop).** A player's

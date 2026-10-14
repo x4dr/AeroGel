@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.aerogel.sable",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "PhysicsChunkTicketManagerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

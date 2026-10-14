@@ -181,7 +181,9 @@ all** (server must not choke at ~80 chunks/s swept).
   threshold interpolates with distance `t(d) = min + (d/maxRange)*(max - min)` (Chebyshev distance to the nearest
   opt-in player), with both endpoints load-adaptive (idle 10..30 s, busy 20..60 s) and `maxRange` auto =
   view-distance + 2 (12 ch here). A player's own chunk while flying uses `min`. Touching the surface (landing),
-  a block write, and the leftovers around an opted-out player are **not queued at all**: the chunk goes
+  a block write, a Sable physics body's section request near the proxy surface (#9; the section stays out of
+  Rapier until real, `sable/PhysicsChunkTicketManagerMixin`, applied only with Sable present), and the leftovers
+  around an opted-out player are **not queued at all**: the chunk goes
   straight to vanilla generation on the trigger, with no budget, hard gate or `maxInFlight`, deduped only so
   the same chunk is not started twice (a mass write = one promotion per chunk, not one per write). **Linger
   promotion is the only paced path**: a token bucket refilled at `maxGenFraction` ms/ms (default 0.5 = at most
@@ -297,7 +299,8 @@ exists — the code either is in the build or is not:
 `touch run/server/aerogel.probe` (gate smoke test), `touch run/server/aerogel.promote` (promotion +
 deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (25-chunk promotion burst),
 `touch run/server/aerogel.flight` (fast-flight benchmark matrix), `touch run/server/aerogel.writesafety` (#6;
-start twice: player placement refused, then a pending write must survive the stop).
+start twice: player placement refused, then a pending write must survive the stop), `touch
+run/server/aerogel.sablebody` (#9: Sable bodies over proxies promote near the surface, not when flying high).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 

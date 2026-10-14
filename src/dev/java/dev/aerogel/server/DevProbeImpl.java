@@ -11,7 +11,8 @@ import net.minecraft.server.MinecraftServer;
  * <p>Flags (all optional, all created next to {@code server.properties} in the game directory):
  * {@code aerogel.probe} (gate smoke test), {@code aerogel.promote} (promotion + deferred-write + push-up),
  * {@code aerogel.promotestress} (25-chunk promotion burst), {@code aerogel.writesafety} (#6: player placement
- * refused + pending write survives a stop; two starts), {@code aerogel.flight} (fast-flight benchmark matrix).
+ * refused + pending write survives a stop; two starts), {@code aerogel.sablebody} (#9: Sable bodies over proxies),
+ * {@code aerogel.flight} (fast-flight benchmark matrix).
  * Each one deletes its own flag before a normal run.</p>
  */
 public final class DevProbeImpl implements DevProbe {
@@ -21,7 +22,8 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.probe"))
             || Files.exists(dir.resolve("aerogel.promote"))
             || Files.exists(dir.resolve("aerogel.promotestress"))
-            || Files.exists(dir.resolve("aerogel.writesafety"))) {
+            || Files.exists(dir.resolve("aerogel.writesafety"))
+            || Files.exists(dir.resolve("aerogel.sablebody"))) {
             AdaptiveMode.debugAlwaysOn(); // headless probes have no players to opt in
         }
         if (Files.exists(dir.resolve("aerogel.writesafety"))) {
@@ -36,6 +38,9 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.promotestress"))) {
             server.execute(() -> PromotionStressProbe.start(server));
         }
+        if (Files.exists(dir.resolve("aerogel.sablebody"))) {
+            server.execute(() -> SableBodyProbe.start(server));
+        }
         // the flight harness keeps the REAL adaptive path (no debugAlwaysOn) and waits for a player
         if (Files.exists(dir.resolve("aerogel.flight"))) {
             FlightProbe.start(server);
@@ -49,5 +54,6 @@ public final class DevProbeImpl implements DevProbe {
         GenerationProbe.tick(server);
         PromotionStressProbe.tick(server);
         WriteSafetyProbe.tick(server);
+        SableBodyProbe.tick(server);
     }
 }

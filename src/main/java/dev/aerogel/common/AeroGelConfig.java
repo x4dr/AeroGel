@@ -73,8 +73,8 @@ public final class AeroGelConfig {
             .push("promotion");
         promotionEnabled = b.comment("Master switch for automatic promotion.")
             .define("enabled", true);
-        landingMargin = b.comment("Touched/landing trigger: generate immediately when a descending player is within")
-            .comment("this many blocks above the sampled proxy surface.")
+        landingMargin = b.comment("Touched/landing trigger: generate immediately when a descending player (or a Sable")
+            .comment("physics body's collision section) is within this many blocks above the sampled proxy surface.")
             .defineInRange("landingMargin", 8.0, 0.0, 64.0);
         maxRange = b.comment("How far out (chunks) a proxy can be linger-promoted. -1 = auto: server view-distance + 2,")
             .comment("the radius at which vanilla actually generates FULL chunks.")

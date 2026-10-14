@@ -5,6 +5,11 @@ license = "${license}"
 [[mixins]]
 config = "aerogel.mixins.json"
 
+# Sable physics bodies promote the proxy terrain they reach (#9); skipped by FML when Sable is absent.
+[[mixins]]
+config = "aerogel.sable.mixins.json"
+requiredMods = ["sable"]
+
 [[mods]]
 modId = "${mod_id}"
 version = "${version}"

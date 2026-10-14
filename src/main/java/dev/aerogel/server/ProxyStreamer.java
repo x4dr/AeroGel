@@ -386,6 +386,20 @@ public final class ProxyStreamer {
         return lvl.registryAccess().registryOrThrow(Registries.BIOME).getHolder(grid.biome()).orElse(null);
     }
 
+    /** highest sampled proxy height in the chunk; {@code Integer.MAX_VALUE} (anywhere) when none is stored. */
+    public static int surfaceMax(ServerLevel lvl, long pos) {
+        State state = state(lvl);
+        Grid grid = state == null ? null : state.grids.get(pos);
+        if (grid == null) {
+            return Integer.MAX_VALUE;
+        }
+        int max = Integer.MIN_VALUE;
+        for (short h : grid.heights()) {
+            max = Math.max(max, h);
+        }
+        return max;
+    }
+
     /** dump the stored mesh points for one chunk (local x,z and height). */
     public static String dumpGrid(ServerLevel lvl, long pos) {
         int cx = ChunkPos.getX(pos);
@@ -408,7 +422,7 @@ public final class ProxyStreamer {
     /**
      * Headless probe hook: sample one chunk at a tier on the pool and block until the worker returns (the
      * caller is the server thread, so the normal tick drain cannot run and steal the result). Exercises the
-     * pool routing, the worker and the biome probe without a client.
+     * pool routing, the worker and the biome probe without a client. The grid is stored like a drained one.
      */
     public static String probeSampleBlocking(ServerLevel lvl, ChunkPos pos, byte tier) {
         State state = state(lvl);
@@ -420,6 +434,7 @@ public final class ProxyStreamer {
         while (System.nanoTime() < deadline) {
             OffThreadSampler.Result r = state.worker.poll();
             if (r != null && r.chunkPos() == pos.toLong() && r.topology() == tier) {
+                state.grids.put(r.chunkPos(), new Grid(r.topology(), r.grid(), r.biome(), r.block()));
                 return "tier=" + ProxyTopology.name(r.topology()) + " heights=" + r.grid().length
                     + " first=" + r.grid()[0] + " biome=" + r.biome()
                     + " block=" + r.block() + " in " + String.format("%.3f", r.nanos() / 1e6) + " ms";
