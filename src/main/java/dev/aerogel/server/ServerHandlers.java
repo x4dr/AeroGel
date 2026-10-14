@@ -21,9 +21,11 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.level.ChunkPos;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.PlayerTickEvent;
@@ -459,7 +461,18 @@ public final class ServerHandlers {
 
     @SubscribeEvent
     public static void onServerStopping(ServerStoppingEvent event) {
+        PromotionManager.finishPendingWrites(event.getServer()); // before the save; the streamer shutdown clears state
         ProxyStreamer.shutdown();
+    }
+
+    /** #6: a player's use/place into a proxy is refused (item kept) and the chunk promoted, not deferred. */
+    @SubscribeEvent
+    public static void onRightClickBlock(PlayerInteractEvent.RightClickBlock event) {
+        if (event.getLevel() instanceof ServerLevel level
+            && PromotionManager.refusePlayerUse(level, event.getPos(), event.getHitVec().getDirection())) {
+            event.setCanceled(true);
+            event.setCancellationResult(InteractionResult.FAIL);
+        }
     }
 
     @SubscribeEvent

@@ -6,6 +6,23 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-14 (evening) — player placement into a proxy refused; pending writes finished on stop (#6)
+
+- **#6 (Maric's decision: refuse player placement into a proxy + finish pending writes on stop).** A player's
+  right-click (`PlayerInteractEvent.RightClickBlock`) whose clicked block or face-adjacent block lies in a proxy, a
+  chunk still promoting, or one with writes awaiting replay is cancelled (`FAIL`, item kept) and that chunk is
+  promoted at once, so the next click works. Reason: the deferred `setBlock` returned true, the caller then filled a
+  block entity that did not exist, and the replay restored an empty chest. Non-player writes keep the deferral.
+- `ServerStoppingEvent` first runs `PromotionManager.finishPendingWrites`: adds a FULL ticket where a pending chunk
+  has no holder, drives the chunk tasks itself (the tick loop has ended, so `haveTime()` is false), replays every
+  write, bounded at 10 s; leftovers are logged as lost. Without it the chunk was not even on disk after the stop.
+- Not done (not cheap): block-entity NBT on deferred non-player writes — the caller fills it after `setBlock`
+  returns, so capturing it needs a hook after every caller. A crash (no stopping event) still loses pending writes.
+- Probe: `aerogel.writesafety` (two starts): fake-player placement refused + promoted + works after; a pending write
+  survives stop/restart. Both FAIL with the main-source change stashed.
+
+---
+
 ## 2026-10-13 (night) — server-only mode: optional channels, vanilla clients can join (#7)
 
 - **#7 (Maric's decision: server-only support where it costs nothing).** The four payloads are registered on an

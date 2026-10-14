@@ -10,8 +10,9 @@ import net.minecraft.server.MinecraftServer;
  *
  * <p>Flags (all optional, all created next to {@code server.properties} in the game directory):
  * {@code aerogel.probe} (gate smoke test), {@code aerogel.promote} (promotion + deferred-write + push-up),
- * {@code aerogel.promotestress} (25-chunk promotion burst), {@code aerogel.flight} (fast-flight benchmark
- * matrix). Each one deletes its own flag before a normal run.</p>
+ * {@code aerogel.promotestress} (25-chunk promotion burst), {@code aerogel.writesafety} (#6: player placement
+ * refused + pending write survives a stop; two starts), {@code aerogel.flight} (fast-flight benchmark matrix).
+ * Each one deletes its own flag before a normal run.</p>
  */
 public final class DevProbeImpl implements DevProbe {
     @Override
@@ -19,8 +20,12 @@ public final class DevProbeImpl implements DevProbe {
         Path dir = server.getServerDirectory();
         if (Files.exists(dir.resolve("aerogel.probe"))
             || Files.exists(dir.resolve("aerogel.promote"))
-            || Files.exists(dir.resolve("aerogel.promotestress"))) {
+            || Files.exists(dir.resolve("aerogel.promotestress"))
+            || Files.exists(dir.resolve("aerogel.writesafety"))) {
             AdaptiveMode.debugAlwaysOn(); // headless probes have no players to opt in
+        }
+        if (Files.exists(dir.resolve("aerogel.writesafety"))) {
+            server.execute(() -> WriteSafetyProbe.start(server));
         }
         if (Files.exists(dir.resolve("aerogel.probe"))) {
             server.execute(() -> new GenerationProbe(server.overworld()).run());
@@ -43,5 +48,6 @@ public final class DevProbeImpl implements DevProbe {
         PromotionProbe.tick(server);
         GenerationProbe.tick(server);
         PromotionStressProbe.tick(server);
+        WriteSafetyProbe.tick(server);
     }
 }

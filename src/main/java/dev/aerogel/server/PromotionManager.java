@@ -13,12 +13,14 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ChunkLevel;
 import net.minecraft.server.level.FullChunkStatus;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.TicketType;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
@@ -91,6 +93,9 @@ public final class PromotionManager {
     private static final int FORCE_START_TICKS = 200;
     private static final int MIN_QUEUE_CAP = 256;
     private static final int MAX_QUEUE_CAP = 4096;
+    /** how long a server stop may spend finishing chunks with deferred writes (#6). */
+    // ponytail: fixed 10 s; a config knob if a big world ever stops with hundreds of pending chunks
+    private static final long STOP_FINISH_NANOS = 10_000_000_000L;
 
     private static final Map<ResourceKey<Level>, State> STATES = new HashMap<>();
 
@@ -607,6 +612,65 @@ public final class PromotionManager {
             LOGGER.warn("proxy chunk {} has more than {} deferred writes; dropping the newest", new ChunkPos(chunkPos), MAX_WRITE_LOG);
         }
         return true;
+    }
+
+    /**
+     * A player's right-click into a proxy, a chunk still promoting, or one with writes awaiting replay is
+     * refused rather than deferred (#6): the deferral loses what the caller fills in after {@code setBlock}
+     * (block-entity contents, sign text) and the item is already consumed. The click and the placement target
+     * (clicked block, or the block on the clicked face) are checked; each stub target is promoted at once, so
+     * the next click works. Returns true when the use must be cancelled.
+     */
+    public static boolean refusePlayerUse(ServerLevel level, BlockPos clicked, Direction face) {
+        State state = state(level);
+        if (!enabled || state == null || !ProxyChunkGate.mayHaveProxy(level)) {
+            return false;
+        }
+        return refuseInto(state, ChunkPos.asLong(clicked)) | refuseInto(state, ChunkPos.asLong(clicked.relative(face)));
+    }
+
+    private static boolean refuseInto(State state, long chunkPos) {
+        if (!isStubTarget(state, chunkPos)) {
+            return false;
+        }
+        promoteImmediate(state, chunkPos);
+        return true;
+    }
+
+    /**
+     * Server stop (#6): finish every chunk that still holds deferred writes — generate it, replay its writes —
+     * so the save that follows persists them. The tick loop has ended, so this drives the chunk tasks itself;
+     * a FULL ticket is added for a chunk with no loaded holder (vanilla removes it on closing). Bounded by
+     * {@link #STOP_FINISH_NANOS}; whatever is left is logged and lost.
+     */
+    public static void finishPendingWrites(MinecraftServer server) {
+        if (STATES.values().stream().allMatch(s -> s.deferredWrites.isEmpty())) {
+            return;
+        }
+        long start = System.nanoTime();
+        server.managedBlock(() -> {
+            boolean pending = false;
+            for (State state : STATES.values()) {
+                for (long pos : state.deferredWrites.keySet()) {
+                    if (!ProxyChunkGate.hasHolder(state.level, pos)) {
+                        ChunkPos chunk = new ChunkPos(pos);
+                        state.level.getChunkSource().addRegionTicket(TicketType.UNKNOWN, chunk, 0, chunk);
+                    }
+                    promoteImmediate(state, pos); // no-op while generating or once real
+                }
+                state.level.getChunkSource().pollTask(); // haveTime() is false after the loop: drive chunk work
+                replayWrites(state, Long.MAX_VALUE);
+                pending |= !state.deferredWrites.isEmpty();
+            }
+            return !pending || System.nanoTime() - start >= STOP_FINISH_NANOS;
+        });
+        for (State state : STATES.values()) {
+            for (var entry : state.deferredWrites.long2ObjectEntrySet()) {
+                LOGGER.error("server stop: proxy chunk {} not finished within {} ms; {} deferred write(s) lost",
+                    new ChunkPos(entry.getLongKey()), STOP_FINISH_NANOS / 1_000_000, entry.getValue().writes.size());
+            }
+        }
+        LOGGER.info("server stop: finished pending deferred writes in {} ms", (System.nanoTime() - start) / 1_000_000);
     }
 
     /**
