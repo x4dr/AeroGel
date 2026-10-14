@@ -59,6 +59,9 @@ public final class AdaptiveMode {
     private static int holdSeconds = 10;
     private static int windowSeconds = 5;
     private static boolean engageOnTeleport;
+    /** set only for the duration of one {@link #pushZones} call from {@link #onTeleport}: zone centre override. */
+    private static UUID teleportPlayer;
+    private static long teleportTarget;
     private static final Window WINDOW = new Window();
 
     private static final Map<UUID, Boolean> travel = new HashMap<>();
@@ -123,13 +126,26 @@ public final class AdaptiveMode {
     }
 
     /**
-     * #14: a player teleports to x/z in their current level (fired before the move). With {@code engageOnTeleport}
+     * #14: a player teleports to x/z in their current level (fired before the move). An opted-in player (client
+     * {@code travel}) gets their zone moved to the target first, so exploration mode covers the arrival. With
+     * {@code engageOnTeleport}
      * and a destination that may not be generated, enforce now, before the arrival area is requested, counted as
      * an activating sample: {@code holdSeconds} applies and {@link #tick} switches it off by itself.
      */
     public static void onTeleport(ServerPlayer player, double x, double z) {
-        if (!engageOnTeleport || !enabled || !hasAeroGel(player) || !(player.level() instanceof ServerLevel level)
-            || !ProxyChunkGate.mayBeUngenerated(level, ChunkPos.asLong(Mth.floor(x) >> 4, Mth.floor(z) >> 4))) {
+        if (!enabled || !hasAeroGel(player) || !(player.level() instanceof ServerLevel level)) {
+            return;
+        }
+        long target = ChunkPos.asLong(Mth.floor(x) >> 4, Mth.floor(z) >> 4);
+        if (!enforcing && optsIn(player)) {
+            // an opted-in player's zone follows player.chunkPosition(), refreshed per tick: at the teleport it is
+            // still around the old position, so move it to the target before the arrival is requested
+            teleportTarget = target;
+            teleportPlayer = player.getUUID();
+            pushZones(level.getServer());
+            teleportPlayer = null;
+        }
+        if (!engageOnTeleport || !ProxyChunkGate.mayBeUngenerated(level, target)) {
             return;
         }
         WINDOW.activate(Util.getMillis());
@@ -214,7 +230,7 @@ public final class AdaptiveMode {
                 continue;
             }
             ResourceKey<Level> key = player.level().dimension();
-            long center = player.chunkPosition().toLong();
+            long center = player.getUUID().equals(teleportPlayer) ? teleportTarget : player.chunkPosition().toLong();
             if (optsIn(player)) {
                 in.computeIfAbsent(key, k -> new ArrayList<>()).add(center);
             } else {

@@ -21,6 +21,11 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 - Probe `aerogel.teleport` (real adaptive path, FakePlayer, same event `/tp` posts): key false → not enforcing; key
   true → enforcing before the arrival ticket, arrival read is the placeholder, still a proxy 20 ticks later,
   enforcing off by itself after ~hold. FAILs with `onTeleport` disabled.
+- **Exploration mode across a teleport (found by the STK L4, key false):** an opted-in player (client `travel`) still
+  stalled ~8.3 s on `/tp` into fresh land: their zone is centred on `player.chunkPosition()`, refreshed per tick, so
+  at the teleport it still sat at the old position and vanilla generated the arrival. `onTeleport` now pushes that
+  player's zone at the target chunk before the move (independent of the key; per player, nothing global). Probe
+  `aerogel.teleport` gains the opted-in check (FAILs without it: target not gated before the move).
 
 ---
 

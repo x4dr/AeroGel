@@ -172,7 +172,7 @@ all** (server must not choke at ~80 chunks/s swept).
   deactivate values, `holdSeconds` (10) have passed since the last activating sample, **and no linger counters
   remain** (so switching to vanilla never bursts instant generation, and the state no longer flaps per tick). With
   `adaptive.engageOnTeleport` (default false, #14) a player teleporting (any `EntityTeleportEvent`: `/tp`, pearl, chorus)
-  to a chunk that is neither loaded nor known disk-FULL engages enforcing before the move, as an activating sample. While not enforcing, a player whose client `travel` switch is on is still gated around them; an
+  to a chunk that is neither loaded nor known disk-FULL engages enforcing before the move, as an activating sample. While not enforcing, a player whose client `travel` switch is on is still gated around them (on a teleport their zone moves to the target before the move, key or not); an
   opted-out player's zone is vanilla (their leftovers are forced to real terrain), and if both overlap the
   opted-out zone wins. A player whose client `proxy` switch is off receives no meshes at all. A client without
   AeroGel can join (the payloads are registered `optional()`, #7): it is recorded once at login and treated as
