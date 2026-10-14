@@ -24,6 +24,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.level.ChunkPos;
 import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.neoforge.common.util.TriState;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
@@ -465,13 +466,20 @@ public final class ServerHandlers {
         ProxyStreamer.shutdown();
     }
 
-    /** #6: a player's use/place into a proxy is refused (item kept) and the chunk promoted, not deferred. */
+    /**
+     * #6: a player's click on a proxy block is refused (item kept), placement into a proxy on the clicked face
+     * only loses the item use (the clicked block's own use still runs); the stub chunk is promoted, not deferred.
+     */
     @SubscribeEvent
     public static void onRightClickBlock(PlayerInteractEvent.RightClickBlock event) {
-        if (event.getLevel() instanceof ServerLevel level
-            && PromotionManager.refusePlayerUse(level, event.getPos(), event.getHitVec().getDirection())) {
+        if (!(event.getLevel() instanceof ServerLevel level)) {
+            return;
+        }
+        if (PromotionManager.refusePlayerUse(level, event.getPos())) {
             event.setCanceled(true);
             event.setCancellationResult(InteractionResult.FAIL);
+        } else if (PromotionManager.refusePlayerUse(level, event.getPos().relative(event.getHitVec().getDirection()))) {
+            event.setUseItem(TriState.FALSE);
         }
     }
 

@@ -91,9 +91,33 @@ final class WriteSafetyProbe {
     }
 
     private static InteractionResult use(BlockPos at) {
+        return use(at, Direction.UP);
+    }
+
+    private static InteractionResult use(BlockPos at, Direction face) {
         player.setItemInHand(InteractionHand.MAIN_HAND, stack);
         return player.gameMode.useItemOn(player, level, stack, InteractionHand.MAIN_HAND,
-            new BlockHitResult(Vec3.atCenterOf(at), Direction.UP, at, false));
+            new BlockHitResult(Vec3.atCenterOf(at), face, at, false));
+    }
+
+    /**
+     * The path a real client takes (it has no proxy chunks to click): the side of a block in a real chunk whose
+     * face points into a proxy. The placement must be refused (item kept, neighbour promoted), the click itself
+     * not cancelled. Returns null when the east neighbour is not a fresh proxy (nothing to check).
+     */
+    private static String faceCheck() {
+        ChunkPos east = new ChunkPos(place.x + 1, place.z);
+        if (!ProxyChunkGate.isProxy(level, east.toLong()) || ProxyChunkGate.isPromoting(level, east.toLong())) {
+            return null;
+        }
+        BlockPos edge = new BlockPos(place.getMaxBlockX(), Y, place.getMinBlockZ() + 8);
+        level.setBlock(edge, Blocks.STONE.defaultBlockState(), 3); // place is real now: a direct write
+        int before = stack.getCount();
+        InteractionResult result = use(edge, Direction.EAST);
+        boolean promoting = ProxyChunkGate.isPromoting(level, east.toLong()) || !ProxyChunkGate.isProxy(level, east.toLong());
+        boolean ok = !result.consumesAction() && stack.getCount() == before && promoting;
+        return String.format("%s (result %s, items %d->%d, neighbour promotion started=%s)",
+            ok ? "PASS" : "FAIL", result, before, stack.getCount(), promoting);
     }
 
     static void tick(MinecraftServer server) {
@@ -132,6 +156,8 @@ final class WriteSafetyProbe {
         boolean placed = retry.consumesAction() && level.getBlockState(at).is(Blocks.STONE) && stack.getCount() == 3;
         LOGGER.info("write safety: VERDICT place {} — into proxy: {}; after promotion: result {}, block {}, items {}/4",
             refused && placed ? "PASS" : "FAIL", refusal, retry, level.getBlockState(at).getBlock(), stack.getCount());
+        String face = faceCheck();
+        LOGGER.info("write safety: VERDICT face {}", face == null ? "SKIP — east neighbour of " + place + " is not a fresh proxy" : face);
         haltWithPendingWrite(server);
     }
 

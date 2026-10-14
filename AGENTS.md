@@ -202,7 +202,8 @@ all** (server must not choke at ~80 chunks/s swept).
   proxies (fluid does not promote). Only a proxy whose promotion has not started is capped (`MAX_WRITE_LOG=256`);
   writes into a generating chunk, or a real one with replay pending, are logged uncapped and replayed in order
   under `promotion.rate.replayBudgetMs` (1.5 ms/tick, `/aerogel promote replay`), the rest carried to the next tick.
-  A **player's** right-click into such a chunk is refused instead (item kept, chunk promoted at once; #6), and
+  A **player's** right-click into such a chunk is refused instead (click on it cancelled; placement through a real
+  block's face into it: item use denied, block use still runs; item kept, chunk promoted at once; #6), and
   server stop finishes every chunk with pending writes before the save (bounded 10 s, leftovers logged).
 - **Promotion in flight reads like a proxy**: until the promoted chunk's FULL future completes
   (`ProxyChunkGate.isPromoting`), main-thread reads get the placeholder (`requireChunk=false`: `null`), fluid

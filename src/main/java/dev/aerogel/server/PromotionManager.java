@@ -13,7 +13,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ChunkLevel;
@@ -617,16 +616,17 @@ public final class PromotionManager {
     /**
      * A player's right-click into a proxy, a chunk still promoting, or one with writes awaiting replay is
      * refused rather than deferred (#6): the deferral loses what the caller fills in after {@code setBlock}
-     * (block-entity contents, sign text) and the item is already consumed. The click and the placement target
-     * (clicked block, or the block on the clicked face) are checked; each stub target is promoted at once, so
-     * the next click works. Returns true when the use must be cancelled.
+     * (block-entity contents, sign text) and the item is already consumed. The caller checks the clicked block
+     * (refuse the whole click) and the block on the clicked face (refuse only the item use, i.e. placement, so a
+     * chest at a proxy border still opens). A stub target is promoted at once, so the next click works. Returns
+     * true when the position is a stub target.
      */
-    public static boolean refusePlayerUse(ServerLevel level, BlockPos clicked, Direction face) {
+    public static boolean refusePlayerUse(ServerLevel level, BlockPos pos) {
         State state = state(level);
         if (!enabled || state == null || !ProxyChunkGate.mayHaveProxy(level)) {
             return false;
         }
-        return refuseInto(state, ChunkPos.asLong(clicked)) | refuseInto(state, ChunkPos.asLong(clicked.relative(face)));
+        return refuseInto(state, ChunkPos.asLong(pos));
     }
 
     private static boolean refuseInto(State state, long chunkPos) {
