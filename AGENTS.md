@@ -170,7 +170,9 @@ all** (server must not choke at ~80 chunks/s swept).
   gated level) is ≥ `backlogActivate` (64) or smoothed tick time ≥ `activateTickMs` (35 ms), both taken as
   the max over the last `windowSeconds` (5); it stops only once both windowed values fall back below the
   deactivate values, `holdSeconds` (10) have passed since the last activating sample, **and no linger counters
-  remain** (so switching to vanilla never bursts instant generation, and the state no longer flaps per tick). While not enforcing, a player whose client `travel` switch is on is still gated around them; an
+  remain** (so switching to vanilla never bursts instant generation, and the state no longer flaps per tick). With
+  `adaptive.engageOnTeleport` (default false, #14) a player teleporting (any `EntityTeleportEvent`: `/tp`, pearl, chorus)
+  to a chunk that is neither loaded nor known disk-FULL engages enforcing before the move, as an activating sample. While not enforcing, a player whose client `travel` switch is on is still gated around them; an
   opted-out player's zone is vanilla (their leftovers are forced to real terrain), and if both overlap the
   opted-out zone wins. A player whose client `proxy` switch is off receives no meshes at all. A client without
   AeroGel can join (the payloads are registered `optional()`, #7): it is recorded once at login and treated as
@@ -285,7 +287,8 @@ all** (server must not choke at ~80 chunks/s swept).
     Immediate (touch / write / opt-out) promotion ignores `concurrency`, `budget` and `hardgate` by design.
   - `/aerogel adaptive status` (backlog/tick now + window max, hold left, opt-in/opt-out/linger),
     `adaptive activate <1-200 ms>`, `adaptive deactivate <1-200 ms>`, `adaptive backlog <activate>
-    <deactivate>` (default 64/16), `adaptive hold <0-600 s>` (default 10), `adaptive window <0-60 s>` (default 5).
+    <deactivate>` (default 64/16), `adaptive hold <0-600 s>` (default 10), `adaptive window <0-60 s>` (default 5),
+    `adaptive teleport <true|false>` (engage on a teleport into maybe-ungenerated land; default false).
   - `draw` is client-only: the server command relays a `ClientSettingPayload` to the player.
 - **Diagnostics**: client `proxy diag` (a `proxy diag:` log line every 5 s, now carrying the renderer signal —
   `visible drawn=N` or `visible unavailable(sodium)`), a one-shot dump relayed by **`/aerogel diag`**
@@ -300,7 +303,8 @@ exists — the code either is in the build or is not:
 deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (25-chunk promotion burst),
 `touch run/server/aerogel.flight` (fast-flight benchmark matrix), `touch run/server/aerogel.writesafety` (#6;
 start twice: player placement refused, then a pending write must survive the stop), `touch
-run/server/aerogel.sablebody` (#9: Sable bodies over proxies promote near the surface, not when flying high).
+run/server/aerogel.sablebody` (#9: Sable bodies over proxies promote near the surface, not when flying high),
+`touch run/server/aerogel.teleport` (#14: engage on teleport, real adaptive path; waits for the server to idle).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 

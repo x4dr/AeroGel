@@ -6,6 +6,24 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-14 (late night) — engage enforcing on a teleport into fresh land (#14, opt-in)
+
+- **#14 (Maric's decision: "sounds like a config option").** New `adaptive.engageOnTeleport` (default **false**,
+  `/aerogel adaptive teleport <bool>`). A NeoForge `EntityTeleportEvent` listener (LOWEST priority; every subtype:
+  `/tp`, `/spreadplayers`, ender pearl, chorus fruit; fired before the move) calls `AdaptiveMode.onTeleport`: if the
+  target chunk is neither loaded nor known disk-FULL (`ProxyChunkGate.mayBeUngenerated`, set lookups +
+  `getChunkNow`, no disk read), enforcing turns on at once and the zones are pushed before the arrival ticket. It
+  counts as an activating sample, so `holdSeconds` applies and the normal window logic ends it.
+- An unclassified chunk counts as maybe-ungenerated (the async disk probe cannot answer before the move), so a
+  teleport into far *generated* land also engages for `holdSeconds`; its chunks still load real after one probe.
+- Not covered: portals / dimension changes (`EntityTravelToDimensionEvent` carries no position); a cross-dimension
+  `/tp` is checked against the source level's chunk at the target x/z.
+- Probe `aerogel.teleport` (real adaptive path, FakePlayer, same event `/tp` posts): key false → not enforcing; key
+  true → enforcing before the arrival ticket, arrival read is the placeholder, still a proxy 20 ticks later,
+  enforcing off by itself after ~hold. FAILs with `onTeleport` disabled.
+
+---
+
 ## 2026-10-14 (night) — Sable bodies promote the proxy terrain they reach (#9, physics part)
 
 - **#9 item 2 (Maric's decision: "ships colliding should force generate the collided chunk").** Sable (ships,

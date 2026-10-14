@@ -12,6 +12,7 @@ import net.minecraft.server.MinecraftServer;
  * {@code aerogel.probe} (gate smoke test), {@code aerogel.promote} (promotion + deferred-write + push-up),
  * {@code aerogel.promotestress} (25-chunk promotion burst), {@code aerogel.writesafety} (#6: player placement
  * refused + pending write survives a stop; two starts), {@code aerogel.sablebody} (#9: Sable bodies over proxies),
+ * {@code aerogel.teleport} (#14: engage on teleport into fresh land),
  * {@code aerogel.flight} (fast-flight benchmark matrix).
  * Each one deletes its own flag before a normal run.</p>
  */
@@ -41,6 +42,10 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.sablebody"))) {
             server.execute(() -> SableBodyProbe.start(server));
         }
+        // #14 needs the real adaptive path too: it waits until the server idles, then teleports a FakePlayer
+        if (Files.exists(dir.resolve("aerogel.teleport"))) {
+            server.execute(() -> TeleportProbe.start(server));
+        }
         // the flight harness keeps the REAL adaptive path (no debugAlwaysOn) and waits for a player
         if (Files.exists(dir.resolve("aerogel.flight"))) {
             FlightProbe.start(server);
@@ -55,5 +60,6 @@ public final class DevProbeImpl implements DevProbe {
         PromotionStressProbe.tick(server);
         WriteSafetyProbe.tick(server);
         SableBodyProbe.tick(server);
+        TeleportProbe.tick(server);
     }
 }

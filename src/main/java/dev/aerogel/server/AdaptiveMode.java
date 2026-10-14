@@ -17,6 +17,8 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,6 +58,7 @@ public final class AdaptiveMode {
     private static int backlogDeactivate = 16;
     private static int holdSeconds = 10;
     private static int windowSeconds = 5;
+    private static boolean engageOnTeleport;
     private static final Window WINDOW = new Window();
 
     private static final Map<UUID, Boolean> travel = new HashMap<>();
@@ -77,6 +80,7 @@ public final class AdaptiveMode {
         backlogDeactivate = cfg.adaptiveBacklogDeactivate.get();
         holdSeconds = cfg.adaptiveHoldSeconds.get();
         windowSeconds = cfg.adaptiveWindowSeconds.get();
+        engageOnTeleport = cfg.adaptiveEngageOnTeleport.get();
         enforcing = false;
         WINDOW.clear();
         travel.clear();
@@ -84,9 +88,10 @@ public final class AdaptiveMode {
         vanilla.clear();
         optInCount = 0;
         optOutCount = 0;
-        LOGGER.info("adaptive: {} (activate {} ms / backlog {}, deactivate {} ms / backlog {}, hold {} s, window {} s)",
+        LOGGER.info("adaptive: {} (activate {} ms / backlog {}, deactivate {} ms / backlog {}, hold {} s, window {} s,"
+                + " engage on teleport {})",
             enabled ? "on" : "off", activateTickMs, backlogActivate, deactivateTickMs, backlogDeactivate,
-            holdSeconds, windowSeconds);
+            holdSeconds, windowSeconds, engageOnTeleport);
     }
 
     public static void shutdown() {
@@ -117,6 +122,25 @@ public final class AdaptiveMode {
         pushZones(server);
     }
 
+    /**
+     * #14: a player teleports to x/z in their current level (fired before the move). With {@code engageOnTeleport}
+     * and a destination that may not be generated, enforce now, before the arrival area is requested, counted as
+     * an activating sample: {@code holdSeconds} applies and {@link #tick} switches it off by itself.
+     */
+    public static void onTeleport(ServerPlayer player, double x, double z) {
+        if (!engageOnTeleport || !enabled || !hasAeroGel(player) || !(player.level() instanceof ServerLevel level)
+            || !ProxyChunkGate.mayBeUngenerated(level, ChunkPos.asLong(Mth.floor(x) >> 4, Mth.floor(z) >> 4))) {
+            return;
+        }
+        WINDOW.activate(Util.getMillis());
+        if (!enforcing) {
+            enforcing = true;
+            LOGGER.info("adaptive: enforcing on ({} teleports into land that may not be generated)",
+                player.getGameProfile().getName());
+            pushZones(level.getServer());
+        }
+    }
+
     /** #8: lag from any gated level counts, not just the overworld. */
     private static int backlog(MinecraftServer server) {
         int max = 0;
@@ -142,6 +166,10 @@ public final class AdaptiveMode {
         private long lastActivatingMs = Long.MIN_VALUE;
         int maxBacklog;
         double maxTickMs;
+
+        void activate(long nowMs) {
+            lastActivatingMs = nowMs;
+        }
 
         void clear() {
             samples.clear();
@@ -317,6 +345,16 @@ public final class AdaptiveMode {
         AeroGelConfig.SPEC.save();
     }
 
+    public static void setEngageOnTeleport(boolean on) {
+        engageOnTeleport = on;
+        AeroGelConfig.CFG.adaptiveEngageOnTeleport.set(on);
+        AeroGelConfig.SPEC.save();
+    }
+
+    public static boolean engageOnTeleport() {
+        return engageOnTeleport;
+    }
+
     public static int holdSeconds() {
         return holdSeconds;
     }
@@ -351,7 +389,8 @@ public final class AdaptiveMode {
             + ", hold " + String.format("%.1f", WINDOW.holdRemainingMs(Util.getMillis()) / 1000.0) + " s left of "
             + holdSeconds + " s"
             + ", opt-in " + optInCount + ", opt-out " + optOutCount
-            + ", linger " + (PromotionManager.hasLinger() ? "yes" : "no");
+            + ", linger " + (PromotionManager.hasLinger() ? "yes" : "no")
+            + ", engage on teleport " + (engageOnTeleport ? "on" : "off");
     }
 
     // ---- per-player client state ----

@@ -383,6 +383,16 @@ public final class ProxyChunkGate {
         }));
     }
 
+    /**
+     * #14: true unless the position is loaded or known disk-FULL this session. Set lookups and
+     * {@code getChunkNow} only: the async {@link #probeDisk} cannot answer before a teleport moves the player, so
+     * an unclassified position counts as maybe-ungenerated.
+     */
+    public static boolean mayBeUngenerated(ServerLevel lvl, long pos) {
+        State state = state(lvl);
+        return isActive(lvl) && !state.real.contains(pos) && !state.allowed.contains(pos) && !loadedNow(state, pos);
+    }
+
     /** test hook (dev probe): forget a position's classification, as if this session never touched it. */
     public static void debugForget(ServerLevel lvl, long pos) {
         State state = state(lvl);

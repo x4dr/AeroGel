@@ -47,6 +47,7 @@ public final class AeroGelConfig {
     public final ModConfigSpec.IntValue adaptiveBacklogDeactivate;
     public final ModConfigSpec.IntValue adaptiveHoldSeconds;
     public final ModConfigSpec.IntValue adaptiveWindowSeconds;
+    public final ModConfigSpec.BooleanValue adaptiveEngageOnTeleport;
 
     // stream
     public final ModConfigSpec.BooleanValue streamEnabled;
@@ -141,6 +142,10 @@ public final class AeroGelConfig {
             .defineInRange("holdSeconds", 10, 0, 600);
         adaptiveWindowSeconds = b.comment("Decide on the max backlog and tick time over this many seconds, not one sample (0 = one sample).")
             .defineInRange("windowSeconds", 5, 0, 60);
+        adaptiveEngageOnTeleport = b.comment("Enforce as soon as a player teleports (/tp, ender pearl, chorus fruit, ...) into land that may",
+                "not be generated yet, before the arrival area is requested; counts as an activating sample, so holdSeconds",
+                "applies and enforcement ends by itself (#14). Off = vanilla generates the arrival area in one go.")
+            .define("engageOnTeleport", false);
         b.pop();
 
         b.comment("Proxy mesh sampling and streaming. Streaming is per-player: a player receives proxies only while")

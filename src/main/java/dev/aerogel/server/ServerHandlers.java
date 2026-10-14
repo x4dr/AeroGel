@@ -23,9 +23,11 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.level.ChunkPos;
+import net.neoforged.bus.api.EventPriority;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.util.TriState;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.entity.EntityTeleportEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
@@ -200,6 +202,9 @@ public final class ServerHandlers {
                     .then(Commands.literal("hold")
                         .then(Commands.argument("seconds", IntegerArgumentType.integer(0, 600))
                             .executes(ctx -> setAdaptiveHold(ctx, IntegerArgumentType.getInteger(ctx, "seconds")))))
+                    .then(Commands.literal("teleport")
+                        .then(Commands.argument("on", BoolArgumentType.bool())
+                            .executes(ctx -> setAdaptiveTeleport(ctx, BoolArgumentType.getBool(ctx, "on")))))
                     .then(Commands.literal("window")
                         .then(Commands.argument("seconds", IntegerArgumentType.integer(0, 60))
                             .executes(ctx -> setAdaptiveWindow(ctx, IntegerArgumentType.getInteger(ctx, "seconds")))))
@@ -357,6 +362,13 @@ public final class ServerHandlers {
         return 1;
     }
 
+    private static int setAdaptiveTeleport(CommandContext<CommandSourceStack> ctx, boolean on) {
+        AdaptiveMode.setEngageOnTeleport(on);
+        ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: adaptive engage on teleport = "
+            + AdaptiveMode.engageOnTeleport()), false);
+        return 1;
+    }
+
     private static int setAdaptiveWindow(CommandContext<CommandSourceStack> ctx, int seconds) {
         AdaptiveMode.setWindowSeconds(seconds);
         ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: adaptive window = "
@@ -480,6 +492,14 @@ public final class ServerHandlers {
             event.setCancellationResult(InteractionResult.FAIL);
         } else if (PromotionManager.refusePlayerUse(level, event.getPos().relative(event.getHitVec().getDirection()))) {
             event.setUseItem(TriState.FALSE);
+        }
+    }
+
+    /** #14: every {@link EntityTeleportEvent} subtype fires before the move; LOWEST so a cancel or new target wins. */
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    public static void onTeleport(EntityTeleportEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            AdaptiveMode.onTeleport(player, event.getTargetX(), event.getTargetZ());
         }
     }
 
