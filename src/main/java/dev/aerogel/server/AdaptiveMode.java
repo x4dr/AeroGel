@@ -67,7 +67,12 @@ public final class AdaptiveMode {
     private static final Map<UUID, Boolean> travel = new HashMap<>();
     private static final Map<UUID, Boolean> proxy = new HashMap<>();
     /** players whose connection lacks the AeroGel channels, cached at login so no send path looks it up. */
-    private static final Set<UUID> vanilla = new HashSet<>();
+    /**
+     * Connections we have confirmed carry the AeroGel channels (#15). Membership means yes; absence means
+     * "not confirmed", which is treated as a client that cannot receive meshes -- so a player whose login
+     * event never reached us is never streamed to, instead of being assumed capable.
+     */
+    private static final Set<UUID> aeroGelClients = new HashSet<>();
     private static int optInCount;
     private static int optOutCount;
 
@@ -88,7 +93,7 @@ public final class AdaptiveMode {
         WINDOW.clear();
         travel.clear();
         proxy.clear();
-        vanilla.clear();
+        aeroGelClients.clear();
         optInCount = 0;
         optOutCount = 0;
         LOGGER.info("adaptive: {} (activate {} ms / backlog {}, deactivate {} ms / backlog {}, hold {} s, window {} s,"
@@ -102,7 +107,7 @@ public final class AdaptiveMode {
         WINDOW.clear();
         travel.clear();
         proxy.clear();
-        vanilla.clear();
+        aeroGelClients.clear();
         optInCount = 0;
         optOutCount = 0;
     }
@@ -288,9 +293,13 @@ public final class AdaptiveMode {
         return hasAeroGel(player) && proxy.getOrDefault(player.getUUID(), true);
     }
 
-    /** true when this player's client has the AeroGel channels; guard every server-to-client payload with it. */
+    /**
+     * True only when this player's login confirmed the AeroGel channels. Anything not confirmed here is
+     * treated as unable to receive meshes, so a login event that never reached us costs a missed stream
+     * rather than a stream into a client that cannot decode it (#15).
+     */
     public static boolean hasAeroGel(ServerPlayer player) {
-        return !vanilla.contains(player.getUUID());
+        return aeroGelClients.contains(player.getUUID());
     }
 
     /** login: cache whether the connection negotiated the AeroGel channels (#7). */
@@ -301,8 +310,10 @@ public final class AdaptiveMode {
     /** split from {@link #onLogin} so the dev probe can drive it without a real connection. */
     public static void setHasAeroGel(ServerPlayer player, boolean has) {
         if (has) {
-            vanilla.remove(player.getUUID());
-        } else if (vanilla.add(player.getUUID())) {
+            aeroGelClients.add(player.getUUID());
+        } else {
+            aeroGelClients.remove(player.getUUID());
+            // once per login; absence from the set is now the default, so this cannot be a change-detect
             LOGGER.info("adaptive: {} joined without AeroGel: no proxy meshes, their zone stays vanilla",
                 player.getGameProfile().getName());
         }
@@ -427,6 +438,6 @@ public final class AdaptiveMode {
     public static void removePlayer(UUID id) {
         travel.remove(id);
         proxy.remove(id);
-        vanilla.remove(id);
+        aeroGelClients.remove(id);
     }
 }
