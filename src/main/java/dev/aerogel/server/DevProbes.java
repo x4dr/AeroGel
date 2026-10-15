@@ -27,4 +27,11 @@ public final class DevProbes {
             probe.onServerTick(server);
         }
     }
+
+    /** see {@link DevProbe#onServerTickPre}: runs inside the tick-time measurement, before any game work. */
+    public static void onServerTickPre(MinecraftServer server) {
+        for (DevProbe probe : PROBES) {
+            probe.onServerTickPre(server);
+        }
+    }
 }

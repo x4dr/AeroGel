@@ -65,6 +65,7 @@ public final class ServerHandlers {
     @SubscribeEvent
     public static void onServerTickPre(ServerTickEvent.Pre event) {
         tickStartNanos = System.nanoTime();
+        DevProbes.onServerTickPre(event.getServer());
     }
 
     @SubscribeEvent

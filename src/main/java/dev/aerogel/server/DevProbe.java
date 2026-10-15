@@ -15,4 +15,12 @@ public interface DevProbe {
 
     /** called once per server tick, before the streamer and promotion ticks. */
     void onServerTick(MinecraftServer server);
+
+    /**
+     * Called at the very start of the server tick, <b>inside</b> the window the smoothed tick time is measured
+     * over — {@code MinecraftServer.tickServer} takes its start timestamp, fires {@code ServerTickEvent.Pre} and
+     * only then tallies {@code smoothedTickTimeMillis}. Work done here is therefore load the adaptive layer
+     * actually sees; work done in {@link #onServerTick} is not, because that runs after the tally.
+     */
+    void onServerTickPre(MinecraftServer server);
 }
