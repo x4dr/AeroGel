@@ -194,30 +194,36 @@ ungated proxy rendering, not CPU.
 
 ## Open questions — must be resolved, not reasoned about
 
-- **Late-batch write loss.** A probe writes ~512 blocks at tick 20, while the chunk is still promoting,
-  so the writes are *deferred* rather than applied. Only 267/512, 257/512 and 70/512 survived across
-  three runs. Leading hypothesis: deferred but not yet replayed, since replay is paced at ~10.7
-  writes/tick (issue #16's own measurement of the 1.5 ms/tick budget) and 512 writes need ~48 ticks.
-  That would make it a probe-calibration bug rather than a product bug — but it is a hypothesis. Needs
-  the discriminating instrumentation and a verdict before #16 can close.
-- **Stationary sampling.** Requirement is one burst then nothing. The structure says it already holds
-  (rebuild only fires on chunk-cross; refinement only re-samples chunks entering the near band) but that
-  has not been measured. Needs a probe that leaves a player still and counts sampler submissions.
-- **Drain-rate budget numbers.** What "under the adaptive activate threshold" means concretely for the
-  drain needs measurement, not a guess.
+- **Late-batch write loss — RESOLVED, and it was not a defect.** The probe scored itself as soon as the *bulk*
+  band completed, while the late band was still draining. Requiring both bands gives `512/512` with
+  `missing: none` and nothing pending. The `#16` two-queue split holds. Two calibration changes went with it:
+  the exit condition, and `MAX_TICKS`, which is now **100** — deliberately below the real cost (the run
+  completes at 60 ticks), so a longer delay is a tripwire rather than something absorbed by a raised timeout.
+- **Stationary sampling — RESOLVED.** `aerogel.stationary`: one burst of 1681 chunks, then 0 sent over 400
+  ticks. Measured, not inferred.
+- **Drain-rate budget numbers — STILL OPEN.** The drain brake is derived from the adaptive activate threshold
+  as agreed, but no measurement backs it. This is the only one of the three still open.
+- **Fake players in the player list — IN FLIGHT.** See `TODO.md` §4. Until a fake has a channel, any probe that
+  parks one must not be in the list on a `tickCount % 20 == 0` tick.
+
 
 ## Verification gate
 
-Per `AGENTS.md`, the posture is compiles / loads / probes PASS. Required before 0.1.1:
+Per `AGENTS.md`, the posture is compiles / loads / probes PASS. Required before 0.1.1, and **all of it now
+PASSES** — the numbers are in `AGENTS.md`:
 
-- `probe`, `promote`, `promotestress`, `writesafety` (×2), `sablebody`, `teleport`, `vanillaclient` — all
-  PASS. `vanillaclient` is re-specified below.
-- New/updated probes for: the drain arm (queued, not immediate); the disengage veto (queue and in-flight
-  empty, checked after the refill); stationary sampling; gate/proxy independence.
-- `promote` carries the restored late-batch write phase and therefore **fails until the write loss is
-  diagnosed** — it is not a side quest, it gates the release.
+- `probe` (5/5 sub-checks, including the reworked adaptive-window check), `promote`, `promotestress`,
+  `writesafety` ×2, `sablebody`, `teleport`, `vanillaclient`, plus the three added by this rewrite: `drain`,
+  `stationary`, `independence`, and one more from the follow-up round, `inflight`.
 - Both mixin descriptors re-verified against the NeoForge version in use (done for 21.1.252, recorded in
   `libs/README.md`).
+
+Two caveats the next agent should not have to rediscover, both recorded in `AGENTS.md` in full. **A probe that
+cannot fail is worse than no probe** — four were found passing without testing anything (`teleport` never
+pushed a zone, `vanillaclient` never engaged the gate, `promote` scored its verdict mid-replay,
+`checkAdaptiveWindow` passed its argument backwards), and they are now written to fail when the mechanism was
+never exercised. And **the probe runner is not trivial**: three of its traps produce `!! no VERDICT line`,
+which points at the probe rather than the runner.
 
 ### `vanillaclient` is re-specified, not deleted
 
@@ -227,6 +233,7 @@ server-side cost and excluding them would only move the stall somewhere they can
 probe must now assert is the actual defect: its square is **paced, not uncapped**. A `FakePlayer` never
 issues chunk requests, so the storm cannot be reproduced directly; the probe asserts the mechanism
 instead — that the client's in-range stubs enter the paced queue rather than being started immediately.
+It force-loads its own square to make that observable, and fails if nothing was ever in flight.
 
 ## Still undecided
 
