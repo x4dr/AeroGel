@@ -72,23 +72,7 @@ The draw decision is no longer involved; this is sampling and delivery latency. 
 Longer-running items are in `plans/README.md` (collider PoC; in-game verification of detail tiers and
 automatic promotion) and the "Next session" list in `AGENTS.md`.
 
-## 4. Give probes a fake player with a real channel — IN FLIGHT
-
-A `FakePlayer` cannot be in the player list on a tick where `tickChildren` calls `synchronizeTime`
-(`tickCount % 20 == 0`), because that walks every player calling `hasChannel` on a connection that has none.
-The current workaround — duty cycles and boundary-safe windows — makes probe behaviour depend on where a run
-lands in the 20-tick cycle, and fails outright for any probe needing more than ~18 contiguous ticks.
-
-The fix is understood and the sources have been read: `hasChannel` null-checks the payload setup, so attaching
-a channel to the fake's shared `DUMMY_CONNECTION` is enough to make it return false without an NPE, and the send
-path degrades to a `writeAndFlush` that an `EmbeddedChannel` outboard handler can drain. Full findings and the
-build steps are in the handoff; do that before adding any probe that needs the player list for long.
-
-**Expected bonus:** a fake that answers `isConnected()` stops being a special case, so probes can be run in a
-pack with other mods installed and any mod that treats connected players differently gets exercised. That is
-strictly better coverage than dodging the boundary.
-
-## 5. Drain-rate numbers — the last unmeasured open question
+## 4. Drain-rate numbers — the last unmeasured open question
 
 The drain brake is derived (`min(hardGateMs, activateTickMs)`) rather than configured, as agreed, but nothing
 measures what "stays under the adaptive activate thresholds" means in practice. This is the only one of the

@@ -203,8 +203,10 @@ ungated proxy rendering, not CPU.
   ticks. Measured, not inferred.
 - **Drain-rate budget numbers — STILL OPEN.** The drain brake is derived from the adaptive activate threshold
   as agreed, but no measurement backs it. This is the only one of the three still open.
-- **Fake players in the player list — IN FLIGHT.** See `TODO.md` §4. Until a fake has a channel, any probe that
-  parks one must not be in the list on a `tickCount % 20 == 0` tick.
+- **Fake players in the player list — RESOLVED.** `ProbeFakePlayer` attaches a draining `EmbeddedChannel` to the
+  fake's shared `Connection`, so a fake is parked for a whole run and the duty-cycle rule is gone. The drain
+  counts nothing in normal operation — the fake's net handler no-ops both `Connection.send` overloads — so the
+  handler holds the path open for writers that bypass the listener rather than carrying the fake's traffic.
 
 
 ## Verification gate

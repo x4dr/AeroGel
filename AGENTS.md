@@ -49,15 +49,24 @@ reaches `Done` on NeoForge **21.1.252 / FML 4.0.44**; and the whole probe set pa
 ~575-tick estimate for the same work was simply wrong, and the bound is now tight enough to be a tripwire
 rather than a formality.
 
-**Probe rules learned the hard way — every new probe must satisfy these.** A `FakePlayer` may not be in the
-player list on a tick where `MinecraftServer.tickChildren` calls `synchronizeTime`, i.e. `tickCount % 20 == 0`;
-it walks every player calling `hasChannel` on a connection that has none. Long-running probes park on a duty
-cycle, short sequences wait for a window that cannot straddle a boundary. A probe that asserts on the gate's
+**Probe rules learned the hard way — every new probe must satisfy these.** A `FakePlayer` used to be barred
+from the player list on a tick where `MinecraftServer.tickChildren` calls `synchronizeTime` (`tickCount % 20 == 0`),
+which walks every player calling `hasChannel` on a connection that has none; `ProbeFakePlayer` (dev
+source set) attaches a draining `EmbeddedChannel` to the fake's shared `Connection` through the private
+`channel` field, so that is gone: park the fake with `ProbeFakePlayer.park` for the whole run and use
+`ProbeFakePlayer.get` instead of `FakePlayerFactory.get`. Two things about it are not obvious. The attachment
+is once per JVM, because every fake shares one static `DUMMY_CONNECTION`. And the drain counts nothing in
+normal operation: `FakePlayerNetHandler` overrides both `Connection.send` overloads to no-ops, so
+`synchronizeTime` updates, chunk sends and broadcasts never reach the `Connection` at all, and the handler's
+job is only to keep a path open for writers that bypass the listener — which is why it carries a self-check
+packet instead of waiting for traffic. A fake is now *connected but declared nothing*: its payload setup is
+empty, the same as an unmodded client, so a probe still states what the fake receives through
+`AdaptiveMode.setHasAeroGel` rather than relying on a channel handshake. A probe that asserts on the gate's
 per-position state must also **pin the adaptive state** for its duration — a zone gives the gate work to do,
-which can push tick time over `activateTickMs` and stall the probe mid-sequence, and a stalled probe is still a
-parked one. And probes must never call a config-persisting setter: a run that does not reach its cleanup leaves
-the dev instance configured differently, and reads the altered value back as its "original" next time. That is
-what `debugSetHoldSeconds` / `debugSetEngageOnTeleport` / `debugSetActivateThresholds` exist for.
+which can push tick time over `activateTickMs` and stall the probe mid-sequence, and a stalled probe is still
+a parked one. And probes must never call a config-persisting setter: a run that does not reach its cleanup
+leaves the dev instance configured differently, and reads the altered value back as its "original" next time.
+That is what `debugSetHoldSeconds` / `debugSetEngageOnTeleport` / `debugSetActivateThresholds` exist for.
 
 **Two traps in running the suite itself, both of which cost a long misdiagnosis.** A probe that halts the
 server leaves the world lock held briefly, and the next run then dies at boot with
@@ -431,7 +440,8 @@ choke at ~80 chunks/s swept).
 **Headless tools** (all self-halt; delete the flag before a normal run). The probe code lives in the `dev`
 source set (`src/dev/java`, contributed through `DevProbe`/`DevProbes` as a `ServiceLoader` provider), so it is
 compiled into every dev run and into **no published jar**. There is no runtime flag that decides whether it
-exists — the code either is in the build or is not:
+exists — the code either is in the build or is not. `ProbeFakePlayer` is the shared fake-player helper (parking,
+and the draining channel described under the probe rules above):
 `touch run/server/aerogel.probe` (gate smoke test), `touch run/server/aerogel.promote` (promotion +
 deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (25-chunk promotion burst),
 `touch run/server/aerogel.flight` (fast-flight benchmark matrix), `touch run/server/aerogel.writesafety` (#6;
@@ -482,6 +492,10 @@ JAVA_HOME=<jdk21> ./gradlew :runServer    # dev server (boots Create+Aero+Sable)
 - Script-started server log: `run/aerogel-server.log`. Vanilla log: `run/server/logs/latest.log`.
   `run/server/server.properties`: port `25565`, `online-mode=false`.
 - The built jar lands in `build/libs/aerogel-1.21.1-<version>.jar`.
+- **Decompiled sources for this exact build are on disk**: `build/moddev/artifacts/neoforge-21.1.252-sources.jar`
+  (NeoForm `sources with NeoForge` — both `net/minecraft/**` and `net/neoforged/**`). `unzip -p <jar> <path>`
+  reads one file, `unzip -p <jar> <path> | grep -n` locates a line. Use it instead of guessing an API or paying
+  for a search: it is how the `Connection.channel`/`hasChannel` and deprecation questions were settled.
 
 ## Design docs
 
