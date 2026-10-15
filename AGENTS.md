@@ -41,6 +41,7 @@ reaches `Done` on NeoForge **21.1.252 / FML 4.0.44**; and the whole probe set pa
 | `sablebody` | PASS |
 | `stationary` | PASS — one burst of 1681 chunks, then 0 sent over 400 ticks |
 | `independence` | PASS — all four `travel`/`proxy` combinations |
+| `footprint` | PASS — one promotion: the 24 chunks outside it at FULL, a partial pyramid out to ring 13, 0 pacer starts |
 | `inflight` | PASS — 9 real despite 65 re-drives, peak 2 against a cap of 2 |
 | `teleport` | PASS — the opted-in target gated before the move, enforcement engaged then self-cleared |
 | `writesafety` ×2 | PASS — placement refused, then a deferred write survives the stop |
@@ -311,8 +312,24 @@ choke at ~80 chunks/s swept).
   goes straight to vanilla generation on the trigger, with no budget, hard gate or `maxInFlight`, deduped only
   so the same chunk is not started twice (a mass write = one promotion per chunk, not one per write). These
   are the only budget bypasses.
+  **What one promotion costs, measured** (`aerogel.footprint`, 2026-10-15). Promoting one proxy fully generates
+  its **5x5** — the chunk plus 24 around it — because a chunk near a player is a ticking chunk and a ticking
+  chunk requires its vicinity at FULL. Around that, vanilla raises a **partial pyramid** from the same
+  dependencies: ring 3 to `initialize_light`, ring 4 to `carvers`, ring 5 to `biomes`, then rings 6 to 13 all at
+  `structure_starts` and nothing beyond ring 13. So one promotion is 25 FULL chunks plus ~700 partial
+  chunk-stages, and that work is real main-thread chunk-task backlog. The dependency path is
+  `ChunkMap.getChunkRangeFuture` → `scheduleChunkGenerationTask` on each neighbour, which **deliberately goes
+  ungated**: intercepting it is what "not being more invasive" buys, and the price is that the pacing below
+  bounds *how many sites convert*, not how many chunks a conversion brings (see `TODO.md` and the issue on
+  accounting for the pyramid). Two consequences worth knowing before tuning: the pyramid's backlog is what
+  raises the adaptive backlog signal during a drain (measured 92 and 576 against `adaptive backlog` 64, while
+  smoothed tick time peaked near 6 ms against 35 ms), and because the pyramid leaves that whole area partially
+  generated, the marginal cost of the next promotion in the same place collapses — a promotion spends the
+  proxies over roughly a 25x25 area.
   **Linger promotion is the only paced path**: a token bucket refilled at `maxGenFraction` ms/ms (default 0.5 =
-  at most half the server's wall time) charged `chunkCostMs` per start, blocked while smoothed tick time ≥
+  at most half the server's wall time) charged the **measured** post-cost per start (`ProxyChunkGate.postCostMs`,
+  an EMA seeded at 5 ms — the `chunkCostMs` config value is *not* what the pacer charges, see `TODO.md`),
+  blocked while smoothed tick time ≥
   `hardGateMs`, and bounded by `maxInFlight`; the queue drains strictly nearest-player-first. While the
   server is **calm** the linger threshold is bypassed — the budget is not — so every fresh lingered stub is
   eligible at once and the same pacer decides when each starts. Promotion **forces the FULL future forward**
@@ -455,7 +472,10 @@ run/server/aerogel.drain` (the disengage model on the real adaptive path: the dr
 drops with work outstanding, and everything eventually generates), `touch run/server/aerogel.stationary`
 (sampling is one burst then nothing while a player stands still), `touch
 run/server/aerogel.independence` (gating and proxy rendering are independent axes — all four
-`travel`/`proxy` combinations).
+`travel`/`proxy` combinations), `touch run/server/aerogel.footprint` (what one promotion generates: its 5x5 at
+FULL plus the partial pyramid around it, and that the pyramid terminates), `touch run/server/aerogel.rate` (the
+linger drain's rate, the refill's calm-threshold bypass, and the pacer's brake and starvation floor under an
+injected load).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 

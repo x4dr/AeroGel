@@ -17,6 +17,9 @@ import net.minecraft.server.MinecraftServer;
  * {@code aerogel.independence} (gating and proxy rendering are independent axes),
  * {@code aerogel.vanillaclient} (#15: a client without AeroGel gets a paced, not uncapped, square),
  * {@code aerogel.teleport} (#14: engage on teleport into fresh land),
+ * {@code aerogel.rate} (the linger drain's rate, the refill's calm-threshold bypass, and the pacer's brake and
+ * starvation floor under an injected load),
+ * {@code aerogel.footprint} (what one promotion generates: its 5x5 at FULL plus the partial pyramid around it),
  * {@code aerogel.flight} (fast-flight benchmark matrix).
  * Each one deletes its own flag before a normal run.</p>
  */
@@ -67,6 +70,13 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.teleport"))) {
             server.execute(() -> TeleportProbe.start(server));
         }
+        // the drain rate keeps the REAL adaptive path: it measures the refill's calm bypass and the pacer
+        if (Files.exists(dir.resolve("aerogel.rate"))) {
+            server.execute(() -> RateProbe.start(server));
+        }
+        if (Files.exists(dir.resolve("aerogel.footprint"))) {
+            server.execute(() -> FootprintProbe.start(server));
+        }
         // the flight harness keeps the REAL adaptive path (no debugAlwaysOn) and waits for a player
         if (Files.exists(dir.resolve("aerogel.flight"))) {
             FlightProbe.start(server);
@@ -87,5 +97,12 @@ public final class DevProbeImpl implements DevProbe {
         IndependenceProbe.tick(server);
         VanillaClientProbe.tick(server);
         TeleportProbe.tick(server);
+        RateProbe.tick(server);
+        FootprintProbe.tick(server);
+    }
+
+    @Override
+    public void onServerTickPre(MinecraftServer server) {
+        RateProbe.tickPre(); // inside the tick-time measurement, which is the point of it
     }
 }

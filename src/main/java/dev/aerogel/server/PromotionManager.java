@@ -146,6 +146,15 @@ public final class PromotionManager {
     private static int inFlightRetryTicks = 300;
     /** total retries issued, so a probe can tell the retry path actually ran. */
     private static int inFlightRetries;
+    /**
+     * The pacer's decisions since {@link #debugResetRateCounters}, so a probe can tell a drain that was paced
+     * by the budget from one that was paced by the concurrency cap, and see the brake and the starvation floor
+     * bite instead of inferring them from timing.
+     */
+    private static int lingerStarts;
+    private static int brakeBlocks;
+    private static int budgetBlocks;
+    private static int forcedStarts;
     /** if no promotion has started for this many ticks, start one even under budget/hard-gate pressure. */
     private static final int FORCE_START_TICKS = 200;
     /**
@@ -987,6 +996,50 @@ public final class PromotionManager {
     }
 
     /**
+     * Dev hooks: the pacer's own decisions since the last {@link #debugResetRateCounters}. {@code starts} counts
+     * linger promotions admitted (not completions), {@code brakeBlocks} and {@code budgetBlocks} count the ticks
+     * that returned early because the smoothed tick time was at the brake or the budget was spent, and
+     * {@code forcedStarts} counts the starts the {@code FORCE_START_TICKS} floor let through over both. A probe
+     * measuring the drain cannot tell "paced by the budget" from "paced by the concurrency cap" without these,
+     * and the floor is the one start the brake does not stop.
+     */
+    public static int debugLingerStarts() {
+        return lingerStarts;
+    }
+
+    public static int debugBrakeBlocks() {
+        return brakeBlocks;
+    }
+
+    public static int debugBudgetBlocks() {
+        return budgetBlocks;
+    }
+
+    public static int debugForcedStarts() {
+        return forcedStarts;
+    }
+
+    /** Dev hook: zero the counters above, so a probe reads one phase rather than the JVM's whole life. */
+    public static void debugResetRateCounters() {
+        lingerStarts = 0;
+        brakeBlocks = 0;
+        budgetBlocks = 0;
+        forcedStarts = 0;
+    }
+
+    /** Dev hook: the queue depth for one level, which the refill's admission shows up in. */
+    public static int debugQueued(ServerLevel lvl) {
+        State state = state(lvl);
+        return state == null ? 0 : state.queue.size();
+    }
+
+    /** Dev hook: the in-flight count for one level. */
+    public static int debugInFlight(ServerLevel lvl) {
+        State state = state(lvl);
+        return state == null ? 0 : state.inFlight.size();
+    }
+
+    /**
      * Dev hook: shorten the in-flight retry interval so a probe can exercise the retry path during an
      * ordinary promotion. One tick means every in-flight chunk is re-driven every tick while it generates,
      * which is the harshest version of what {@link #retryInFlight} does — exactly what a probe needs to find
@@ -1010,7 +1063,8 @@ public final class PromotionManager {
     }
 
     /** test hook: queue a chunk as if it had lingered (used by the dev-only headless stress probe). */
-    public static void debugEnqueue(ServerLevel lvl, long chunkPos) {        State state = state(lvl);
+    public static void debugEnqueue(ServerLevel lvl, long chunkPos) {
+        State state = state(lvl);
         if (state != null && enabled) {
             // deliberately past the cap: the probe is simulating "these chunks all qualified", and the refill
             // is what would normally decide the set
@@ -1101,9 +1155,11 @@ public final class PromotionManager {
             double brake = hardGateMs <= 0.0 ? AdaptiveMode.activateTickMs()
                 : Math.min(hardGateMs, AdaptiveMode.activateTickMs());
             if (brake > 0.0 && tickMs >= brake) {
+                brakeBlocks++;
                 return; // server already at the level that would re-engage enforcement: queue, do not start
             }
             if (state.budgetMs < cost) {
+                budgetBlocks++;
                 return; // no generation time left this window
             }
         }
@@ -1124,6 +1180,10 @@ public final class PromotionManager {
             state.budgetMs += cost; // the promotion never ran: refund the budget
             enqueue(state, pos, true);
         } else {
+            lingerStarts++;
+            if (starved) {
+                forcedStarts++;
+            }
             state.lastStartTick = state.tickCounter;
         }
     }

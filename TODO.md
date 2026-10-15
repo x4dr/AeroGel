@@ -72,10 +72,45 @@ The draw decision is no longer involved; this is sampling and delivery latency. 
 Longer-running items are in `plans/README.md` (collider PoC; in-game verification of detail tiers and
 automatic promotion) and the "Next session" list in `AGENTS.md`.
 
-## 4. Drain-rate numbers — the last unmeasured open question
+## 4. What one promotion actually costs, and the pacing math that ignores it
 
-The drain brake is derived (`min(hardGateMs, activateTickMs)`) rather than configured, as agreed, but nothing
-measures what "stays under the adaptive activate thresholds" means in practice. This is the only one of the
-plan's three original open questions still open; the other two (late-batch write loss, stationary sampling)
-are resolved and recorded in `plans/promotion-and-gating-rewrite.md`.
+Measured (`aerogel.footprint`, 2026-10-15): one promotion fully generates its 5x5 (25 chunks) and raises a
+partial pyramid around it — ring 3 `initialize_light`, ring 4 `carvers`, ring 5 `biomes`, rings 6-13
+`structure_starts`, nothing beyond ring 13 — so ~728 chunks are touched by one request.
+
+Two things follow that the code does not account for:
+
+- **The pacer charges one start's cost while a start generates up to 25 chunks plus the pyramid.** `maxInFlight`
+  bounds how many sites convert per tick, not how much generation each conversion brings. Tuning
+  `promote concurrency/budget` therefore does not bound the work the way the docs implied.
+- **`chunkCostMs` is not what the pacer charges.** `processQueue` charges `ProxyChunkGate.postCostMs` (an EMA of
+  the measured finish cost, seeded at 5 ms); the `chunkCostMs` config value and its `/aerogel promote cost` knob
+  are only read back into the status line. Either the knob should go or the pacer should use it — worth deciding
+  before anyone tunes it.
+
+The pyramid's dependency path (`ChunkMap.getChunkRangeFuture` → `scheduleChunkGenerationTask`) deliberately goes
+ungated, so this is the accepted price of not intercepting vanilla's dependency generation, not a bug. It is
+filed so the gating logic can be made to account for the pyramid and its flat top.
+
+## 5. A mid-generation chunk reads as real
+
+`ProxyChunkGate.loadedNow` (used by `isProxy` and `isLoadedReal`) asks `ServerChunkCache.getChunkNow`, which
+NeoForge patches to return `chunkHolder.currentlyLoading` for a chunk that is merely *being* generated. So a
+chunk with no data yet answers "vanilla has it loaded", and `isProxy` returns false for it on the reasoning that
+a vanilla-loaded chunk is real. It is why a partially generated neighbour counted as real in the first
+footprint measurement, and why that probe reads holder statuses instead.
+
+Not a one-line fix: tightening `loadedNow` makes `isProxy` report true for a position whose promotion is in
+flight, which changes which path serves reads during a promotion (`isPromoting` vs the placeholder) — verified
+behaviour, so it needs its own change and a re-run of the gate probes. Recorded as a comment at the accessor.
+
+## 6. Drain-rate numbers — RESOLVED, and the answer was not a number
+
+Measured (`aerogel.rate`, 2026-10-15): the drain's own starts do not move smoothed tick time near the brake
+(peaks ~6 ms against 35 ms; at an injected load the brake blocked 259 of 260 ticks and the starvation floor was
+the only start that still got through). What does move is the **adaptive backlog signal**, because a promotion's
+neighbourhood work is real main-thread chunk tasks — measured peaks 92 and 576 against `adaptive backlog` 64. So
+"the drain stays under the adaptive activate thresholds" is true for tick time and false for backlog, and the
+backlog half is inherent to promotion rather than a pacing failure. Recorded in
+`plans/promotion-and-gating-rewrite.md`.
 

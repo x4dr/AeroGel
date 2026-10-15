@@ -201,8 +201,19 @@ ungated proxy rendering, not CPU.
   completes at 60 ticks), so a longer delay is a tripwire rather than something absorbed by a raised timeout.
 - **Stationary sampling — RESOLVED.** `aerogel.stationary`: one burst of 1681 chunks, then 0 sent over 400
   ticks. Measured, not inferred.
-- **Drain-rate budget numbers — STILL OPEN.** The drain brake is derived from the adaptive activate threshold
-  as agreed, but no measurement backs it. This is the only one of the three still open.
+- **Drain-rate budget numbers — RESOLVED, and the answer was not a number.** The brake is derived
+  (`min(hardGateMs, activateTickMs)`) as agreed, and measured: the drain's own starts never approached it
+  (smoothed tick time peaked ~6 ms against 35 ms, and under injected load the brake blocked 259 of 260 ticks
+  with only the starvation floor still starting one). What does rise is the **adaptive backlog** signal (peaks
+  92 and 576 against `adaptive backlog` 64), because a promotion's neighbourhood work is real main-thread chunk
+  tasks — inherent to promotion, not a pacing failure. So the claim "the drain stays under the adaptive
+  activate thresholds" holds only for tick time.
+- **Promotion footprint — MEASURED, and it is what the pacing math ignores.** One promotion fully generates its
+  5x5 (25 chunks) plus a partial pyramid out to ring 13 (`initialize_light`, `carvers`, `biomes`, then
+  `structure_starts`), ~728 chunks touched, from `aerogel.footprint`. The dependency path is deliberately
+  ungated, so the pacer bounds sites, not chunks. Filed as an issue: the gating logic needs to account for the
+  pyramid and its flat top. Also recorded: the pacer charges `ProxyChunkGate.postCostMs`, so the `chunkCostMs`
+  knob is not what anyone would assume it is (`TODO.md`).
 - **Fake players in the player list — RESOLVED.** `ProbeFakePlayer` attaches a draining `EmbeddedChannel` to the
   fake's shared `Connection`, so a fake is parked for a whole run and the duty-cycle rule is gone. The drain
   counts nothing in normal operation — the fake's net handler no-ops both `Connection.send` overloads — so the

@@ -405,6 +405,19 @@ public final class ProxyChunkGate {
         }
     }
 
+    /**
+     * Whether vanilla would serve this position from a real chunk right now.
+     *
+     * <p><b>Trap, and it is deliberate on NeoForge's side.</b> {@code ServerChunkCache.getChunkNow} is patched
+     * to return {@code chunkHolder.currentlyLoading} when the chunk is merely <i>being</i> generated ("to
+     * prevent a deadlock"), so this answers true for a chunk that has no data yet and would block the main
+     * thread if something asked for it. Callers here treat true as "vanilla will serve it, so it is not a
+     * proxy", which holds for a loaded chunk but not for one mid-generation. It is why a partially generated
+     * neighbour reads as real to a probe (and why the first footprint measurement had to read holder statuses
+     * instead). Tightening it is not a one-line change: {@code isProxy} would start reporting true for a
+     * position whose promotion is in flight, which changes which path serves reads during a promotion — see
+     * {@code TODO.md}, "a mid-generation chunk reads as real".
+     */
     private static boolean loadedNow(State state, long pos) {
         return state != null
             && state.level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos)) != null;

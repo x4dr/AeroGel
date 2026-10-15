@@ -29,15 +29,15 @@ import org.slf4j.LoggerFactory;
  * <li><b>Everything generates.</b> The square is fully real at the end. The drain is slow, never lossy.</li>
  * </ol>
  *
- * <p><b>Why the queue is filled with {@code debugEnqueue} instead of by the linger path.</b> A
- * {@code FakePlayer} cannot stay in the player list: {@code MinecraftServer.tickChildren} calls
- * {@code synchronizeTime} every 20 ticks, which walks every player and calls {@code hasChannel} on its
- * connection, and a fake has no channel. The linger path needs a player in the list for as long as the
- * window takes to cool, which is seconds — so it cannot be driven headlessly at all. The veto and the pacing
- * are what this probe covers, and both read the queue. Two things that need a real client are therefore
- * <b>not</b> covered here and belong in the in-game list: the refill's calm-threshold bypass filling the
- * queue, and the gated-stub count in {@link PromotionManager#drained} (which is only computed where players
- * are).</p>
+ * <p><b>Why the queue is filled with {@code debugEnqueue} instead of by the linger path.</b> This probe asserts
+ * the veto and the pacing, and both read the queue, so it wants a queue it controls and a gate state it can
+ * depend on; filling it with {@code debugEnqueue} is what makes the drain failure-injectable. A fake
+ * <i>can</i> stay in the player list now ({@link ProbeFakePlayer} gives its shared connection a draining
+ * channel, so the {@code synchronizeTime} walk is safe), and the linger path is therefore covered elsewhere —
+ * {@code aerogel.rate} drives the refill's calm-threshold bypass with a real parked player, and
+ * {@code aerogel.footprint} measures what one promotion generates. The old note here, that the linger path
+ * "cannot be driven headlessly at all", and the mention of a gated-stub count in
+ * {@link PromotionManager#drained} (dropped by the promotion and gating rewrite) are both obsolete.</p>
  *
  * <p>{@code holdSeconds} is set to 0 for the run so the activating sample from the teleport does not keep the
  * gate on by itself: without that, enforcement would still be inside its hold for the whole drain and the
