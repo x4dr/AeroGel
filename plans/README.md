@@ -30,7 +30,7 @@
 6. ~~Hardening pass~~ — DONE (2026-10-13). Void plane deleted, config validated, probes moved to the `dev`
    source set, outbound mesh batches split and `mesh_request` rate-limited, promotion de-urgented. Verified:
    loads on NeoForge 21.1.252 and the `aerogel.promote` probe PASSes. See `work_log.md`.
-7. **Promotion and gating rewrite** — IN PROGRESS, unverified. The opt-out zone list is gone (the gate is
+7. **Promotion and gating rewrite** — DONE and verified (2026-10-15): compiles, loads, all eleven probes PASS. The opt-out zone list is gone (the gate is
    global while enforcing, otherwise the union of opted-in `travel` zones), linger is universal and
    server-side, and the server no longer branches on whether a client renders proxies — `AdaptiveMode.renders`
    gates mesh *sending* only, which is what removes the uncapped leftover arm behind #15. The disengage model
