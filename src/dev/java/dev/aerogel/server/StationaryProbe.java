@@ -1,14 +1,11 @@
 package dev.aerogel.server;
 
 import com.mojang.authlib.GameProfile;
-import java.util.List;
 import java.util.UUID;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
 import net.neoforged.neoforge.common.util.FakePlayer;
-import net.neoforged.neoforge.common.util.FakePlayerFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,7 +38,6 @@ final class StationaryProbe {
     private static long burstEnd = -1;
     private static int stable;
     private static int phase;
-    private static boolean parked;
 
     private StationaryProbe() {
     }
@@ -50,21 +46,24 @@ final class StationaryProbe {
         level = server.overworld();
         ChunkPos spawn = new ChunkPos(level.getSharedSpawnPos());
         ChunkPos target = new ChunkPos(spawn.x + OFFSET, spawn.z + OFFSET);
-        viewer = FakePlayerFactory.get(level,
+        viewer = ProbeFakePlayer.get(level,
             new GameProfile(UUID.fromString("ae0ae0ae-0000-4000-8000-0000000007c1"), "aerogel-stationary"));
         AdaptiveMode.setHasAeroGel(viewer, true);
         AdaptiveMode.setPlayerSwitch(viewer, "proxy", true);  // it receives meshes
         AdaptiveMode.setPlayerSwitch(viewer, "travel", false); // but does not ask for gating: sampling only
         viewer.setPos(target.getMiddleBlockX() + 0.5, 200, target.getMiddleBlockZ() + 0.5);
-        // added by dutyPark below, not here: a fake cannot be in the player list on a tick where
-        // MinecraftServer.tickChildren calls synchronizeTime, and that is every 20 ticks
+        // parked for the whole run: the fake's shared Connection now carries a draining channel, so it can
+        // stay in the player list across the tickCount % 20 boundary this probe used to dodge
+        if (!ProbeFakePlayer.park(server, viewer)) {
+            finish(server, false, "the fake player has no draining channel, so it cannot stay in the player"
+                + " list and this run would assert nothing");
+        }
     }
 
     static void tick(MinecraftServer server) {
         if (level == null) {
             return;
         }
-        dutyPark(server);
         ticks++;
         if (ticks > IDLE_TIMEOUT + BURST_TIMEOUT + HOLD_TICKS) {
             finish(server, false, "probe itself timed out");
@@ -100,43 +99,10 @@ final class StationaryProbe {
                 }
                 if (ticks - stable >= HOLD_TICKS) {
                     finish(server, true, String.format("one burst of %d chunk(s), then 0 sent over %d"
-                        + " stationary ticks", burstEnd, HOLD_TICKS));
+                        + " stationary ticks (%s)", burstEnd, HOLD_TICKS, ProbeFakePlayer.drainSummary()));
                 }
             }
             default -> finish(server, false, "unreachable phase");
-        }
-    }
-
-    /**
-     * Keep the fake in the player list for 18 of every 20 ticks, and out of it for the two around each
-     * boundary. {@code MinecraftServer.tickChildren} calls {@code synchronizeTime} when
-     * {@code tickCount % 20 == 0}, and that walks every player calling {@code hasChannel} on its connection —
-     * which a fake does not have. Unparking at {@code % 20 == 19} means it is already gone when the boundary
-     * tick arrives. The streamer's per-player state is keyed by UUID and survives the gap, and
-     * {@code LINGER_GRACE_TICKS} is 40, so nothing ages out.
-     */
-    private static void dutyPark(MinecraftServer server) {
-        boolean want = server.getTickCount() % 20 != 0 && server.getTickCount() % 20 != 19;
-        if (want == parked) {
-            return;
-        }
-        if (want) {
-            playerList(server).add(viewer);
-        } else {
-            playerList(server).remove(viewer);
-        }
-        parked = want;
-    }
-
-    /** the mutable backing list ({@code getPlayers()} is unmodifiable); probe-only reflection. */
-    @SuppressWarnings("unchecked")
-    private static List<ServerPlayer> playerList(MinecraftServer server) {
-        try {
-            java.lang.reflect.Field f = net.minecraft.server.players.PlayerList.class.getDeclaredField("players");
-            f.setAccessible(true);
-            return (List<ServerPlayer>) f.get(server.getPlayerList());
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException(e);
         }
     }
 
@@ -146,10 +112,7 @@ final class StationaryProbe {
         } else {
             LOGGER.error("stationary probe: VERDICT FAIL — {}", detail);
         }
-        if (parked) {
-            playerList(server).remove(viewer);
-            parked = false;
-        }
+        ProbeFakePlayer.unpark(server, viewer);
         AdaptiveMode.removePlayer(viewer.getUUID());
         level = null;
         viewer = null;

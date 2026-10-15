@@ -1,14 +1,11 @@
 package dev.aerogel.server;
 
 import com.mojang.authlib.GameProfile;
-import java.util.List;
 import java.util.UUID;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
 import net.neoforged.neoforge.common.util.FakePlayer;
-import net.neoforged.neoforge.common.util.FakePlayerFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,8 +32,9 @@ import org.slf4j.LoggerFactory;
  * past {@code maxInFlight}, which is the assertion. The old probe's assertion cannot be restored because the
  * contract it described is gone.</p>
  *
- * <p>The fake is removed from the player list before the next ~20-tick boundary: it has no connection, and
- * {@code MinecraftServer.synchronizeTime} walks every player calling {@code hasChannel}.</p>
+ * <p>The fake stays in the player list for the whole run: {@code ProbeFakePlayer} gives its shared
+ * connection a draining channel, so the {@code tickCount % 20 == 0} boundary where
+ * {@code MinecraftServer.synchronizeTime} walks every player calling {@code hasChannel} is now safe.</p>
  */
 final class VanillaClientProbe {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.vanillaprobe");
@@ -52,7 +50,6 @@ final class VanillaClientProbe {
     private static int ticks;
     private static int peakInFlight;
     private static boolean noMeshes;
-    private static boolean parked;
 
     private VanillaClientProbe() {
     }
@@ -81,14 +78,19 @@ final class VanillaClientProbe {
             finish(server, false, "no fresh 3x3 near offset " + OFFSET);
             return;
         }
-        plain = FakePlayerFactory.get(level,
+        plain = ProbeFakePlayer.get(level,
             new GameProfile(UUID.fromString("ae0ae0ae-0000-4000-8000-0000000007a2"), "aerogel-plain"));
         AdaptiveMode.setHasAeroGel(plain, false); // #7: no mesh_batch channel, so no meshes are sent to it
         // a FakePlayer has no connection, so teleportTo is a no-op that NPEs; place it explicitly. pushZones
         // reads player.chunkPosition(), so a fake left at its default position would push a zone elsewhere.
         plain.setPos(center.getMiddleBlockX() + 0.5, 200, center.getMiddleBlockZ() + 0.5);
-        // added by dutyPark below, not here: a fake cannot be in the player list on a tick where
-        // MinecraftServer.tickChildren calls synchronizeTime, and that is every 20 ticks
+        // parked for the whole run: the fake's shared Connection now carries a draining channel, so it can
+        // stay in the player list across the tickCount % 20 boundary this probe used to dodge
+        if (!ProbeFakePlayer.park(server, plain)) {
+            finish(server, false, "the fake player has no draining channel, so it cannot stay in the player"
+                + " list and this run would assert nothing");
+            return;
+        }
         // force-load the square so the chunks become stubs the linger path can see; a FakePlayer requests
         // nothing of its own
         for (int dx = -RADIUS; dx <= RADIUS; dx++) {
@@ -108,7 +110,6 @@ final class VanillaClientProbe {
         if (level == null) {
             return;
         }
-        dutyPark(server);
         ticks++;
         if (ticks > IDLE_TIMEOUT) {
             finish(server, false, "server never went quiet enough to start (still enforcing)");
@@ -151,50 +152,14 @@ final class VanillaClientProbe {
                 return;
             }
             finish(server, true, String.format("all %d chunks real, peak concurrent generation %d <= cap %d,"
-                + " no meshes sent", expected, peakInFlight, PromotionManager.maxInFlight()));
+                + " no meshes sent (%s)", expected, peakInFlight, PromotionManager.maxInFlight(),
+                ProbeFakePlayer.drainSummary()));
             return;
         }
         if (ticks > MAX_TICKS) {
             finish(server, false, String.format("only %d/%d real after %d ticks (peak in flight %d)",
                 real, expected, ticks, peakInFlight));
         }
-    }
-
-    /** the mutable backing list ({@code getPlayers()} is unmodifiable); probe-only reflection. */
-    @SuppressWarnings("unchecked")
-    private static List<ServerPlayer> playerList(MinecraftServer server) {
-        try {
-            java.lang.reflect.Field f = net.minecraft.server.players.PlayerList.class.getDeclaredField("players");
-            f.setAccessible(true);
-            return (List<ServerPlayer>) f.get(server.getPlayerList());
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
-    private static void park(MinecraftServer server) {
-        playerList(server).add(plain);
-        parked = true;
-    }
-
-    /**
-     * Keep the fake in the player list for 18 of every 20 ticks, and out of it for the two around each
-     * boundary. {@code MinecraftServer.tickChildren} calls {@code synchronizeTime} when
-     * {@code tickCount % 20 == 0}, and that walks every player calling {@code hasChannel} on its connection —
-     * which a fake does not have. Unparking at {@code % 20 == 19} means it is already gone when the boundary
-     * tick arrives.
-     */
-    private static void dutyPark(MinecraftServer server) {
-        boolean want = server.getTickCount() % 20 != 0 && server.getTickCount() % 20 != 19;
-        if (want == parked) {
-            return;
-        }
-        if (want) {
-            playerList(server).add(plain);
-        } else {
-            playerList(server).remove(plain);
-        }
-        parked = want;
     }
 
     private static void finish(MinecraftServer server, boolean pass, String detail) {
@@ -210,11 +175,8 @@ final class VanillaClientProbe {
                 }
             }
         }
-        if (parked) {
-            playerList(server).remove(plain);
-            parked = false;
-        }
         if (plain != null) {
+            ProbeFakePlayer.unpark(server, plain);
             AdaptiveMode.removePlayer(plain.getUUID());
         }
         level = null;

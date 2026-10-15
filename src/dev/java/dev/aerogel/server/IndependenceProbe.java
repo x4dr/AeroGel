@@ -1,14 +1,11 @@
 package dev.aerogel.server;
 
 import com.mojang.authlib.GameProfile;
-import java.util.List;
 import java.util.UUID;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
 import net.neoforged.neoforge.common.util.FakePlayer;
-import net.neoforged.neoforge.common.util.FakePlayerFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,7 +44,6 @@ final class IndependenceProbe {
     private static int ticks;
     private static int step;
     private static boolean fails;
-    private static boolean parked;
     private static double originalActivateTickMs;
     private static int originalBacklogActivate;
     private static final StringBuilder cells = new StringBuilder();
@@ -59,14 +55,19 @@ final class IndependenceProbe {
         level = server.overworld();
         originalActivateTickMs = AdaptiveMode.activateTickMs();
         originalBacklogActivate = AdaptiveMode.backlogActivate();
-        player = FakePlayerFactory.get(level,
+        player = ProbeFakePlayer.get(level,
             new GameProfile(UUID.fromString("ae0ae0ae-0000-4000-8000-0000000007d1"), "aerogel-independence"));
         AdaptiveMode.setHasAeroGel(player, true); // confirmed channel: both switches are meaningful
         ChunkPos spawn = new ChunkPos(level.getSharedSpawnPos());
         player.setPos((spawn.x + OFFSET) * 16.0 + 8.0, 200, (spawn.z + OFFSET) * 16.0 + 8.0);
-        // NOT parked here: MinecraftServer.tickChildren calls synchronizeTime at tickCount % 20 == 0, and that
-        // walks every player calling hasChannel on its connection, which a fake does not have. The sequence
-        // below needs eight consecutive ticks, so it waits for a window that cannot straddle a boundary.
+        // parked for the whole run: the fake's shared Connection now carries a draining channel, so the
+        // tickCount % 20 boundary where synchronizeTime calls hasChannel is no longer a reason to keep it out
+        // of the player list. The sequence below still runs while the fake is parked throughout, because
+        // pushZones drops a player that is not in the list and the zone under test would disappear with it.
+        if (!ProbeFakePlayer.park(server, player)) {
+            finish(server, false, "the fake player has no draining channel, so it cannot stay in the player"
+                + " list and this run would assert nothing");
+        }
     }
 
     static void tick(MinecraftServer server) {
@@ -84,20 +85,12 @@ final class IndependenceProbe {
         if (++step > 8) {
             return;
         }
-        // The eight steps must run on consecutive ticks with the fake parked throughout, or pushZones drops it
-        // and the zone under test disappears. Wait for a window that cannot straddle a synchronizeTime
-        // boundary, then park for the whole sequence and leave.
-        if (!parked) {
-            if (server.getTickCount() % 20 > 9) {
-                step = 0;
-                return;
-            }
+        if (step == 1) {
             // Hold enforcement off for the sequence. Having a zone at all gives the streamer and the gate
             // something to do, which can push tick time over the activate threshold -- and if enforcement
-            // engages mid-sequence the probe stalls *while still parked*, stretching the parked window across a
-            // synchronizeTime boundary. Measured, not assumed: that is how the first two runs died.
+            // engages mid-sequence every position reads engaged, hiding the axis under test. Measured, not
+            // assumed: that is how the first two runs died.
             AdaptiveMode.debugSetActivateThresholds(1000.0, 1_000_000);
-            park(server);
         }
         long here = player.chunkPosition().toLong();
         switch (step) {
@@ -148,32 +141,14 @@ final class IndependenceProbe {
             ok ? "" : "FAIL ", name, engaged, travel, renders, proxy));
     }
 
-    /** the mutable backing list ({@code getPlayers()} is unmodifiable); probe-only reflection. */
-    @SuppressWarnings("unchecked")
-    private static List<ServerPlayer> playerList(MinecraftServer server) {
-        try {
-            java.lang.reflect.Field f = net.minecraft.server.players.PlayerList.class.getDeclaredField("players");
-            f.setAccessible(true);
-            return (List<ServerPlayer>) f.get(server.getPlayerList());
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
-    private static void park(MinecraftServer server) {
-        playerList(server).add(player);
-        parked = true;
-    }
-
     private static void finish(MinecraftServer server, boolean pass, String detail) {
         if (pass) {
             LOGGER.info("independence probe: VERDICT PASS — {}", detail);
         } else {
             LOGGER.error("independence probe: VERDICT FAIL — {}", detail);
         }
-        if (parked) {
-            playerList(server).remove(player);
-            parked = false;
+        if (player != null) {
+            ProbeFakePlayer.unpark(server, player);
         }
         AdaptiveMode.debugSetActivateThresholds(originalActivateTickMs, originalBacklogActivate);
         AdaptiveMode.removePlayer(player.getUUID());
