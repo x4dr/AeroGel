@@ -7,7 +7,7 @@ resume any workstream after a session loss.
 ## Ordering (run in series — one agent at a time, main working tree)
 
 Collisions are avoided by **serial execution**, not worktrees. Each workstream
-ends with `JAVA_HOME=~/.local/share/PrismLauncher/java/java-runtime-delta ./gradlew :compileJava`
+ends with `JAVA_HOME=<jdk21> ./gradlew :compileJava`
 and a report. The orchestrator reviews + commits between workstreams.
 
 1. `01-core-dimensions.md` — **do first.** Server state becomes per-dimension;
@@ -48,7 +48,7 @@ and a report. The orchestrator reviews + commits between workstreams.
 ## Build command
 
 ```bash
-JAVA_HOME=~/.local/share/PrismLauncher/java/java-runtime-delta ./gradlew :compileJava
+JAVA_HOME=<jdk21> ./gradlew :compileJava
 ```
 
 The dev server is stopped, so the Gradle project lock is free. Do not start it.

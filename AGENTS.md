@@ -333,17 +333,16 @@ scripts/deploy.sh stop|start|restart|status|logs
 Manual equivalents:
 
 ```bash
-JAVA_HOME=~/.local/share/PrismLauncher/java/java-runtime-delta ./gradlew :compileJava   # compile only (fast)
-JAVA_HOME=~/.local/share/PrismLauncher/java/java-runtime-delta ./gradlew :assemble     # build the mod jar
-JAVA_HOME=~/.local/share/PrismLauncher/java/java-runtime-delta ./gradlew :deployDemo   # assemble + copy to AeroGelDemo
-JAVA_HOME=~/.local/share/PrismLauncher/java/java-runtime-delta ./gradlew :runServer    # dev server (boots Create+Aero+Sable)
+JAVA_HOME=<jdk21> ./gradlew :compileJava   # compile only (fast)
+JAVA_HOME=<jdk21> ./gradlew :assemble     # build the mod jar
+JAVA_HOME=<jdk21> ./gradlew :deployDemo   # assemble + copy to AeroGelDemo
+JAVA_HOME=<jdk21> ./gradlew :runServer    # dev server (boots Create+Aero+Sable)
 ```
 
 **Dev-loop facts (so a new agent does not have to rediscover them):**
-- The **test client is the Prism instance `AeroGelDemo`** (launched from PrismLauncher, not `:runClient`). It
-  loads `aerogel-*.jar` from `.../instances/AeroGelDemo/.minecraft/mods/`; **restart the client** to pick up a
-  new jar. `2026 sinking the kitchen` is the source pack the `libs/` jars were staged from — do not deploy
-  there.
+- The **test client is the launcher instance `AeroGelDemo`** (launched from the launcher, not `:runClient`). It
+  loads `aerogel-*.jar` from that instance's `mods/`; **restart the client** to pick up a
+  new jar. Never deploy to the pack the `libs/` jars were staged from.
 - The **dev server is `:runServer`** with gameDir `run/server`; it loads AeroGel from `build/classes` /
   `build/resources` (the `sourceSet`, via `-Dfml.modFolders`), so **the server needs no jar copy** — a rebuild
   + restart is enough. `run/server/mods/` is intentionally empty; Create/Aeronautics/Sable come from `libs/`

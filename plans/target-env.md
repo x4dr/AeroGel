@@ -1,7 +1,7 @@
 # AeroGel — Target Environment
 
-Everything AeroGel builds against. Source of truth: the PrismLauncher instance
-`2026 sinking the kitchen` (NeoForge kitchen-sink pack, Create 6 family).
+Everything AeroGel builds against. Versions are the ones the mod declares and tests against; the jars
+themselves are staged locally per `libs/README.md` and are not committed or redistributed.
 
 ## Version stack
 
@@ -20,19 +20,21 @@ Everything AeroGel builds against. Source of truth: the PrismLauncher instance
 Aeronautics deps (from its `neoforge.mods.toml`): neoforge `[21.1.228,)`, create `[6.0.10,)`,
 sable `[2.0.0,3.0.0)`, simulated `[1.3.2,)`, flywheel client `[1.0.6,)`.
 
-## Instance / paths
+## Local paths
 
-- Instance root: `~/.local/share/PrismLauncher/instances/2026 sinking the kitchen/`
-- Instance mods: `.../.minecraft/mods/` (286+ jars — Create family, AE2, magic, tech, etc.)
-- Client Java (JDK 21): `~/.local/share/PrismLauncher/java/java-runtime-delta/bin/java`
-- Sable natives dir (runtime, auto-extracted): `<gameDir>/.sable/natives/sable_rapier_x86_64_linux.so`
+Kept out of this repo on purpose — per-machine, and not useful to anyone else. Set your own:
+
+- Test client instance: the launcher instance that runs the Create-family pack, used by
+  `scripts/deploy.sh` and `:deployDemo` (override with `-PaerogelInstance=<name>` or `AEROGEL_INSTANCE`).
+- JDK 21 for the build: `JAVA_HOME=... ./gradlew`
+- Sable natives (auto-extracted at runtime): `<gameDir>/.sable/natives/sable_rapier_<platform>.so`
 
 ## Dependency mavens (from the Create Aeronautics team's own build)
 
 Used only as reference; AeroGel compiles against jars staged in `libs/` (see `libs/README.md`).
 
 - `https://maven.createmod.net` → `com.simibubi.create:create-1.21.1:6.0.10-280` (also Ponder, Flywheel)
-- `https://maven.ryanhcode.dev/releases` → `dev.ryanhcode.sable:sable-neoforge-1.21.1:2.0.5`, sable-companion
+- `https://maven.ryanhcode.dev/releases` → `dev.ryanhcode.sable:sable-neoforge-1.21.1:2.0.6`, sable-companion
 - Aeronautics/Simulated/Offroad are ONLY in the bundled jar (not on public maven) → staged from jarjar.
 
 ## Dependency stance
@@ -44,14 +46,13 @@ Create-family integration code; it must be loaded lazily / guarded so absence of
 ## How AeroGel is installed (server AND client)
 
 1. `./gradlew :assemble` → `build/libs/aerogel-1.21.1-<version>.jar`
-2. Client: copy the jar into the **`AeroGelDemo`** Prism instance
-   (`~/.local/share/PrismLauncher/instances/AeroGelDemo/.minecraft/mods/`) — `scripts/deploy.sh` or
-   `./gradlew :deployDemo` does this.
+2. Client: copy the jar into the test client instance's `mods/` folder — `scripts/deploy.sh` or
+   `./gradlew :deployDemo` does this (default instance name `AeroGelDemo`).
 3. Server: the dev server loads AeroGel from `build/classes` / `build/resources` (no jar copy); a dedicated
    server gets the same jar in its `mods/` folder.
 
 Because both sides run the same NeoForge mod (side=BOTH), one jar serves both.
-**`2026 sinking the kitchen` is the source pack the `libs/` jars were staged from — do not deploy there.**
+**Deploy to the dedicated test client instance only, never to the pack the `libs/` jars were staged from.**
 
 ## Verified during setup
 - `./gradlew :compileJava` and `:assemble` succeed with staged libs.
