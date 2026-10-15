@@ -86,6 +86,14 @@ public final class PromotionManager {
      * post-generation cleanup and by {@code VanillaBlockTickMixin} around the block-tick queue -- the two
      * vanilla paths that reach {@code Level.setBlock} after a chunk stopped being a stub. A depth counter
      * rather than a flag because those run on chunk-task workers and the server thread at the same time.
+     *
+     * <p><b>WHITE-BOX.</b> This works by hooking the vanilla paths that write into a chunk after generation
+     * reports done; the flag is only correct while that list stays complete. A vanilla update adding a third
+     * such path puts those writes in the caller queue, where they replay on top of the caller's again and
+     * silently erase blocks -- and the promote probe will not catch it unless the test chunk happens to carry
+     * vegetation at the probe's write height. If that shows up, turn on
+     * {@link #refuseStubWrites} ({@code /aerogel promote refuse true}) instead of extending the hook: refusing
+     * writes has no detection to keep in sync.</p>
      */
     private static final ThreadLocal<int[]> VANILLA_WRITES = ThreadLocal.withInitial(() -> new int[1]);
 

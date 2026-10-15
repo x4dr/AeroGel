@@ -17,6 +17,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * the leaf state back, erasing the block the player put there. Vanilla ordering saves it because the player's
  * edit happens after the tick; our replay is not ordered against it.</p>
  *
+ *
+ * <p><b>WHITE-BOX:</b> this hooks one specific vanilla path. If a future version writes into a
+ * promoted chunk by another route, {@code isVanillaWrite()} stops being a complete answer and the
+ * caller's blocks start being erased again. {@link dev.aerogel.server.PromotionManager#refusesStubWrites}
+ * is the fallback that needs no detection.
  * @see VanillaChunkWriteMixin
  */
 @Mixin(ServerLevel.class)

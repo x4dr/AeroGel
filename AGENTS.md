@@ -206,6 +206,19 @@ all** (server must not choke at ~80 chunks/s swept).
   proxies (fluid does not promote). Only a proxy whose promotion has not started is capped (`MAX_WRITE_LOG=256`);
   writes into a generating chunk, or a real one with replay pending, are logged uncapped and replayed in order
   under `promotion.rate.replayBudgetMs` (1.5 ms/tick, `/aerogel promote replay`), the rest carried to the next tick.
+  **Each chunk's log is two queues, not one** (#16): `vanilla` (this chunk's own terrain, replayed first) and
+  `caller` (the caller's writes, replayed last). Feature placement never reaches the guard — `WorldGenRegion`
+  overrides `setBlock` with a 4-arg signature and writes straight to the chunk — but two vanilla paths do, and
+  used to arrive after the caller's writes and erase them: `LevelChunk.postProcessGeneration`, and the block-tick
+  queue, where a leaf that worldgen placed schedules a decay tick that fires *after* promotion. They are flagged
+  by `mixin/VanillaChunkWriteMixin` / `mixin/VanillaBlockTickMixin` with a thread-local depth. Vanilla writes do
+  not count against the per-chunk drop cap.
+  **This is white-box**: it works by hooking the vanilla paths that write into a chunk after generation reports
+  done. A future vanilla version adding a third such path reintroduces the bug silently — no probe catches it,
+  because the trigger is a vegetated chunk. If that happens, the fallback is `promotion.refuseStubWrites` /
+  `/aerogel promote refuse true`, which has no detection at all: refuse every write into a chunk that is not real
+  terrain instead of deferring it (the placement fails and the actor retries; the chunk is promoted on the first
+  attempt). Default off.
   A **player's** right-click into such a chunk is refused instead (click on it cancelled; placement through a real
   block's face into it: item use denied, block use still runs; item kept, chunk promoted at once; #6), and
   server stop finishes every chunk with pending writes before the save (bounded 10 s, leftovers logged).

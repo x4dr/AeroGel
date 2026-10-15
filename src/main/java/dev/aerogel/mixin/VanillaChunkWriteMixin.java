@@ -16,6 +16,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * other post-generation step — cave-air cleanup and ore/lichen replacement — which does go through
  * {@code Level.setBlock} and would otherwise be replayed on top of a player's block.</p>
  *
+ *
+ * <p><b>WHITE-BOX:</b> this hooks one specific vanilla path. If a future version writes into a
+ * promoted chunk by another route, {@code isVanillaWrite()} stops being a complete answer and the
+ * caller's blocks start being erased again. {@link dev.aerogel.server.PromotionManager#refusesStubWrites}
+ * is the fallback that needs no detection.
  * @see VanillaBlockTickMixin
  */
 @Mixin(LevelChunk.class)
