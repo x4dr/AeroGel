@@ -1,6 +1,6 @@
 # AeroGel — AGENTS.md
 
-## ▶ CURRENT TASK: promotion and gating rewrite — designed, code in flight, nothing verified yet
+## ▶ CURRENT TASK: promotion and gating rewrite — compiles, loads, all probes PASS
 
 The virtual-proxy gate and the client render integration (2026-09-13,
 `plans/proxy-chunk-state-machine.md`) are unchanged and still verified in-game. What is being rewritten is
@@ -24,12 +24,30 @@ makes are:
   right-click, Sable body contact) bypass the budget. `PromotionManager.tick` must therefore run **before**
   `AdaptiveMode.tick`, because the veto reads the queue the refill just wrote.
 
-**Not verified.** No probe has been run against this design. `aerogel.vanillaclient` is **re-specified**
-rather than deleted — an unmodded client's square must now be *paced, not uncapped*, since the defect it used
-to assert (the opt-out subtraction) no longer exists. `aerogel.promote` carries the restored late-batch write
-phase and therefore fails until the write loss in the plan's open questions is diagnosed. The 2026-10-13
-hardening pass is still the last verified state: loads to the main menu on NeoForge **21.1.252 / FML 4.0.44**,
-and `:runServer` + `touch run/server/aerogel.promote` reported **VERDICT PASS**.
+**Verified: compiles, loads, all probes PASS (2026-10-15).** `:compileJava :compileDevJava` clean; the server
+reaches `Done` on NeoForge **21.1.252 / FML 4.0.44**; and every probe in the gate passes —
+`probe`, `promote`, `promotestress`, `writesafety` ×2, `sablebody`, `teleport`, `vanillaclient`, plus the three
+added by this rewrite (`drain`, `stationary`, `independence`). The interesting numbers: `drain` reports peak
+concurrent generation 2 against a cap of 2 with the veto held for 37 ticks, `vanillaclient` the same bound for
+an unmodded client, and `stationary` one burst of 1681 chunks then 0 sent over 400 ticks. `promote` reports
+`missing: none` on both bands with nothing left pending, which closes the late-batch question as probe
+calibration rather than a defect.
+
+**Three probe defects were found and fixed on the way, all older than this rewrite:** `aerogel.teleport` could
+not pass at all (it never declared its player's `mesh_batch` channel, so `optsIn` was false and no zone was ever
+pushed — broken since `adfd53a` inverted that set); `GenerationProbe.checkAdaptiveWindow` passed the veto
+argument as "no linger" where it now means "work outstanding", so its may-stop cases could never pass; and
+`aerogel.vanillaclient` was passing vacuously because nothing was enforcing for it, so its square was never
+gated. `aerogel.drain` and `aerogel.vanillaclient` now fail rather than pass when the veto was never exercised.
+
+**Not covered by any probe**, and therefore still on the in-game list: the refill's calm-threshold bypass
+filling the queue, and the gated-stub count in `PromotionManager.drained`. Both need a player present for
+longer than a `FakePlayer` may stay in the list — `MinecraftServer.tickChildren` calls `synchronizeTime` every
+20 ticks and that NPEs on a player whose connection has no channel, so long-running probes park fakes on a
+18-in-20 duty cycle, which is not enough to let the adaptive window cool.
+
+**Previous verified state** was the 2026-10-13 hardening pass: loads to the main menu and
+`:runServer` + `touch run/server/aerogel.promote` reporting **VERDICT PASS**.
 
 **Posture — work, or crash, never silently nothing.** `aerogel.mixins.json` stays `"required": true` with
 `"defaultRequire": 1` on purpose: a moved injection target is a launch failure, not a silently disabled

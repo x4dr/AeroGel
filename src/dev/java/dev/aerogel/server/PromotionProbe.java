@@ -136,7 +136,10 @@ final class PromotionProbe {
         return present;
     }
 
-    /** #16: sample what actually occupies a few positions whose deferred write did not survive. */
+    /**
+     * #16: sample what actually occupies a few positions whose deferred write did not survive. Air means the
+     * write was never applied; anything else means something was written over it, which is a different bug.
+     */
     private static String missingSummary(int present) {
         if (present == BULK) {
             return "none";
@@ -157,9 +160,29 @@ final class PromotionProbe {
         return samples.toString();
     }
 
+    /** what occupies the late band's missing positions; air means never applied, else overwritten. */
+    private static String lateMissingSummary(int present) {
+        if (present == LATE) {
+            return "none";
+        }
+        List<String> samples = new ArrayList<>();
+        BlockPos.MutableBlockPos at = new BlockPos.MutableBlockPos();
+        for (int y = LATE_Y; y < LATE_Y + LATE_LAYERS && samples.size() < 8; y++) {
+            for (int dx = 0; dx < 16 && samples.size() < 8; dx++) {
+                for (int dz = 0; dz < 16; dz++) {
+                    BlockState s = level.getBlockState(at.set(probe.getMinBlockX() + dx, y, probe.getMinBlockZ() + dz));
+                    if (!s.is(Blocks.EMERALD_BLOCK)) {
+                        samples.add("y" + y + "=" + s.getBlock());
+                        break;
+                    }
+                }
+            }
+        }
+        return samples.toString();
+    }
+
     /** count the late batch: emerald in the LATE band. */
-    private static int latePresent() {
-        int present = 0;
+    private static int latePresent() {        int present = 0;
         BlockPos.MutableBlockPos at = new BlockPos.MutableBlockPos();
         for (int y = LATE_Y; y < LATE_Y + LATE_LAYERS; y++) {
             for (int dx = 0; dx < 16; dx++) {
@@ -198,18 +221,20 @@ final class PromotionProbe {
         if (present > 0 && bulkFirstTick < 0) {
             bulkFirstTick = ticks;
         }
-        if (chunk != null && (present == BULK || ticks > MAX_TICKS)) {
+        if (chunk != null && (present == BULK && latePresent() == LATE || ticks > MAX_TICKS)) {
             BlockState at = level.getBlockState(writePos);
             boolean replayed = at.is(Blocks.STONE);
             int spread = present > 0 ? ticks - bulkFirstTick + 1 : 0;
             boolean realAfter = !(level.getChunk(probe.x, probe.z) instanceof EmptyLevelChunk);
             int late = latePresent();
+            int pending = PromotionManager.debugDeferredWrites(level, probe.toLong());
             LOGGER.info("promote probe: late batch (caller AFTER vanilla) {}/{}", late, LATE);
             boolean pass = replayed && inFlightOk && present == BULK && late == LATE && spread > 1 && realAfter;
             LOGGER.info("promote probe: VERDICT {} — chunk {} real after {} ticks, deferred write replayed={} (block {}); "
-                    + "in-flight read {}; {}/{} in-flight writes landed over {} tick(s); real read after={}; missing: {}",
+                    + "in-flight read {}; {}/{} in-flight writes landed over {} tick(s); real read after={}; "
+                    + "missing: {}; late missing: {}; deferred still pending={}",
                 pass ? "PASS" : "FAIL", probe, ticks, replayed, at.getBlock(), inFlightRead, present, BULK, spread,
-                realAfter, missingSummary(present));
+                realAfter, missingSummary(present), lateMissingSummary(late), pending);
             testPushUp();
             finish(server);
         } else if (ticks > MAX_TICKS) {

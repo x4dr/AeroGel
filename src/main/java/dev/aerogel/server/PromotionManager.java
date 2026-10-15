@@ -966,9 +966,22 @@ public final class PromotionManager {
             && !ProxyChunkGate.isLoadedReal(state.level, chunkPos);
     }
 
-    /** test hook: queue a chunk as if it had lingered (used by the dev-only headless stress probe). */
-    public static void debugEnqueue(ServerLevel lvl, long chunkPos) {
+    /**
+     * Dev hook: how many deferred writes this chunk still has to replay, or 0 when it has none. A probe that
+     * counts blocks in the world cannot tell "deferred, not yet replayed" from "lost", and that distinction is
+     * the whole question in #16.
+     */
+    public static int debugDeferredWrites(ServerLevel lvl, long chunkPos) {
         State state = state(lvl);
+        if (state == null) {
+            return 0;
+        }
+        WriteLog log = state.deferredWrites.get(chunkPos);
+        return log == null ? 0 : log.size();
+    }
+
+    /** test hook: queue a chunk as if it had lingered (used by the dev-only headless stress probe). */
+    public static void debugEnqueue(ServerLevel lvl, long chunkPos) {        State state = state(lvl);
         if (state != null && enabled) {
             // deliberately past the cap: the probe is simulating "these chunks all qualified", and the refill
             // is what would normally decide the set

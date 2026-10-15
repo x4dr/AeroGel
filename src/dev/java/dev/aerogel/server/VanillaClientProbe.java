@@ -52,6 +52,7 @@ final class VanillaClientProbe {
     private static int ticks;
     private static int peakInFlight;
     private static boolean noMeshes;
+    private static boolean parked;
 
     private VanillaClientProbe() {
     }
@@ -86,7 +87,8 @@ final class VanillaClientProbe {
         // a FakePlayer has no connection, so teleportTo is a no-op that NPEs; place it explicitly. pushZones
         // reads player.chunkPosition(), so a fake left at its default position would push a zone elsewhere.
         plain.setPos(center.getMiddleBlockX() + 0.5, 200, center.getMiddleBlockZ() + 0.5);
-        park(server);
+        // added by dutyPark below, not here: a fake cannot be in the player list on a tick where
+        // MinecraftServer.tickChildren calls synchronizeTime, and that is every 20 ticks
         // force-load the square so the chunks become stubs the linger path can see; a FakePlayer requests
         // nothing of its own
         for (int dx = -RADIUS; dx <= RADIUS; dx++) {
@@ -106,6 +108,7 @@ final class VanillaClientProbe {
         if (level == null) {
             return;
         }
+        dutyPark(server);
         ticks++;
         if (ticks > IDLE_TIMEOUT) {
             finish(server, false, "server never went quiet enough to start (still enforcing)");
@@ -139,6 +142,14 @@ final class VanillaClientProbe {
                 finish(server, false, "a client without the mesh_batch channel was treated as mesh-capable (#15)");
                 return;
             }
+            if (peakInFlight == 0) {
+                // nothing was ever gated, so the square generated plainly and this run asserts nothing. That
+                // is what an unengaged gate looks like, and it is the vacuous pass this probe had before the
+                // flag was added to the debugAlwaysOn list.
+                finish(server, false, "no chunk was ever in flight: the gate was never engaged on this square,"
+                    + " so the pacing bound was not exercised");
+                return;
+            }
             finish(server, true, String.format("all %d chunks real, peak concurrent generation %d <= cap %d,"
                 + " no meshes sent", expected, peakInFlight, PromotionManager.maxInFlight()));
             return;
@@ -163,10 +174,27 @@ final class VanillaClientProbe {
 
     private static void park(MinecraftServer server) {
         playerList(server).add(plain);
+        parked = true;
     }
 
-    private static void unpark(MinecraftServer server) {
-        playerList(server).remove(plain);
+    /**
+     * Keep the fake in the player list for 18 of every 20 ticks, and out of it for the two around each
+     * boundary. {@code MinecraftServer.tickChildren} calls {@code synchronizeTime} when
+     * {@code tickCount % 20 == 0}, and that walks every player calling {@code hasChannel} on its connection —
+     * which a fake does not have. Unparking at {@code % 20 == 19} means it is already gone when the boundary
+     * tick arrives.
+     */
+    private static void dutyPark(MinecraftServer server) {
+        boolean want = server.getTickCount() % 20 != 0 && server.getTickCount() % 20 != 19;
+        if (want == parked) {
+            return;
+        }
+        if (want) {
+            playerList(server).add(plain);
+        } else {
+            playerList(server).remove(plain);
+        }
+        parked = want;
     }
 
     private static void finish(MinecraftServer server, boolean pass, String detail) {
@@ -182,7 +210,10 @@ final class VanillaClientProbe {
                 }
             }
         }
-        unpark(server);
+        if (parked) {
+            playerList(server).remove(plain);
+            parked = false;
+        }
         if (plain != null) {
             AdaptiveMode.removePlayer(plain.getUUID());
         }

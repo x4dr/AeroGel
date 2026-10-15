@@ -60,6 +60,11 @@ final class TeleportProbe {
             }
         }
         fake = FakePlayerFactory.get(level, new GameProfile(UUID.fromString("ae0ae0ae-0000-4000-8000-00000000014a"), "aerogel-tp"));
+        // The login cache is a positive set: absence means "no AeroGel channels", and hasAeroGel gates optsIn.
+        // Without this the fake is never opted in, so no zone is pushed and the target is never gated, whatever
+        // the switch says. Every other probe that needs an opted-in player declares it; this one was missed
+        // when the set was inverted.
+        AdaptiveMode.setHasAeroGel(fake, true);
         if (c == null) {
             fail(server, "no three fresh chunks near offset " + OFFSET);
         }

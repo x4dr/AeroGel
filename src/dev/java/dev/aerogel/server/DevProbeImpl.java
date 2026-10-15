@@ -28,6 +28,7 @@ public final class DevProbeImpl implements DevProbe {
             || Files.exists(dir.resolve("aerogel.promote"))
             || Files.exists(dir.resolve("aerogel.promotestress"))
             || Files.exists(dir.resolve("aerogel.writesafety"))
+            || Files.exists(dir.resolve("aerogel.vanillaclient"))
             || Files.exists(dir.resolve("aerogel.sablebody"))) {
             AdaptiveMode.debugAlwaysOn(); // headless probes have no players to opt in
         }

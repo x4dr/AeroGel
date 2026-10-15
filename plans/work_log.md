@@ -73,11 +73,26 @@ Also corrected: `GenerationProbe.checkAdaptiveWindow` was still passing `false` 
 It now tests both directions: a calm window with nothing outstanding stops, and a calm window with work
 outstanding does not.
 
-**Not verified beyond that.** `aerogel.probe`, `aerogel.independence`, `aerogel.vanillaclient` and the
-corrected `aerogel.drain` are the runs so far; the rest of the gate is outstanding.
-`aerogel.vanillaclient` is re-specified (it asserted the opt-out subtraction, which no longer exists) and now
-asserts *paced, not uncapped*. `aerogel.promote` carries the restored late-batch write phase and fails until
-that loss is diagnosed — still open, see `promotion-and-gating-rewrite.md` §Open questions.
+**Verified.** All ten probes in the gate pass: `probe` (5/5 sub-checks), `independence` (all four
+`travel`/`proxy` cells), `drain` (peak concurrent generation 2 against a cap of 2, veto held 37 ticks),
+`stationary` (one burst of 1681 chunks then 0 sent over 400 ticks), `promotestress`, `writesafety` ×2,
+`sablebody`, `teleport`, `promote` (`missing: none` on both bands, nothing left pending) and `vanillaclient`
+(peak 2 against a cap of 2 for an unmodded client).
+
+`aerogel.promote`'s late batch drains fully once the probe stops declaring its verdict the moment the bulk
+finishes, so **the write loss in the plan's open questions was probe calibration, not a defect** — the `#16`
+two-queue split holds, and the bulk band is `6144/6144` with nothing missing.
+
+Three probe defects were found and fixed, all older than this rewrite: `aerogel.teleport` could not pass at all
+(it never declared its player's `mesh_batch` channel, so no zone was ever pushed — broken since `adfd53a`
+inverted that set); `GenerationProbe.checkAdaptiveWindow` passed the veto argument as "no linger" where it now
+means "work outstanding"; and `aerogel.vanillaclient` was passing vacuously because nothing was enforcing for
+it, so its square was never gated. `drain` and `vanillaclient` now fail rather than pass when the veto was never
+exercised.
+
+**Still not covered by any probe**, and on the in-game list: the refill's calm-threshold bypass filling the
+queue, and the gated-stub count in `PromotionManager.drained`. Both need a player present for longer than a
+`FakePlayer` may stay in the player list.
 
 **Also open from this session**: the drain-rate budget needs numbers, stationary sampling is unmeasured, and
 `PromotionManager.sweepInFlight`'s re-promotion of a stalled chunk is a no-op (it calls `promoteImmediate`,
