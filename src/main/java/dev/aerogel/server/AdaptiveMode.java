@@ -4,10 +4,9 @@ import dev.aerogel.common.AeroGelConfig;
 import dev.aerogel.net.ClientSwitchPayload;
 import dev.aerogel.net.MeshBatchPayload;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -31,19 +30,24 @@ import org.slf4j.LoggerFactory;
  * is at or above {@code backlogActivate}, or the smoothed tick time is at or above {@code activateTickMs}.
  * Both inputs are the max over the last {@code windowSeconds}, because a single sample swings across the
  * whole band within a tick (#2). It stops only once both windowed values are back below the deactivate
- * values, {@code holdSeconds} have passed since the last activating sample, <b>and no chunk is
- * mid-linger</b>, so switching to vanilla can never trigger a burst of instant generation.</p>
+ * values, {@code holdSeconds} have passed since the last activating sample, <b>and the promotion queue and
+ * in-flight set are both empty</b>, so switching to vanilla can never trigger a burst of instant generation.
+ * That last condition is read <em>after</em> {@code PromotionManager}'s refill has run for the tick, which is
+ * what makes it meaningful: while the server is calm the refill bypasses the linger threshold, so every stub
+ * that would generate on disengagement is already queued by the time the veto is asked.</p>
  *
- * <p><b>Per-player opt-in.</b> While the server is not enforcing, a player whose client {@code travel}
- * switch is on still gets the lingering gate around them; a player whose {@code travel} switch is off
- * behaves as vanilla (their nearby leftovers are forced to real terrain). Generation is shared, so an
- * opted-out player inside an opted-in zone forces vanilla locally. The client {@code proxy} switch controls
- * whether that player receives/renders proxy meshes at all.</p>
+ * <p><b>Per-player zones.</b> While the server is not enforcing, the gate applies only inside the zone
+ * (Chebyshev {@link PromotionManager#effectiveMaxRange}) of a player whose client {@code travel} switch is
+ * on; everyone else is vanilla. Generation is shared, so a player who declined {@code travel} and stands
+ * inside someone else's opted-in zone is gated anyway -- a preference being overridden, not a void, and a
+ * rendering preference the client {@code proxy} switch ({@link #renders}) already covers. There is
+ * deliberately no opt-out list subtracted from that union: it held most connected players rather than the few
+ * who asked, so it cost more on the idle path than the behaviour it protected was worth.</p>
  *
- * <p><b>Clients without AeroGel</b> (#7) are recorded once at login ({@link #onLogin}) and treated as opted
- * out, even while the server enforces: they get no meshes (the streamer does no work for them) and their zone
- * is vanilla, because a vanilla client has no proxy layer and would otherwise stand at the edge of terrain it
- * can never receive.</p>
+ * <p><b>Clients without AeroGel</b> (#7) are recorded once at login ({@link #onLogin}) and receive no meshes
+ * (the streamer does no work for them), because a vanilla client has no proxy layer to draw them with. Their
+ * chunks are gated and promoted like everyone else's: generation is a server-side cost, and excluding them
+ * would only move the stall to somewhere they cannot see it coming.</p>
  *
  * <p>All state is touched on the server thread.</p>
  */
@@ -73,8 +77,10 @@ public final class AdaptiveMode {
      * event never reached us is never streamed to, instead of being assumed capable.
      */
     private static final Set<UUID> aeroGelClients = new HashSet<>();
+    private static final long[] NO_CENTERS = new long[0];
+    /** one reusable scratch per dimension, so the per-tick zone push allocates nothing in the steady state. */
+    private static final Map<ResourceKey<Level>, Zones> ZONES = new HashMap<>();
     private static int optInCount;
-    private static int optOutCount;
 
     private AdaptiveMode() {
     }
@@ -94,8 +100,8 @@ public final class AdaptiveMode {
         travel.clear();
         proxy.clear();
         aeroGelClients.clear();
+        ZONES.clear();
         optInCount = 0;
-        optOutCount = 0;
         LOGGER.info("adaptive: {} (activate {} ms / backlog {}, deactivate {} ms / backlog {}, hold {} s, window {} s,"
                 + " engage on teleport {})",
             enabled ? "on" : "off", activateTickMs, backlogActivate, deactivateTickMs, backlogDeactivate,
@@ -108,8 +114,8 @@ public final class AdaptiveMode {
         travel.clear();
         proxy.clear();
         aeroGelClients.clear();
+        ZONES.clear();
         optInCount = 0;
-        optOutCount = 0;
     }
 
     public static void tick(MinecraftServer server) {
@@ -121,10 +127,10 @@ public final class AdaptiveMode {
         }
         boolean was = enforcing;
         enforcing = WINDOW.decide(enforcing, Util.getMillis(), backlog(server), server.getCurrentSmoothedTickTime(),
-            PromotionManager.hasLinger());
+            PromotionManager.drained());
         if (enforcing != was) {
             LOGGER.info(enforcing ? "adaptive: enforcing on (backlog {}, tick {} ms over {} s)"
-                    : "adaptive: enforcing off (backlog {}, tick {} ms over {} s, no linger)",
+                    : "adaptive: enforcing off (backlog {}, tick {} ms over {} s, promotion drained)",
                 WINDOW.maxBacklog, String.format("%.1f", WINDOW.maxTickMs), windowSeconds);
         }
         pushZones(server);
@@ -177,7 +183,7 @@ public final class AdaptiveMode {
      * The enforcing decision over a sliding window of samples, kept free of the server so a probe can feed it a
      * synthetic sequence. On: the window's max backlog or max tick time reaches its activate value. Off: both
      * window maxima are at or below the deactivate values, {@code holdSeconds} have passed since the last
-     * activating sample, and no linger counter remains.
+     * activating sample, and the promotion queue is drained.
      */
     static final class Window {
         private record Sample(long ms, int backlog, double tickMs) {
@@ -199,7 +205,7 @@ public final class AdaptiveMode {
             maxTickMs = 0;
         }
 
-        boolean decide(boolean enforcingNow, long nowMs, int backlog, double tickMs, boolean linger) {
+        boolean decide(boolean enforcingNow, long nowMs, int backlog, double tickMs, boolean drained) {
             samples.addLast(new Sample(nowMs, backlog, tickMs));
             while (samples.peekFirst().ms() < nowMs - windowSeconds * 1000L) {
                 samples.removeFirst();
@@ -216,7 +222,7 @@ public final class AdaptiveMode {
             if (!enforcingNow) {
                 return maxBacklog >= backlogActivate || maxTickMs >= activateTickMs;
             }
-            return maxBacklog > backlogDeactivate || maxTickMs > deactivateTickMs || linger
+            return maxBacklog > backlogDeactivate || maxTickMs > deactivateTickMs || !drained
                 || holdRemainingMs(nowMs) > 0;
         }
 
@@ -226,40 +232,72 @@ public final class AdaptiveMode {
         }
     }
 
+    /**
+     * Refills the per-dimension zone scratch from the players who opted in and hands each level its centres.
+     * Runs every tick, so it must not allocate in the steady state: the scratch is refilled in place and the
+     * gate keeps the exact-length array it already has unless the centres actually moved.
+     */
     private static void pushZones(MinecraftServer server) {
         // zones are per-dimension: a player only gates the level they are actually in.
-        Map<ResourceKey<Level>, List<Long>> in = new HashMap<>();
-        Map<ResourceKey<Level>, List<Long>> out = new HashMap<>();
+        for (Zones zones : ZONES.values()) {
+            zones.count = 0;
+        }
+        int optedIn = 0;
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (player.hasDisconnected()) {
+            if (player.hasDisconnected() || !optsIn(player)) {
                 continue;
             }
-            ResourceKey<Level> key = player.level().dimension();
             long center = player.getUUID().equals(teleportPlayer) ? teleportTarget : player.chunkPosition().toLong();
-            if (optsIn(player)) {
-                in.computeIfAbsent(key, k -> new ArrayList<>()).add(center);
-            } else {
-                out.computeIfAbsent(key, k -> new ArrayList<>()).add(center);
-            }
+            ZONES.computeIfAbsent(player.level().dimension(), key -> new Zones()).add(center);
+            optedIn++;
         }
-        optInCount = in.values().stream().mapToInt(List::size).sum();
-        optOutCount = out.values().stream().mapToInt(List::size).sum();
+        optInCount = optedIn;
         int radius = PromotionManager.effectiveMaxRange(server);
         for (ServerLevel level : server.getAllLevels()) {
-            ResourceKey<Level> key = level.dimension();
-            ProxyChunkGate.setAdaptive(level, enforcing, toArray(in.get(key)), toArray(out.get(key)), radius, enabled);
+            Zones zones = ZONES.get(level.dimension());
+            long[] centers = zones == null ? NO_CENTERS : zones.handOver();
+            ProxyChunkGate.setAdaptive(level, enforcing, centers, radius, enabled);
         }
     }
 
-    private static long[] toArray(List<Long> list) {
-        if (list == null) {
-            return new long[0];
+    /**
+     * One dimension's zone centres: a growable scratch the push fills, plus the exact-length array
+     * {@link ProxyChunkGate} is currently holding. Centres move every tick during flight, so the array is
+     * recopied whenever the contents differ -- but a server that is standing still hands back the very same
+     * array and allocates nothing at all. An array that has been handed over is never written to again; the
+     * gate holds it until the next push.
+     */
+    private static final class Zones {
+        private long[] buf = new long[8];
+        private int count;
+        private long[] handed = NO_CENTERS;
+
+        void add(long center) {
+            if (count == buf.length) {
+                buf = Arrays.copyOf(buf, buf.length * 2);
+            }
+            buf[count++] = center;
         }
-        long[] array = new long[list.size()];
-        for (int i = 0; i < array.length; i++) {
-            array[i] = list.get(i);
+
+        /** the exact-length array for the gate: the one it already holds when nothing moved. */
+        long[] handOver() {
+            if (!matches(handed)) {
+                handed = Arrays.copyOf(buf, count);
+            }
+            return handed;
         }
-        return array;
+
+        private boolean matches(long[] array) {
+            if (array.length != count) {
+                return false;
+            }
+            for (int i = 0; i < count; i++) {
+                if (array[i] != buf[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     // ---- queries ----
@@ -272,16 +310,20 @@ public final class AdaptiveMode {
         return enabled;
     }
 
+    /**
+     * True when the adaptive window has no reason to enforce. Read by {@code PromotionManager}'s refill: while
+     * calm the linger threshold is bypassed so the gate can reach a state where it may disengage. A one-tick
+     * lag is harmless — the drain simply waits a tick longer.
+     */
+    public static boolean serverCalm() {
+        return !enforcing;
+    }
+
     /** test hook: force the legacy always-on gate for a headless probe, without touching the config. */
     public static void debugAlwaysOn() {
         enabled = false;
         enforcing = false;
         ProxyChunkGate.setAdaptiveAll(false, false);
-    }
-
-    /** true when this player should use the lingering gate (server-enforced, or they opted in). */
-    public static boolean isOptIn(ServerPlayer player) {
-        return hasAeroGel(player) && (enforcing || travel.getOrDefault(player.getUUID(), false));
     }
 
     private static boolean optsIn(ServerPlayer player) {
@@ -314,8 +356,7 @@ public final class AdaptiveMode {
         } else {
             aeroGelClients.remove(player.getUUID());
             // once per login; absence from the set is now the default, so this cannot be a change-detect
-            LOGGER.info("adaptive: {} joined without AeroGel: no proxy meshes, their zone stays vanilla",
-                player.getGameProfile().getName());
+            LOGGER.info("adaptive: {} joined without AeroGel: no proxy meshes", player.getGameProfile().getName());
         }
     }
 
@@ -415,8 +456,8 @@ public final class AdaptiveMode {
             + String.format("%.1f", activateTickMs) + " / deact " + String.format("%.1f", deactivateTickMs) + ")"
             + ", hold " + String.format("%.1f", WINDOW.holdRemainingMs(Util.getMillis()) / 1000.0) + " s left of "
             + holdSeconds + " s"
-            + ", opt-in " + optInCount + ", opt-out " + optOutCount
-            + ", linger " + (PromotionManager.hasLinger() ? "yes" : "no")
+            + ", opt-in " + optInCount
+            + ", " + PromotionManager.drainState() + " queued/in flight"
             + ", engage on teleport " + (engageOnTeleport ? "on" : "off");
     }
 

@@ -71,7 +71,7 @@ final class TeleportProbe {
         }
         ticks++;
         if (engagedTick < 0) {
-            if (AdaptiveMode.enforcing() || PromotionManager.hasLinger()) {
+            if (AdaptiveMode.enforcing() || !PromotionManager.drained()) {
                 if (ticks > IDLE_TIMEOUT) {
                     fail(server, "server never went idle (still enforcing at start)");
                 }

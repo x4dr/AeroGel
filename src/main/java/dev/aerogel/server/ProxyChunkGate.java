@@ -144,7 +144,6 @@ public final class ProxyChunkGate {
         // adaptive zone state, pushed per level each tick by AdaptiveMode.
         boolean enforcing;
         long[] optInCenters = NO_CENTERS;
-        long[] optOutCenters = NO_CENTERS;
         int zoneRadius;
         boolean adaptiveEnabled = true;
 
@@ -219,16 +218,18 @@ public final class ProxyChunkGate {
         return lvl == null ? null : STATES.get(lvl.dimension());
     }
 
-    /** refresh one level's adaptive zone state; called from {@link AdaptiveMode} each tick. */
-    public static void setAdaptive(ServerLevel lvl, boolean enforcingNow, long[] optIn, long[] optOut,
-        int radius, boolean enabled) {
+    /**
+     * Refresh one level's adaptive zone state; called from {@link AdaptiveMode} each tick. {@code optIn} is
+     * every opted-in player's chunk position in this dimension; the array is owned by the caller and is never
+     * mutated after this call, so the gate can hold the reference until the next push.
+     */
+    public static void setAdaptive(ServerLevel lvl, boolean enforcingNow, long[] optIn, int radius, boolean enabled) {
         State state = state(lvl);
         if (state == null) {
             return;
         }
         state.enforcing = enforcingNow;
         state.optInCenters = optIn;
-        state.optOutCenters = optOut;
         state.zoneRadius = radius;
         state.adaptiveEnabled = enabled;
     }
@@ -238,7 +239,6 @@ public final class ProxyChunkGate {
         for (State state : STATES.values()) {
             state.enforcing = enforcingNow;
             state.optInCenters = NO_CENTERS;
-            state.optOutCenters = NO_CENTERS;
             state.zoneRadius = 0;
             state.adaptiveEnabled = enabled;
         }
@@ -251,8 +251,9 @@ public final class ProxyChunkGate {
 
     /**
      * True when the gate should apply at this position, ignoring the allowed/real classification. While the
-     * server is enforcing this is global; otherwise it is the union of opt-in player zones minus opt-out
-     * player zones (generation is shared, so an opted-out player forces vanilla locally).
+     * server is enforcing this is global -- no zone scan at all; otherwise it is the union of the opted-in
+     * players' zones. Generation is shared, so a player who declined {@code travel} and stands inside one of
+     * those zones is gated too ({@code AdaptiveMode} carries why there is no opt-out subtraction).
      */
     public static boolean isEngaged(ServerLevel lvl, long pos) {
         return isEngaged(state(lvl), pos);
@@ -267,8 +268,7 @@ public final class ProxyChunkGate {
         }
         int x = ChunkPos.getX(pos);
         int z = ChunkPos.getZ(pos);
-        return nearAny(state.optInCenters, x, z, state.zoneRadius)
-            && !nearAny(state.optOutCenters, x, z, state.zoneRadius);
+        return nearAny(state.optInCenters, x, z, state.zoneRadius);
     }
 
     private static boolean nearAny(long[] centers, int x, int z, int radius) {

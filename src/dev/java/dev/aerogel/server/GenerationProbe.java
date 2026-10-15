@@ -186,8 +186,11 @@ final class GenerationProbe {
     }
 
     /**
-     * #7: the login-cached "no AeroGel channel" flag alone turns streaming and opt-in off (the streamer skips a
-     * player on {@code renders}, linger/zones use {@code isOptIn}), and a client switch command sends nothing.
+     * #7: the login-cached "no AeroGel channel" flag alone turns mesh streaming off (the streamer skips a
+     * player on {@code renders}) and refuses a client switch command. The gate has no per-player predicate
+     * left to test: it engages globally while the server enforces and around the players who asked for
+     * {@code travel} otherwise, so the gate half of this check drives {@link ProxyChunkGate#isEngaged}
+     * directly with a pushed zone.
      */
     private void checkVanillaClient() {
         net.minecraft.server.MinecraftServer server = this.level.getServer();
@@ -195,17 +198,28 @@ final class GenerationProbe {
         net.minecraft.commands.CommandSourceStack src = fake.createCommandSourceStack().withSuppressedOutput();
         AdaptiveMode.setHasAeroGel(fake, false);
         AdaptiveMode.setPlayerSwitch(fake, "travel", true);
-        boolean flagDrives = !AdaptiveMode.renders(fake) && !AdaptiveMode.isOptIn(fake);
+        boolean noMeshes = !AdaptiveMode.renders(fake);
         AdaptiveMode.setPlayerSwitch(fake, "travel", false);
         server.getCommands().performPrefixedCommand(src, "aerogel switch travel true");
         boolean switchRefused = !AdaptiveMode.playerSwitch(fake, "travel");
+        // gate half: with no zone pushed the gate is off outside enforcing...
+        int radius = PromotionManager.effectiveMaxRange(server);
+        ChunkPos here = fake.chunkPosition();
+        ProxyChunkGate.setAdaptive(this.level, false, new long[0], radius, true);
+        boolean noZone = !ProxyChunkGate.isEngaged(this.level, here.toLong());
+        // ...and one zone engages it there, and nowhere beyond the zone radius
+        ProxyChunkGate.setAdaptive(this.level, false, new long[] { here.toLong() }, radius, true);
+        boolean zoneEngaged = ProxyChunkGate.isEngaged(this.level, here.toLong())
+            && !ProxyChunkGate.isEngaged(this.level, ChunkPos.asLong(here.x + radius + 1, here.z));
+        ProxyChunkGate.setAdaptiveAll(false, false); // back to the probes' always-engaged gate
         AdaptiveMode.setHasAeroGel(fake, true);
         server.getCommands().performPrefixedCommand(src, "aerogel switch travel true");
-        boolean moddedIn = AdaptiveMode.renders(fake) && AdaptiveMode.isOptIn(fake);
+        boolean withChannel = AdaptiveMode.renders(fake) && AdaptiveMode.playerSwitch(fake, "travel");
         AdaptiveMode.removePlayer(fake.getUUID());
-        LOGGER.info(flagDrives && switchRefused && moddedIn
-            ? "VERDICT: PASS — vanilla client (no channel: no meshes, never opted in, switch refused; with channel: opted in)"
-            : "VERDICT: FAIL — vanilla client flagDrives=" + flagDrives + " switchRefused=" + switchRefused
-                + " moddedIn=" + moddedIn);
+        LOGGER.info(noMeshes && switchRefused && noZone && zoneEngaged && withChannel
+            ? "VERDICT: PASS — vanilla client (no channel: no meshes, switch refused, no gate zone; with channel:"
+                + " meshes and a gate zone " + radius + " chunks)"
+            : "VERDICT: FAIL — vanilla client noMeshes=" + noMeshes + " switchRefused=" + switchRefused
+                + " noZone=" + noZone + " zoneEngaged=" + zoneEngaged + " withChannel=" + withChannel);
     }
 }

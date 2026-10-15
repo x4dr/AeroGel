@@ -1,23 +1,44 @@
 # AeroGel — AGENTS.md
 
-## ▶ CURRENT TASK: hardening pass + release prep — compiles, loads, probes PASS
+## ▶ CURRENT TASK: promotion and gating rewrite — designed, code in flight, nothing verified yet
 
 The virtual-proxy gate and the client render integration (2026-09-13,
-`plans/proxy-chunk-state-machine.md`) are unchanged and still verified in-game. On top of that a
-review-driven hardening pass landed (2026-10-13): immediate promotion is now plain vanilla generation, the
-void plane is deleted, the config is cross-checked, the headless probes are a dev-only source set, and the
-two packet paths are bounded. Verified: the mod loads to the main menu on NeoForge **21.1.252 / FML 4.0.44**,
-and `:runServer` + `touch run/server/aerogel.promote` reports **VERDICT PASS** (write deferred, immediate
-promotion, write replayed). See `plans/work_log.md` for the change list.
+`plans/proxy-chunk-state-machine.md`) are unchanged and still verified in-game. What is being rewritten is
+everything downstream of it: the 2026-10-15 review of #15/#16 found the promotion path built on three
+premises that did not hold. The design is `plans/promotion-and-gating-rewrite.md` and the three changes it
+makes are:
+
+- **The opt-out concept is gone** (#15). There is no opt-out zone list: the gate is global while enforcing,
+  and otherwise the union of the zones of players whose client `travel` switch is on. A player who declined
+  `travel` and stands inside someone else's opted-in zone is gated anyway — generation is shared, so that is
+  a preference being overridden, not a void. The list also cost the most on the idle path precisely because it
+  held most connected players rather than the small opt-in set.
+- **The server never branches on whether a client renders proxies.** `AdaptiveMode.renders` (has the mod and
+  the `proxy` switch on) gates *sending meshes* and nothing else; promotion is a server-side generation
+  decision with no interest in what any client draws. This is what deletes the nearby-leftover arm instead of
+  merely re-pacing it, and with it #15's uncapped generation storm.
+- **The disengage model replaces the linger-counter veto.** Per tick: accrue → refill → drain → *may
+  disengage* → prune. Refill runs before the emptiness check, so "queue empty" can only mean "nothing left to
+  generate", which is why disengaging cannot burst instant generation. Refill bypasses the linger
+  **threshold** while calm, never the budget; only player actions (touchdown, block write, refused
+  right-click, Sable body contact) bypass the budget. `PromotionManager.tick` must therefore run **before**
+  `AdaptiveMode.tick`, because the veto reads the queue the refill just wrote.
+
+**Not verified.** No probe has been run against this design. `aerogel.vanillaclient` is **re-specified**
+rather than deleted — an unmodded client's square must now be *paced, not uncapped*, since the defect it used
+to assert (the opt-out subtraction) no longer exists. `aerogel.promote` carries the restored late-batch write
+phase and therefore fails until the write loss in the plan's open questions is diagnosed. The 2026-10-13
+hardening pass is still the last verified state: loads to the main menu on NeoForge **21.1.252 / FML 4.0.44**,
+and `:runServer` + `touch run/server/aerogel.promote` reported **VERDICT PASS**.
 
 **Posture — work, or crash, never silently nothing.** `aerogel.mixins.json` stays `"required": true` with
 `"defaultRequire": 1` on purpose: a moved injection target is a launch failure, not a silently disabled
-feature, and the config is validated rather than trusted. The flip side is the dormant path — while no
+feature, and the config is validated rather than trusted. The flip side is the gate-off path — while no
 mechanic is enabled or triggered, the mod has to be undetectable, so every hot path keeps its cheap per-level
 fast bail (`ProxyChunkGate.mayHaveProxy` first).
 
-Previous list, still open: in-game verification of detail tiers, adaptive enforcement + automatic promotion
-(`/aerogel adaptive status`, `/aerogel promote status`), then morphing if the pop ever reads badly.
+Previous list, still open: in-game verification of detail tiers, then the rewritten enforcement + promotion
+path (`/aerogel adaptive status`, `/aerogel promote status`), then morphing if the pop ever reads badly.
 
 ## ✅ PERFORMANCE REMEDIATION — 2026-09-13 (all workstreams landed, probes PASS)
 
@@ -28,17 +49,20 @@ committed; the headless gate/promote/stress probes all PASS after the refactor. 
   (`Map<ResourceKey<Level>, State>`); mixins dispatch on the level in scope. Fixes the bug where an overworld
   proxy `(x,z)` was treated as a proxy in the nether/end and `placeholders` returned an overworld chunk.
   Overworld/Nether/End all use `NoiseBasedChunkGenerator`, so all three stream; non-noise dimensions skip.
-- **Dormant fast bail.** `ProxyChunkGate.mayHaveProxy(ServerLevel)` is checked first on the
+- **Gate-off fast bail.** `ProxyChunkGate.mayHaveProxy(ServerLevel)` is checked first on the
   `ServerChunkCache.getChunk` / `Level.setBlock` / `FlowingFluid.spreadTo` hot paths; `isProxy` does the
   cheap set checks before `getChunkNow`. `real`/`allowed`/`proxy` sets are pruned (bounded, 200-tick).
 - **Budgeted promotion plumbing.** `ProxyChunkGate.tick` drains classification completions at ~2 ms/tick and
   chunk resends at ~1 ms/tick (was a raw 4096 cap / inline callback).
-- **Promotion queue** is bounded (oldest non-urgent evicted, urgent never dropped, deferred writes exempt),
-  evicts entries no player has been near for 10 s, and times out stuck `inFlight` (300 ticks).
+- **Promotion queue** was bounded here by an oldest-first eviction scan plus a 10 s no-player-near grace
+  sweep, and stuck `inFlight` entries are timed out (300 ticks). The 2026-10-15 rewrite replaced the
+  eviction with a refill that rebuilds the queue from the nearest candidates each pass — see
+  `plans/promotion-and-gating-rewrite.md`.
 - **Streamer**: `promoteNearBand` renamed **`refineNearBand`** (it is mesh detail refinement, not terrain
   promotion); wanted-list dedup via a per-stream membership set; refinement gated on `mayHaveProxy`.
 - **Client**: per-dimension floor/sea (nether/end get no water classification); sprite caches cleared on
-  resource reload; `proxyPositions` is a locked primitive set; reconciliation early-outs when dormant.
+  resource reload; `proxyPositions` is a locked primitive set; reconciliation early-outs when proxy
+  streaming is off.
 - **Sampler**: point cache bounded per pool (~48 MB/dimension cap) with FIFO eighth-eviction; vertical ceiling
   derived from the dimension's noise settings; biome diagnostic string built once per biome.
 - **Removed dead code**: `ProxyTopology.upsample`, `WireframePayload`, `ViewAreaInvoker` +
@@ -78,13 +102,16 @@ Next session, priority order:
 1. **Verify detail tiers in-game** — tiers render at the sampled tier (`/aerogel detail near 25`;
    `detail neardist 3` for the coarse fan); `/aerogel detail threads 4` under a radius-50 sweep; biome blocks
    on plains/forest/jungle/desert/snow/ocean/windswept hills; F3 biome without generating; `/aerogel detail draw`.
-2. **Verify adaptive enforcement + promotion in-game** — by default AeroGel is dormant: the gate only engages
-   when the chunk-task backlog exceeds `adaptive backlog` (default 64) or tick time hits `activateTickMs`
-   (35 ms), and disengages once the backlog drains **and** no linger counters remain. `/aerogel adaptive status`
-   shows backlog/tick/opt-in/opt-out/linger; `/aerogel switch travel true` opts a client in while the server is
-   not enforcing. Stand still: the chunk under you promotes after ~10 s (`d=0` min), the fringe
-   (view-distance+2 = 12 ch) after ~30 s (max), linearly between (`/aerogel promote status`); touching/landing
-   or a block write generates at once, uncapped. Watch `server tick stall` / `stream perf`. Tune
+2. **Verify the rewritten enforcement + promotion in-game** — the gate is off until the chunk-task backlog
+   exceeds `adaptive backlog` (default 64) or tick time hits `activateTickMs` (35 ms); while it is off it
+   applies inside the zone of every player whose client `travel` switch is on (`/aerogel switch travel true`
+   opts a client in). `/aerogel adaptive status` shows backlog/tick, hold left, the opt-in count and the
+   promotion queue/in-flight its veto reads. Stand still: while the server is busy the chunk under you
+   promotes after ~10 s (`d=0` min), the fringe (view-distance+2 = 12 ch) after ~30 s (max), linearly
+   between; while the server is **calm** the threshold is bypassed and every fresh lingered stub is eligible
+   at once, still paced by `maxInFlight` and the budget (`/aerogel promote status`). Touching/landing, a
+   block write, a refused right-click and Sable body contact generate at once, uncapped. Watch
+   `server tick stall` / `stream perf`. Tune
    `promote range/linger/landing/concurrency/budget/cost` (the budget and concurrency knobs shape **linger**
    promotion only).
 3. **Watch the write→promotion path under a mass write** — an immediate trigger now starts the promotion
@@ -98,10 +125,11 @@ Next session, priority order:
 A NeoForge 1.21.1 mod that stops chunk-load lag when flying Create Aeronautics contraptions very fast.
 Concept: replace the full-chunk pipeline in a fast flight corridor with cheap **coarse proxy terrain** —
 a per-chunk low-detail surface derived from the worldgen noise functions (density/router sampling), streamed
-server→client as tiny height packets. Full chunks are only generated when a player/vehicle lingers (10 s under
-you, 30 s at the generation-range fringe, linear between) or touches the ground. Adaptive by default: the whole
-gate is dormant unless the server is backlogged or a player opts into proxy travel. Priority: **fastness above
-all** (server must not choke at ~80 chunks/s swept).
+server→client as tiny height packets. Full chunks are only generated when a player/vehicle lingers (the
+threshold interpolates from ~10 s under you to ~30 s at the generation-range fringe, and is bypassed
+entirely while the server is calm) or touches the ground. Adaptive by default: the gate is off unless the
+server is backlogged or a player opts into proxy travel. Priority: **fastness above all** (server must not
+choke at ~80 chunks/s swept).
 
 ## Project facts
 
@@ -168,34 +196,63 @@ all** (server must not choke at ~80 chunks/s swept).
 - **Adaptive enforcement**: `server/AdaptiveMode` decides whether the gate applies at all. The server enforces
   globally while the main-thread chunk-task backlog (`ServerChunkCache.getPendingTasksCount()`, max over every
   gated level) is ≥ `backlogActivate` (64) or smoothed tick time ≥ `activateTickMs` (35 ms), both taken as
-  the max over the last `windowSeconds` (5); it stops only once both windowed values fall back below the
-  deactivate values, `holdSeconds` (10) have passed since the last activating sample, **and no linger counters
-  remain** (so switching to vanilla never bursts instant generation, and the state no longer flaps per tick). With
-  `adaptive.engageOnTeleport` (default false, #14) a player teleporting (any `EntityTeleportEvent`: `/tp`, pearl, chorus)
-  to a chunk that is neither loaded nor known disk-FULL engages enforcing before the move, as an activating sample. While not enforcing, a player whose client `travel` switch is on is still gated around them (on a teleport their zone moves to the target before the move, key or not); an
-  opted-out player's zone is vanilla (their leftovers are forced to real terrain), and if both overlap the
-  opted-out zone wins. A player whose client `proxy` switch is off receives no meshes at all. A client without
-  AeroGel can join (the payloads are registered `optional()`, #7): it is recorded once at login and treated as
-  opted out even while the server enforces (no meshes, no streamer work, vanilla zone, client switches refused),
-  and an AeroGel client on a server without the mod sends nothing and leaves the proxy layer idle. See
-  `plans/proxy-chunk-state-machine.md` §Adaptive enforcement.
-- **Promotion**: `server/PromotionManager` + `ProxyChunkGate.promote`. One cumulative per-chunk counter; the
-  threshold interpolates with distance `t(d) = min + (d/maxRange)*(max - min)` (Chebyshev distance to the nearest
-  opt-in player), with both endpoints load-adaptive (idle 10..30 s, busy 20..60 s) and `maxRange` auto =
-  view-distance + 2 (12 ch here). A player's own chunk while flying uses `min`. Touching the surface (landing),
-  a block write, a Sable physics body's section request near the proxy surface (#9; the section stays out of
-  Rapier until real, `sable/PhysicsChunkTicketManagerMixin`, applied only with Sable present), and the leftovers
-  around an opted-out player are **not queued at all**: the chunk goes
-  straight to vanilla generation on the trigger, with no budget, hard gate or `maxInFlight`, deduped only so
-  the same chunk is not started twice (a mass write = one promotion per chunk, not one per write). **Linger
-  promotion is the only paced path**: a token bucket refilled at `maxGenFraction` ms/ms (default 0.5 = at most
-  half the server's wall time) charged `chunkCostMs` per start, blocked while smoothed tick time ≥
-  `hardGateMs`, and bounded by `maxInFlight`; the queue drains strictly nearest-player-first. Promotion **forces the FULL future forward**
+  the max over the last `windowSeconds` (5). It **may** stop only once both windowed values fall back below the
+  deactivate values, `holdSeconds` (10) have passed since the last activating sample, **and the promotion queue
+  and the in-flight set are both empty** — read *after* the refill, so "empty" can only mean "nothing left to
+  generate", which is what makes disengaging safe. The old veto was "no linger counter remains"; universal
+  linger invalidated it, because a predicate on those counters degenerates into "there are players" and pins
+  enforcement on for the rest of the session. With `adaptive.engageOnTeleport` (default false, #14) a player
+  teleporting (any `EntityTeleportEvent`: `/tp`, pearl, chorus) to a chunk that is neither loaded nor known
+  disk-FULL engages enforcing before the move, as an activating sample. While not enforcing, the gate is the
+  **union of the zones of players whose client `travel` switch is on** (on a teleport, an opted-in player's
+  zone moves to the target before the move). There is no opt-out list and no subtraction: a player who
+  declined `travel` and stands inside someone else's opted-in zone is gated anyway — generation is shared,
+  so a preference is being overridden, not a void. `pushZones` reuses a per-dimension scratch and hands the
+  gate the array it already holds unless the centres actually moved, so a server at rest allocates nothing.
+  A player whose client `proxy` switch is off receives no meshes at all, and that is the *only* thing
+  `AdaptiveMode.renders` gates — promotion is a server-side generation decision and takes no interest in
+  what any client draws. A client without AeroGel can join (the payloads are registered `optional()`, #7): it
+  is recorded once at login, receives no meshes and does no streamer work, and its chunks are gated and
+  promoted like everyone else's — excluding a client that cannot see proxies would only move the stall
+  somewhere it cannot be seen coming. An AeroGel client on a server without the mod sends nothing and leaves
+  the proxy layer idle. See `plans/proxy-chunk-state-machine.md` §Adaptive enforcement and
+  `plans/promotion-and-gating-rewrite.md` §1, §4.
+- **Promotion**: `server/PromotionManager` + `ProxyChunkGate.promote`. **Linger is universal and
+  server-side**: every player near a stub accrues, including clients without AeroGel and players whose `proxy`
+  switch is off. One `startLinger` timestamp per stub is written on first approach and refreshed
+  (`lingerSeen`) every tick the stub is near a player, so duration is a subtraction — there is no per-tick
+  counter and no prune sweep; expired entries are dropped lazily when the scan looks at them. An entry with
+  **pending deferred writes** never ages out: its banked duration is the only thing between a player's block
+  placement and being re-lingered from zero. The threshold is distance-dependent,
+  `t(d) = min + (d/maxRange)*(max - min)` (Chebyshev distance to the nearest player), both endpoints
+  load-adaptive (idle 10..30 s, busy 20..60 s), `maxRange` auto = view-distance + 2 (12 ch here). Crossing it
+  makes the chunk a *candidate*.
+  **The queue is a work buffer, not a backlog.** Each refill rebuilds it from the nearest candidates and fills
+  it to a **soft** cap derived from `maxInFlight` (a computed drain-rate cap would couple queue depth to a
+  load-derived rate, a feedback loop inside the component whose job is to break feedback loops), so
+  "nearest discards farthest" is a property of the refill rather than a policy with an eviction scan — no
+  FIFO `order` deque, no `evictOldest`, no no-player-near grace sweep. A chunk with pending deferred writes is
+  never dropped for capacity. Admission requires a **loaded FULL holder**: AeroGel cannot promote a chunk
+  vanilla would not have generated, because promotion allow-lists a position and forces the FULL future on a
+  holder that already exists, so it can never invent a ticket. Anything that misses the cut is still a stub
+  with its `startLinger` intact and re-qualifies on a later pass.
+  **Touching the surface (landing), a block write, a refused right-click (#6) and a Sable physics body's
+  section request near the proxy surface (#9; the section stays out of Rapier until real,
+  `sable/PhysicsChunkTicketManagerMixin`, applied only with Sable present) are not queued at all**: the chunk
+  goes straight to vanilla generation on the trigger, with no budget, hard gate or `maxInFlight`, deduped only
+  so the same chunk is not started twice (a mass write = one promotion per chunk, not one per write). These
+  are the only budget bypasses.
+  **Linger promotion is the only paced path**: a token bucket refilled at `maxGenFraction` ms/ms (default 0.5 =
+  at most half the server's wall time) charged `chunkCostMs` per start, blocked while smoothed tick time ≥
+  `hardGateMs`, and bounded by `maxInFlight`; the queue drains strictly nearest-player-first. While the
+  server is **calm** the linger threshold is bypassed — the budget is not — so every fresh lingered stub is
+  eligible at once and the same pacer decides when each starts. Promotion **forces the FULL future forward**
   from the chunk's persisted status — no backwards reset. `ProxyChunkGate.forcePrepare` first resets the three
   cached futures to the **exact** unloaded sentinel object (`ChunkHolderAccessor.unloadedFuture()`), because
   `updateFutures`'s ENTITY_TICKING branch throws `IllegalStateException` on an identity mismatch (a throw there
   is swallowed, leaving the holder half-demoted and crashing the next vanilla `DistanceManager.runAllUpdates`).
-  `/aerogel generate` is the manual entry point. All knobs live in `config/aerogel-common.toml`
+  `/aerogel generate` is the manual entry point. `PromotionManager.tick` must run **before**
+  `AdaptiveMode.tick` — the veto reads the queue. All knobs live in `config/aerogel-common.toml`
   (`AeroGelConfig`); the client switches/draw radius in `config/aerogel-client.toml` (`AeroGelClientConfig`).
   Cross-field pairs (idle/busy tick time, adaptive activate/deactivate, backlog, linger ordering) are checked at
   server start by `AeroGelConfig.validate()` and corrected with a warning, so a hand-edited file cannot produce
@@ -297,10 +354,12 @@ all** (server must not choke at ~80 chunks/s swept).
     charged per linger promotion; default 100), `promote hardgate <ms>` (linger tick-time brake; default 60),
     `promote replay <ms>` (per-tick wall time for replaying deferred writes; default 1.5),
     `promote status` (effective thresholds, budget, queue/in-flight). Every setter writes the COMMON config.
-    Immediate (touch / write / opt-out) promotion ignores `concurrency`, `budget` and `hardgate` by design.
-  - `/aerogel adaptive status` (backlog/tick now + window max, hold left, opt-in/opt-out/linger),
-    `adaptive activate <1-200 ms>`, `adaptive deactivate <1-200 ms>`, `adaptive backlog <activate>
-    <deactivate>` (default 64/16), `adaptive hold <0-600 s>` (default 10), `adaptive window <0-60 s>` (default 5),
+    Immediate (touch / write / right-click / Sable body) promotion ignores `concurrency`, `budget` and
+    `hardgate` by design.
+  - `/aerogel adaptive status` (backlog/tick now + window max, hold left, opt-in count, and the promotion
+    queue/in-flight the disengage veto reads), `adaptive activate <1-200 ms>`, `adaptive deactivate <1-200 ms>`,
+    `adaptive backlog <activate> <deactivate>` (default 64/16), `adaptive hold <0-600 s>` (default 10),
+    `adaptive window <0-60 s>` (default 5),
     `adaptive teleport <true|false>` (engage on a teleport into maybe-ungenerated land; default false).
   - `draw` is client-only: the server command relays a `ClientSettingPayload` to the player.
 - **Diagnostics**: client `proxy diag` (a `proxy diag:` log line every 5 s, now carrying the renderer signal —
@@ -317,7 +376,10 @@ deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (
 `touch run/server/aerogel.flight` (fast-flight benchmark matrix), `touch run/server/aerogel.writesafety` (#6;
 start twice: player placement refused, then a pending write must survive the stop), `touch
 run/server/aerogel.sablebody` (#9: Sable bodies over proxies promote near the surface, not when flying high),
-`touch run/server/aerogel.teleport` (#14: engage on teleport, real adaptive path; waits for the server to idle).
+`touch run/server/aerogel.teleport` (#14: engage on teleport, real adaptive path; waits for the server to idle),
+`touch run/server/aerogel.vanillaclient` (#15: a client without AeroGel is gated like anyone else, so its
+in-range stubs must enter the paced queue rather than being force-generated — assert *paced, not uncapped*;
+a `FakePlayer` issues no chunk requests, so the probe asserts the mechanism, not the storm).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 
@@ -361,6 +423,9 @@ JAVA_HOME=<jdk21> ./gradlew :runServer    # dev server (boots Create+Aero+Sable)
 - `plans/architecture.md` — the agreed architecture + hard constraints + terms (proxy/corridor/promotion).
 - `plans/proxy-chunk-state-machine.md` — the current virtual-proxy gate design (verified in-game), the
   mechanism, verified vanilla signatures, and the source-level research. Read before touching promotion.
+- `plans/promotion-and-gating-rewrite.md` — the gate model and the disengage model: no opt-out, universal
+  linger, the queue as a work buffer, and why the server must not branch on whether a client renders
+  proxies. Read before touching `AdaptiveMode` or `PromotionManager`.
 - `plans/measurements.md` — the live sampler/streaming measurements (v4 onward).
 - `plans/target-env.md` — exact versions, instance paths, dependency coordinates.
 - `plans/work_log.md` — chronological history + rationale for decisions that are now baked in. History only.
@@ -385,7 +450,7 @@ JAVA_HOME=<jdk21> ./gradlew :runServer    # dev server (boots Create+Aero+Sable)
 3. **Proxy payload + handshake + client quad layer — DONE** (`aerogel:mesh_batch` / `aerogel:mesh_request`),
    one static `VertexBuffer` per chunk + a draw-matrix rise/sink; verified smooth in-game.
 4. **Promotion — DONE** (manual + automatic linger/landing/block-write, verified headless; in-game check
-   pending).
+   pending). **Being rewritten** — see `plans/promotion-and-gating-rewrite.md`; the new model is unverified.
 5. **Chunk lifecycle — DONE** (`ProxyChunkGate`, verified in-game); see `plans/proxy-chunk-state-machine.md`.
 6. **Biome colours + detail tiers — DONE** (client-side tint, textures, nested 5/9/25/81 tiers).
 7. **Verify later in-game:** rider chunk-ticket coordinate space (real vs parked ~20M-block plot position),

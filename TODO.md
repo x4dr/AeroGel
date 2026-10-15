@@ -3,6 +3,29 @@
 Open work that is not yet designed. The design lives in `plans/`; this is the short list of things known to be
 wrong or missing.
 
+## 0. Batch proxy draw calls
+
+`ProxyRenderer` issues **one `VertexBuffer` and one draw call per chunk** — ~1.7k draws/frame at radius 20,
+~40k at radius 100, which is why the radius forecast calls large radii unrenderable. This is the binding
+limit on proxy rendering, not CPU: a player standing still asking for proxies at r=20 pays ~1.7k draws every
+frame indefinitely, and the 0.15 ms/chunk sampling that produced the mesh is long since done.
+
+DH manages this by baking LOD geometry into large combined meshes per level, so many chunks share a draw.
+Do the same:
+
+- **Tile-batch the mid and far field** — 8x8 chunks per buffer, one draw per tile. 1681 draws → ~27 at r=20.
+- **Keep per-chunk buffers for the near field**, where geometry changes often and rebuild granularity matters:
+  a tile rebuild would re-emit 64 chunks of geometry instead of one.
+- Seam walls, tint and the `POSITION_TEX_COLOR` format are unchanged; this is purely how vertices are grouped
+  into buffers.
+
+The real trade: today one chunk's change re-uploads one buffer; with tiling a change rebuilds 64 chunks of
+geometry. Sampling is the expensive part and geometry emission is cheaper, so it should be a smaller spike than
+it looks — but it is a spike, not incremental.
+
+This is the prerequisite for ungated proxy rendering ("player on a tower, fog off, wants the horizon") being
+affordable. See `plans/promotion-and-gating-rewrite.md` §6.
+
 ## 1. Replace the draw-order workaround with a real visibility decision
 
 The renderer paints the proxy layer **before** the terrain (`AFTER_SKY`, depth-tested, depth write off) so

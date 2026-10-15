@@ -21,6 +21,13 @@ import org.slf4j.LoggerFactory;
  * then verifies the write was replayed onto the real terrain. While the promotion is generating it also checks
  * that a main-thread read returns the placeholder at once instead of blocking (#13), and writes more than the
  * 256-per-chunk cap into the chunk, which must all land, replayed over more than one tick (#5). Self-halting.
+ *
+ * <p><b>KNOWN FAILING (#16).</b> The late batch below was last observed landing only partially (267/512,
+ * 257/512 and 70/512 across three runs), so this probe currently FAILs and that question is unresolved:
+ * caller writes issued after a chunk went real are partly lost, and it is not yet established whether that
+ * is AeroGel or vanilla semantics. The probe was reconstructed after being deleted; the run that produced
+ * those numbers and its logs are gone, so the finding is currently unreproducible. Fix or verdict it before
+ * treating a PASS here as meaningful.</p>
  */
 final class PromotionProbe {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.promoteprobe");
@@ -30,6 +37,17 @@ final class PromotionProbe {
     private static final int BULK_Y = 101;
     private static final int BULK_LAYERS = 24;
     private static final int BULK = 16 * 16 * BULK_LAYERS;
+
+    // ---- LATE BATCH (#16) --------------------------------------------------------------------------------
+    // A second, smaller batch written at LATE_TICK, once vanilla's own post-generation / block-tick writes
+    // have already been queued, to exercise the caller-after-vanilla order. Kept well clear of BULK_Y so the
+    // two counts stay independent -- an earlier revision used y=101 and silently overwrote two gold layers,
+    // which looked like 512 lost gold blocks rather than an overlapping band.
+    private static final int LATE_TICK = 20;
+    private static final int LATE_Y = 95;
+    private static final int LATE_LAYERS = 2;
+    private static final int LATE = 16 * 16 * LATE_LAYERS;
+    private static boolean lateWritten;
 
     private static ServerLevel level;
     private static ChunkPos probe;
@@ -133,6 +151,23 @@ final class PromotionProbe {
         return samples.toString();
     }
 
+    /** count the late batch: emerald in the LATE band. */
+    private static int latePresent() {
+        int present = 0;
+        BlockPos.MutableBlockPos at = new BlockPos.MutableBlockPos();
+        for (int y = LATE_Y; y < LATE_Y + LATE_LAYERS; y++) {
+            for (int dx = 0; dx < 16; dx++) {
+                for (int dz = 0; dz < 16; dz++) {
+                    if (level.getBlockState(at.set(probe.getMinBlockX() + dx, y, probe.getMinBlockZ() + dz))
+                        .is(Blocks.EMERALD_BLOCK)) {
+                        present++;
+                    }
+                }
+            }
+        }
+        return present;
+    }
+
     static void tick(MinecraftServer server) {
         if (level == null || probe == null) {
             return;
@@ -141,6 +176,17 @@ final class PromotionProbe {
             write();
         }
         ++ticks;
+        if (!lateWritten && ticks == LATE_TICK) {
+            for (int y = LATE_Y; y < LATE_Y + LATE_LAYERS; y++) {
+                for (int dx = 0; dx < 16; dx++) {
+                    for (int dz = 0; dz < 16; dz++) {
+                        level.setBlock(new BlockPos(probe.getMinBlockX() + dx, y, probe.getMinBlockZ() + dz),
+                            Blocks.EMERALD_BLOCK.defaultBlockState(), 3);
+                    }
+                }
+            }
+            lateWritten = true;
+        }
         LevelChunk chunk = level.getChunkSource().getChunkNow(probe.x, probe.z);
         int present = chunk == null ? 0 : bulkPresent();
         if (present > 0 && bulkFirstTick < 0) {
@@ -151,7 +197,9 @@ final class PromotionProbe {
             boolean replayed = at.is(Blocks.STONE);
             int spread = present > 0 ? ticks - bulkFirstTick + 1 : 0;
             boolean realAfter = !(level.getChunk(probe.x, probe.z) instanceof EmptyLevelChunk);
-            boolean pass = replayed && inFlightOk && present == BULK && spread > 1 && realAfter;
+            int late = latePresent();
+            LOGGER.info("promote probe: late batch (caller AFTER vanilla) {}/{}", late, LATE);
+            boolean pass = replayed && inFlightOk && present == BULK && late == LATE && spread > 1 && realAfter;
             LOGGER.info("promote probe: VERDICT {} — chunk {} real after {} ticks, deferred write replayed={} (block {}); "
                     + "in-flight read {}; {}/{} in-flight writes landed over {} tick(s); real read after={}; missing: {}",
                 pass ? "PASS" : "FAIL", probe, ticks, replayed, at.getBlock(), inFlightRead, present, BULK, spread,

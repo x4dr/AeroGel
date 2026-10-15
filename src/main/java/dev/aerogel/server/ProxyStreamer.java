@@ -496,10 +496,13 @@ public final class ProxyStreamer {
             srv.halt(false);
             return;
         }
-        // 0. adaptive enforcement: decide whether the gate is on at all this tick
-        AdaptiveMode.tick(srv);
-        // 0a. automatic promotion: linger/touch/write -> real chunk, paced by server load
+        // 0. automatic promotion: accrue -> refill -> drain. MUST run before AdaptiveMode: the refill writes
+        // the queue, and AdaptiveMode reads the queue as its disengage veto. Reversed, the veto would see a
+        // queue the refill had not filled yet and could drop the gate on a tick where a stub was about to be
+        // queued -- which is exactly the burst of instant generation the veto exists to prevent.
         PromotionManager.tick(srv);
+        // 0a. adaptive enforcement: decide whether the gate is on at all this tick
+        AdaptiveMode.tick(srv);
         // 0b. classification completions + placeholder cache pruning
         ProxyChunkGate.tick(srv);
         if (!streamEnabled) {

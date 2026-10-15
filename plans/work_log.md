@@ -6,6 +6,71 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-10-15 — promotion and gating rewrite: no opt-out, universal linger, the disengage model
+
+Design: `plans/promotion-and-gating-rewrite.md`. Rewrite of **local** history (nothing pushed), so this is a
+rebase off the upstream tip rather than a set of reverts: `0e4a16b` + the survivors of the 2026-10-15 review.
+
+**Three premises that did not hold, from the #15/#16 review.**
+
+1. **The opted-out arm was queued, then un-queued.** `ad386f1` had it as `enqueue(pos, true)` — the queue,
+   flagged urgent, which existed to make an uncapped queue behave as if it were capped. `f9a8692` deleted the
+   whole `urgent` class, and the same arm became `promoteImmediate`. That un-queuing is the direct ancestor of
+   #15's generation storm: one player's `(2*range+1)^2` square handed to vanilla with no budget, hard gate or
+   concurrency cap.
+2. **Gate engagement and proxy rendering had been fused.** The opted-out arm promoted every nearby proxy, so
+   "gate off" meant "proxies disappear". They are now independent axes: `travel` is a *generation* request,
+   `proxy` is a *rendering* request.
+3. **Opt-out was never needed.** It existed to express "don't gate near people who declined" and carried
+   essentially all of the idle-path cost, because the opt-out list holds *most* connected players while the
+   opt-in list holds the few who asked.
+
+**Decided during the rewrite, not in the original plan.**
+
+- **The server must not branch on whether a client renders proxies.** `AdaptiveMode.renders` gates *sending
+  meshes* and nothing else. An intermediate pass did re-introduce the leftover trigger as a queued arm keyed on
+  `!renders`; it was removed again, because it re-protected the one case the plan had already accepted as lost
+  and because it was the last place a generation decision read a rendering decision. `d3e7e2a` (the opt-out
+  subtraction in `isEngaged`) went with the concept rather than being reverted.
+- **Universal linger invalidated the `hasLinger` veto.** That veto read "some chunk has a linger counter". Once
+  linger accrues for every player it degenerates into "there are players", which pins enforcement on for the
+  rest of the session — the opposite of what it was protecting. The replacement is the **disengage model**:
+  accrue → refill → drain → *may disengage* → prune, where the veto is "queue and in-flight both empty", read
+  *after* the refill.
+- **`PromotionManager.tick` must run before `AdaptiveMode.tick`.** The veto reads the queue the refill writes;
+  in the old order it can see a queue that has not been refilled yet and drop the gate one tick early, which is
+  the burst arriving through the new code instead of around it.
+- **The refill, not an eviction scan, is what makes nearest win.** The queue is rebuilt each pass from the
+  union of what is queued and what just became a candidate, cut to the nearest `queueCap`. `evictOldest`, the
+  FIFO `order` deque and `Promotion` went with it. Two things are never dropped for capacity: a chunk holding a
+  pending deferred write, and a chunk queued by a direct trigger (no linger entry — a player's action is not
+  the refill's to reorder).
+- **Admission requires a loaded FULL holder.** Promotion allow-lists a position and forces the FULL future on a
+  holder that already exists, so AeroGel can never invent a ticket: it cannot generate what vanilla would not
+  have. Without this, fringe chunks at `range = view + 2`, where the player's own ticket demands less than
+  FULL, occupy queue slots they can never use — harmless in a 256-deep queue, fatal in a small work buffer,
+  because the queue then never empties and the gate can never disengage.
+- **Linger duration is a subtraction.** One `lingerStart` timestamp written on first approach (`putIfAbsent`,
+  so a chunk oscillating at the edge of range does not have its bank reset each time it drops out for a tick)
+  plus `lingerSeen` refreshed each tick. The per-tick `addTo` and the every-100-ticks prune sweep both go; the
+  expiry moves to the scan that reads the maps, with a backstop for a level whose players have all left.
+- **The drain brake is derived, not configured**: the tighter of `hardGateMs` and the adaptive activate
+  threshold, so the drain cannot push tick time to the level that would re-engage enforcement. No new knob.
+  The threshold bypasses; **the budget never does** — touchdown, block write, refused right-click and Sable
+  body contact remain the only budget bypasses.
+
+**Not verified.** No probe has been run against this model. `aerogel.vanillaclient` is re-specified (it
+asserted the opt-out subtraction, which no longer exists) and now asserts *paced, not uncapped*. `aerogel.promote`
+carries the restored late-batch write phase and fails until that loss is diagnosed — still open, see
+`promotion-and-gating-rewrite.md` §Open questions.
+
+**Also open from this session**: the drain-rate budget needs numbers, stationary sampling is unmeasured, and
+`PromotionManager.sweepInFlight`'s re-promotion of a stalled chunk is a no-op (it calls `promoteImmediate`,
+which returns early for an already-`allowed` position). The last one was found while reading for the late-batch
+loss and is real but wrong scale for that symptom.
+
+---
+
 ## 2026-10-14 (late night) — engage enforcing on a teleport into fresh land (#14, opt-in)
 
 - **#14 (Maric's decision: "sounds like a config option").** New `adaptive.engageOnTeleport` (default **false**,
