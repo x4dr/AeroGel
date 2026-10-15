@@ -23,9 +23,10 @@
 5. ~~Automatic promotion + block-write guard~~ — DONE (`PromotionManager`, `LevelWriteGuardMixin`); in-game
    verification pending. Immediate promotion is plain vanilla generation (see
    `proxy-chunk-state-machine.md`); linger is budget-paced, and the gate may only disengage once the server is
-   calm **and** the promotion queue and the in-flight set are both empty **and** no fresh gated stub remains in
-   a player's range — read after the refill, so "empty"
-   can only mean "nothing left to generate". Superseded in part by entry 7.
+   calm **and** the promotion queue and the in-flight set are both empty — read after the refill, so "empty"
+   can only mean "nothing left to generate". The adaptive tick is split into `AdaptiveMode.sample` (before the
+   promotion tick) and `AdaptiveMode.decide` (after it) so the refill and the decision read the same window
+   maxima; the count of gated stubs that used to cover the mismatch is gone. Superseded in part by entry 7.
 6. ~~Hardening pass~~ — DONE (2026-10-13). Void plane deleted, config validated, probes moved to the `dev`
    source set, outbound mesh batches split and `mesh_request` rate-limited, promotion de-urgented. Verified:
    loads on NeoForge 21.1.252 and the `aerogel.promote` probe PASSes. See `work_log.md`.
@@ -33,11 +34,10 @@
    global while enforcing, otherwise the union of opted-in `travel` zones), linger is universal and
    server-side, and the server no longer branches on whether a client renders proxies — `AdaptiveMode.renders`
    gates mesh *sending* only, which is what removes the uncapped leftover arm behind #15. The disengage model
-   replaces the `hasLinger` veto: accrue → refill (threshold bypassed while calm, budget never) → drain →
-   may-disengage on queue *and* in-flight empty *and* no fresh gated stub in range → lazy prune.
-   `PromotionManager.tick` must run before
-   `AdaptiveMode.tick`. `vanillaclient` is re-specified to assert *paced, not uncapped*. Design and open
-   questions: `promotion-and-gating-rewrite.md`.
+   replaces the `hasLinger` veto: sample the window → refill (threshold bypassed while calm, budget never) →
+   drain → may-disengage on queue *and* in-flight empty → lazy prune. `AdaptiveMode.sample` runs before
+   `PromotionManager.tick` and `AdaptiveMode.decide` after it. `vanillaclient` is re-specified to assert
+   *paced, not uncapped*. Design and open questions: `promotion-and-gating-rewrite.md`.
 8. **In-game checks** — detail tiers, then the rewritten enforcement + promotion, and the mass-write path. See
    `../AGENTS.md` CURRENT TASK.
 9. **Collider PoC** — feed the low-poly surface into Sable Rapier

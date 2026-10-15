@@ -82,7 +82,7 @@ final class TeleportProbe {
                 }
                 return;
             }
-            AdaptiveMode.setEngageOnTeleport(false);
+            AdaptiveMode.debugSetEngageOnTeleport(false);
             EventHooks.onEntityTeleportCommand(fake, a.getMiddleBlockX(), 200, a.getMiddleBlockZ());
             boolean offEngaged = AdaptiveMode.enforcing() || ProxyChunkGate.isEnforcing(level);
             // exploration mode (client travel) with the key false: the opted-in player's zone must sit at the target
@@ -100,7 +100,7 @@ final class TeleportProbe {
                 fail(server, "opted-in player's target not gated before the move (key false)");
                 return;
             }
-            AdaptiveMode.setEngageOnTeleport(true);
+            AdaptiveMode.debugSetEngageOnTeleport(true);
             EventHooks.onEntityTeleportCommand(fake, b.getMiddleBlockX(), 200, b.getMiddleBlockZ());
             boolean onEngaged = AdaptiveMode.enforcing() && ProxyChunkGate.isEnforcing(level);
             early = "key false -> enforcing " + offEngaged + "; key true -> enforcing before the move " + onEngaged;
@@ -162,7 +162,7 @@ final class TeleportProbe {
     }
 
     private static void finish(MinecraftServer server) {
-        AdaptiveMode.setEngageOnTeleport(original);
+        AdaptiveMode.debugSetEngageOnTeleport(original);
         level = null;
         server.halt(false);
     }

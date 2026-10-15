@@ -37,7 +37,7 @@ import org.slf4j.LoggerFactory;
  *
  * <p>One {@code lingerStart} timestamp per stub is written on first approach and refreshed
  * ({@code lingerSeen}) every tick the stub stays near a player, so a chunk's duration is the subtraction.
- * There is no per-tick counter to maintain and no prune sweep of its own — {@link #expireLinger} retires an
+ * There is no per-tick counter to maintain and no prune sweep of its own — {@link #refill} retires an
  * entry as it stops being seen. Crossing the distance-dependent threshold
  * {@code t(d) = min + (d/maxRange)*(max - min)}, where {@code d} is the Chebyshev distance to the nearest
  * player and both endpoints are interpolated between idle and busy server load, makes a chunk a
@@ -79,11 +79,13 @@ import org.slf4j.LoggerFactory;
  * scalar config stays global. Every method resolves the state from the {@link ServerLevel} in scope, so an
  * overworld position is never treated as a proxy in the nether/end.</p>
  *
- * <p><b>In-flight safety.</b> A promotion handed to {@link ProxyChunkGate#promote} is timed: if its
- * completion callback never fires within {@link #IN_FLIGHT_TIMEOUT_TICKS}, the slot is reclaimed (with a
- * warn), so one stuck future can never stall all promotion. A timed-out chunk with pending deferred writes
- * is re-promoted; otherwise it is dropped (the gate has already allowed the chunk, so vanilla will
- * generate it).</p>
+ * <p><b>In-flight retry.</b> A promotion handed to {@link ProxyChunkGate#promote} stays in the in-flight set
+ * until the chunk is genuinely real. If its completion callback never fires, {@link #retryInFlight} drives the
+ * same chunk again every {@link #IN_FLIGHT_RETRY_TICKS} without releasing the slot — <b>it never concludes
+ * that a generation finished because time passed</b>. Releasing the slot on a timer would let the next tick
+ * start another generation on top of one still running, which is the wrong direction for a server that is
+ * already behind; a stuck chunk holding its slot is loud in the log, whereas an in-flight count drifting below
+ * the number of generations actually running is not.</p>
  *
  * <p>All state is touched on the server thread (tick / player-tick / block-write events).</p>
  */
@@ -136,8 +138,14 @@ public final class PromotionManager {
     private static final int QUEUE_GRACE_TICKS = 200;
     /** how often the queue proximity/eviction sweep runs (ticks). */
     private static final int QUEUE_SWEEP_INTERVAL = 20;
-    /** a promotion whose completion never fires is reclaimed after this many ticks (15 s). */
-    private static final int IN_FLIGHT_TIMEOUT_TICKS = 300;
+    /**
+     * How often a promotion whose completion callback has not fired is driven again. Not a timeout: nothing
+     * is concluded when it elapses, the slot is never released on this signal alone, and the chunk is retried
+     * until it is genuinely real. See {@link #retryInFlight}.
+     */
+    private static int inFlightRetryTicks = 300;
+    /** total retries issued, so a probe can tell the retry path actually ran. */
+    private static int inFlightRetries;
     /** if no promotion has started for this many ticks, start one even under budget/hard-gate pressure. */
     private static final int FORCE_START_TICKS = 200;
     /**
@@ -213,11 +221,6 @@ public final class PromotionManager {
         final List<ServerPlayer> playersScratch = new ArrayList<>();
         /** how many chunks the refill will hold: {@code maxInFlight} plus {@link #QUEUE_HEADROOM}. */
         int queueCap = QUEUE_HEADROOM;
-        /**
-         * Fresh in-range stubs a promotion could still start, counted by {@link #refill} whether or not the
-         * threshold admitted them this tick. Part of the disengage veto: see {@link #drained}.
-         */
-        int unpromoted;
         /** tick the last promotion started; drives the progress guarantee (see FORCE_START_TICKS). */
         int lastStartTick;
 
@@ -408,27 +411,23 @@ public final class PromotionManager {
     }
 
     /**
-     * True when nothing is left for the promotion path to do: no fresh in-range stub a promotion could still
-     * start, and an empty queue and in-flight set. This is the gate's disengage veto.
+     * True when nothing is left for the promotion path to do: no chunk is generating and the queue is empty.
      *
-     * <p><b>Why it counts stubs and not just the queue.</b> The queue alone is not enough, and the drain probe
-     * caught why. The refill reads the window's calm state, which is one tick behind the decision, so on the
-     * tick the server goes calm the refill can still be on the busy path — threshold applied, nothing queued,
-     * queue empty, gate would drop — and the very next tick the calm path queues the whole square. Those
-     * chunks are ungated by then, so they build their own FULL futures: the burst this veto exists to prevent,
-     * arriving one tick late. Counting the stubs that are still gated closes it, and it is the invariant
-     * stated directly rather than by proxy: <b>the gate may not disengage while chunks it gated are still
-     * stub terrain.</b></p>
+     * <p>That is a complete answer <b>only because of the order of a tick</b>, and the order is load-bearing:
+     * the window is sampled first, then {@link #refill} runs, and only then is this asked. The refill below
+     * admits every fresh in-range stub the gate could promote, so an empty queue after it can only mean there
+     * was nothing left to fill from — which is why this needs no separate count of "chunks still gated in
+     * range". If this were asked before the refill, or the refill and the enforcement decision read different
+     * window maxima, it would report "drained" while gated stubs sat there and the gate would drop on them.
+     * See {@code AdaptiveMode.Window.sample} for the tick where that used to happen.</p>
      *
-     * <p>It does not degenerate the way the old {@code hasLinger} veto did. That one was a predicate on the
-     * linger maps, which is "there are players" once linger is universal; this counts real gated terrain, and
-     * it reaches zero because the drain promotes it. It also cannot pin on a chunk vanilla would not have
-     * generated: {@link #refill} only counts positions with a loaded FULL holder, so a fringe stub outside
-     * every ticket's reach is not counted and cannot hold the gate.</p>
+     * <p>It does not degenerate the way the old {@code hasLinger} veto did: that was a predicate on the linger
+     * maps, which is "there are players" once linger is universal. This is about real outstanding work, and it
+     * reaches zero because the drain finishes it.</p>
      */
     public static boolean drained() {
         for (State state : STATES.values()) {
-            if (state.unpromoted > 0 || !state.queue.isEmpty() || !state.inFlight.isEmpty()) {
+            if (!state.queue.isEmpty() || !state.inFlight.isEmpty()) {
                 return false;
             }
         }
@@ -504,10 +503,6 @@ public final class PromotionManager {
 
     private static void tickState(MinecraftServer server, State state) {
         state.tickCounter++;
-        // Reset before every return below, including the !enabled one and the mayHaveProxy guard that skips
-        // the scan. Nothing else clears it, so a stale non-zero count would hold adaptive enforcement on for
-        // the rest of the session.
-        state.unpromoted = 0;
         if (!enabled) {
             return;
         }
@@ -520,20 +515,19 @@ public final class PromotionManager {
         List<ServerPlayer> players = state.playersScratch;
         levelPlayers(server, state.level, players);
         refillBudget(state);
-        sweepInFlight(state);
-        // nothing to linger over when the level has no proxies: skip the (2*range+1)^2 per-player scan entirely.
-        // Expiry runs whenever there could be proxies, because the maps are shared state and a level whose
-        // players have all left would otherwise hold a departed player's whole range indefinitely.
+        retryInFlight(state);
+        // nothing to linger over when the level has no proxies: the per-player scan is skipped, but the refill
+        // below still runs, because retiring a departed player's linger entries is half of what it does.
         if (ProxyChunkGate.mayHaveProxy(state.level)) {
-            expireLinger(state);
             if (!players.isEmpty()) {
                 accumulateLinger(state, players, range);
-                // The refill runs BEFORE anything reads the queue as the disengage veto, and while the server
-                // is calm it bypasses the linger threshold so every fresh stub is eligible at once. That
-                // ordering is the whole reason "queue empty" can only mean "nothing left to generate": a
-                // chunk that would generate on disengagement is in the queue by the time the veto is asked.
-                refill(state, players, range, AdaptiveMode.windowCalm(), minTicks, maxTicks);
             }
+            // The refill runs BEFORE anything reads the queue as the disengage veto, and while the server is
+            // calm it bypasses the linger threshold so every fresh stub is eligible at once. That ordering is
+            // the whole reason "queue empty" can only mean "nothing left to generate": a chunk that would
+            // generate on disengagement is in the queue by the time the veto is asked. It also runs with no
+            // players present, because retiring a departed player's linger entries is half of the same pass.
+            refill(state, players, range, AdaptiveMode.windowCalm(), minTicks, maxTicks);
         }
         if (state.tickCounter % 100 == 0 && System.currentTimeMillis() - lastStatusLog > 30_000) {
             lastStatusLog = System.currentTimeMillis();
@@ -603,7 +597,16 @@ public final class PromotionManager {
     }
 
     /**
-     * Turn the linger maps into a queue, nearest-player-first.
+     * The single pass over the linger map, per tick: retire what has stopped being seen and admit what has
+     * qualified. <b>One scan does both</b>, because the two are the same decision — an entry is either still
+     * near a player, and therefore a candidate, or it is not, and therefore finished. Splitting them means
+     * walking the same map twice and having to keep the two halves in agreement; a chunk's linger is retired
+     * by the same pass that would have enqueued it, and by nothing else. Distance has no hand in it: it
+     * decides the <em>threshold</em>, never whether an entry lives or its clock restarts.
+     *
+     * <p>With no players in the level nothing refreshes {@code lingerSeen}, so every entry ages out here and
+     * the pass admits nothing — which is why it runs whether or not anyone is online, and why the stale case
+     * is not a separate sweep.</p>
      *
      * <p>While the server is <b>calm</b> the linger threshold is bypassed: every stub that is still fresh is
      * eligible immediately, because the gate is trying to reach a state where it can disengage and a stub it
@@ -624,17 +627,29 @@ public final class PromotionManager {
         // one. A chunk queued by a direct trigger -- a write or right-click whose holder was not loaded, so
         // promoteImmediate fell back to the queue -- has no linger entry and is deliberately not seeded: it is
         // a player's action, not the refill's to reorder or drop.
-        for (var entry : state.queue.long2IntEntrySet()) {
-            long pos = entry.getLongKey();
-            if (state.lingerStart.containsKey(pos)) {
-                union.put(pos, nearestDistance(pos, players));
+        if (!players.isEmpty()) {
+            for (var entry : state.queue.long2IntEntrySet()) {
+                long pos = entry.getLongKey();
+                if (state.lingerStart.containsKey(pos)) {
+                    union.put(pos, nearestDistance(pos, players));
+                }
             }
         }
         var it = state.lingerStart.long2IntEntrySet().iterator();
         while (it.hasNext()) {
             var entry = it.next();
             long pos = entry.getLongKey();
-            if (state.queue.containsKey(pos) || state.inFlight.contains(pos)) {
+            if (state.tickCounter - state.lingerSeen.get(pos) > LINGER_GRACE_TICKS) {
+                // Stale: retire it here rather than in a sweep of its own. A chunk holding a deferred write
+                // keeps its clock, because that banked duration is the only thing between a player's block
+                // placement and being re-lingered from zero.
+                if (!state.deferredWrites.containsKey(pos)) {
+                    it.remove();
+                    state.lingerSeen.remove(pos);
+                }
+                continue;
+            }
+            if (players.isEmpty() || state.queue.containsKey(pos) || state.inFlight.contains(pos)) {
                 continue;
             }
             if (!ProxyChunkGate.isProxy(state.level, pos)) {
@@ -646,10 +661,6 @@ public final class PromotionManager {
                 // not have generated either, and admitting it would only occupy a slot it can never use.
                 continue;
             }
-            // Counted whether or not the threshold admits it this tick: it is gated terrain either way, so
-            // the gate may not disengage over it. This is what closes the one-tick hole where the refill is
-            // still on the busy path while the window has already gone calm.
-            state.unpromoted++;
             // the walk above already recorded this tick's distance for every in-range stub; only an entry
             // that is fresh but no longer in range needs the scan
             int distance = state.occupied.get(pos);
@@ -661,6 +672,12 @@ public final class PromotionManager {
                 continue;
             }
             union.put(pos, distance);
+        }
+        // With nobody in the level there is nothing to admit and nothing to cut back to, and applying an
+        // empty union would clear the queue of chunks that are already draining. The walk above has done the
+        // expiry either way, which is the half that has to happen with no players.
+        if (players.isEmpty()) {
+            return;
         }
 
         int cap = state.queueCap;
@@ -709,28 +726,6 @@ public final class PromotionManager {
         }
     }
 
-    /**
-     * Drop linger entries no player has been near for {@link #LINGER_GRACE_TICKS}. This is the only place
-     * they are retired, so it runs every tick a level could hold proxies — not on a sweep interval of its
-     * own, and not only when a player is present, since a level whose players have all left would otherwise
-     * hold a departed player's whole range until someone joined again. {@code lingerStart} is authoritative:
-     * the two maps are written together and retired together.
-     *
-     * <p>A chunk holding a deferred write keeps its clock: that banked duration is the only thing between a
-     * player's block placement and being re-lingered from zero.</p>
-     */
-    private static void expireLinger(State state) {
-        var it = state.lingerStart.long2IntEntrySet().iterator();
-        while (it.hasNext()) {
-            long pos = it.next().getLongKey();
-            if (state.tickCounter - state.lingerSeen.get(pos) > LINGER_GRACE_TICKS
-                && !state.deferredWrites.containsKey(pos)) {
-                it.remove();
-                state.lingerSeen.remove(pos);
-            }
-        }
-    }
-
     /** copy the union's keys and distances into the parallel scratch arrays, growing them if needed. */
     private static int spread(Long2IntOpenHashMap union, State state) {
         if (state.unionPos.length < union.size()) {
@@ -748,12 +743,21 @@ public final class PromotionManager {
     }
 
     /**
-     * Reclaim in-flight slots whose completion callback never fired. Without this a single stuck future
-     * leaves {@code inFlight} at {@code maxInFlight} and all promotion stops forever. A chunk with pending
-     * deferred writes is re-queued urgent (the write must not be lost); a linger-only chunk is dropped —
-     * the gate already allowed it, so vanilla will generate it.
+     * Retry promotions whose completion callback has not fired, and clear the ones that finished anyway.
+     *
+     * <p><b>This must not assume a promotion is done because time has passed.</b> Releasing the slot is what
+     * makes that dangerous: {@code inFlight} is what {@link #processQueue} bounds concurrency on, so freeing a
+     * slot while a generation is still running lets the next tick start another one on top of it — concurrency
+     * climbs past {@code maxInFlight} precisely when the server is already hanging. So the entry stays and so
+     * does the slot, and the gate is asked to drive the same chunk again; it is cleared only once the chunk is
+     * genuinely real. {@code ProxyChunkGate.promote} re-runs {@code forcePrepare}, so asking again is a real
+     * re-drive rather than the no-op {@code promoteImmediate} would be for an already-allowed position.</p>
+     *
+     * <p>The trade: a chunk whose generation is genuinely stuck now holds its concurrency slot and keeps being
+     * retried, instead of quietly letting the in-flight count drift below the number of generations actually
+     * running. A stall is loud in the log; amplification is not.</p>
      */
-    private static void sweepInFlight(State state) {
+    private static void retryInFlight(State state) {
         if (state.inFlightSince.isEmpty()) {
             return;
         }
@@ -761,21 +765,32 @@ public final class PromotionManager {
         while (it.hasNext()) {
             var entry = it.next();
             long pos = entry.getLongKey();
-            if (state.tickCounter - entry.getLongValue() <= IN_FLIGHT_TIMEOUT_TICKS) {
+            if (ProxyChunkGate.isLoadedReal(state.level, pos)) {
+                // it finished, whether or not the callback ever arrived: the slot is genuinely free now
+                it.remove();
+                state.inFlight.remove(pos);
+                LOGGER.warn("promotion of proxy chunk {} finished without clearing its slot; reclaimed",
+                    new ChunkPos(pos));
                 continue;
             }
-            it.remove();
-            state.inFlight.remove(pos);
+            if (state.tickCounter - entry.getLongValue() < inFlightRetryTicks) {
+                continue;
+            }
+            entry.setValue(state.tickCounter);
+            inFlightRetries++;
             WriteLog log = state.deferredWrites.get(pos);
-            if (log != null && !log.isEmpty()) {
-                LOGGER.warn("promotion of proxy chunk {} stalled for {} ticks; re-promoting with {} deferred write(s)",
-                    new ChunkPos(pos), IN_FLIGHT_TIMEOUT_TICKS, log.size());
-                promoteImmediate(state, pos);
-            } else {
-                LOGGER.warn("promotion of proxy chunk {} stalled for {} ticks; dropping it (vanilla will generate)",
-                    new ChunkPos(pos), IN_FLIGHT_TIMEOUT_TICKS);
-                state.lingerStart.remove(pos);
-                state.lingerSeen.remove(pos);
+            LOGGER.warn("promotion of proxy chunk {} has not completed after {} s ({} tick(s)), {} deferred"
+                    + " write(s); asking again, slot stays occupied",
+                new ChunkPos(pos), inFlightRetryTicks / 20, inFlightRetryTicks, log == null ? 0 : log.size());
+            try {
+                if (!ProxyChunkGate.promote(state.level, new ChunkPos(pos), () -> onComplete(state, pos))) {
+                    // most likely no holder reaching FULL any more. Leave the entry so the next pass retries
+                    // rather than forgetting the chunk while its generation may still be running.
+                    LOGGER.warn("re-drive of proxy chunk {} was refused; it stays in flight and is retried",
+                        new ChunkPos(pos));
+                }
+            } catch (Throwable t) {
+                LOGGER.error("failed to re-drive regeneration of proxy chunk {}", new ChunkPos(pos), t);
             }
         }
     }
@@ -966,8 +981,22 @@ public final class PromotionManager {
             && !ProxyChunkGate.isLoadedReal(state.level, chunkPos);
     }
 
+    /** Dev hook: how many retries have been issued, so a probe can tell the retry path ran. */
+    public static int debugInFlightRetries() {
+        return inFlightRetries;
+    }
+
     /**
-     * Dev hook: how many deferred writes this chunk still has to replay, or 0 when it has none. A probe that
+     * Dev hook: shorten the in-flight retry interval so a probe can exercise the retry path during an
+     * ordinary promotion. One tick means every in-flight chunk is re-driven every tick while it generates,
+     * which is the harshest version of what {@link #retryInFlight} does — exactly what a probe needs to find
+     * out whether re-driving a live generation disturbs it.
+     */
+    public static void debugSetInFlightRetryTicks(int ticks) {
+        inFlightRetryTicks = Math.max(1, ticks);
+    }
+
+    /** Dev hook: how many deferred writes this chunk still has to replay, or 0 when it has none. A probe that
      * counts blocks in the world cannot tell "deferred, not yet replayed" from "lost", and that distinction is
      * the whole question in #16.
      */

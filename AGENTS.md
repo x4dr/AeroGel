@@ -17,34 +17,70 @@ makes are:
   the `proxy` switch on) gates *sending meshes* and nothing else; promotion is a server-side generation
   decision with no interest in what any client draws. This is what deletes the nearby-leftover arm instead of
   merely re-pacing it, and with it #15's uncapped generation storm.
-- **The disengage model replaces the linger-counter veto.** Per tick: accrue → refill → drain → *may
-  disengage* → prune. Refill runs before the emptiness check, so "queue empty" can only mean "nothing left to
-  generate", which is why disengaging cannot burst instant generation. Refill bypasses the linger
+- **The disengage model replaces the linger-counter veto.** Per tick: sample the window → retry → accrue →
+  refill → drain → *decide*. Refill runs before the emptiness check, so "queue empty" can only mean "nothing
+  left to generate", which is why disengaging cannot burst instant generation. Refill bypasses the linger
   **threshold** while calm, never the budget; only player actions (touchdown, block write, refused
-  right-click, Sable body contact) bypass the budget. `PromotionManager.tick` must therefore run **before**
-  `AdaptiveMode.tick`, because the veto reads the queue the refill just wrote.
+  right-click, Sable body contact) bypass the budget. The adaptive tick is **split in two** — `AdaptiveMode.sample`
+  before the promotion tick and `AdaptiveMode.decide` after it — because the refill and the decision must read
+  the **same** window maxima. They are a max over `windowSeconds`, so they hold and then step down in one tick;
+  read at two points, the refill saw "busy" and queued nothing while the decision saw "calm" and disengaged,
+  which is the burst. That ordering is what lets the veto be plain "queue and in-flight empty".
 
-**Verified: compiles, loads, all probes PASS (2026-10-15).** `:compileJava :compileDevJava` clean; the server
-reaches `Done` on NeoForge **21.1.252 / FML 4.0.44**; and every probe in the gate passes —
-`probe`, `promote`, `promotestress`, `writesafety` ×2, `sablebody`, `teleport`, `vanillaclient`, plus the three
-added by this rewrite (`drain`, `stationary`, `independence`). The interesting numbers: `drain` reports peak
-concurrent generation 2 against a cap of 2 with the veto held for 37 ticks, `vanillaclient` the same bound for
-an unmodded client, and `stationary` one burst of 1681 chunks then 0 sent over 400 ticks. `promote` reports
-`missing: none` on both bands with nothing left pending, which closes the late-batch question as probe
-calibration rather than a defect.
+**Verified: compiles, loads, probes PASS (2026-10-15).** `:compileJava :compileDevJava` clean; the server
+reaches `Done` on NeoForge **21.1.252 / FML 4.0.44**; and the whole probe set passes, re-run after the
+`AdaptiveMode.sample`/`decide` split, the merged refill and the in-flight retry:
 
-**Three probe defects were found and fixed on the way, all older than this rewrite:** `aerogel.teleport` could
-not pass at all (it never declared its player's `mesh_batch` channel, so `optsIn` was false and no zone was ever
-pushed — broken since `adfd53a` inverted that set); `GenerationProbe.checkAdaptiveWindow` passed the veto
-argument as "no linger" where it now means "work outstanding", so its may-stop cases could never pass; and
-`aerogel.vanillaclient` was passing vacuously because nothing was enforcing for it, so its square was never
-gated. `aerogel.drain` and `aerogel.vanillaclient` now fail rather than pass when the veto was never exercised.
+| probe | result |
+|---|---|
+| `probe` | PASS 5/5, including the reworked adaptive-window check |
+| `drain` | PASS — 25 real, peak concurrent 2 against a cap of 2, veto held 44 ticks |
+| `promotestress` | PASS — 25 real in 60 ticks |
+| `promote` | PASS at `MAX_TICKS = 100` — real at 60 ticks, 6144/6144 writes over 27 ticks, `missing: none`, late 512/512, nothing pending |
+| `vanillaclient` | PASS — 9 real, peak 2 against a cap of 2, no meshes sent |
+| `sablebody` | PASS |
+| `stationary` | PASS — one burst of 1681 chunks, then 0 sent over 400 ticks |
+| `independence` | PASS — all four `travel`/`proxy` combinations |
+| `inflight` | PASS — 9 real despite 65 re-drives, peak 2 against a cap of 2 |
+| `teleport` | PASS — the opted-in target gated before the move, enforcement engaged then self-cleared |
+| `writesafety` ×2 | PASS — placement refused, then a deferred write survives the stop |
 
-**Not covered by any probe**, and therefore still on the in-game list: the refill's calm-threshold bypass
-filling the queue, and the gated-stub count in `PromotionManager.drained`. Both need a player present for
-longer than a `FakePlayer` may stay in the list — `MinecraftServer.tickChildren` calls `synchronizeTime` every
-20 ticks and that NPEs on a player whose connection has no channel, so long-running probes park fakes on a
-18-in-20 duty cycle, which is not enough to let the adaptive window cool.
+`promote` at 100 ticks is the answer to the bound itself: the chunk goes real at 60 ticks, so issue #16's own
+~575-tick estimate for the same work was simply wrong, and the bound is now tight enough to be a tripwire
+rather than a formality.
+
+**Probe rules learned the hard way — every new probe must satisfy these.** A `FakePlayer` may not be in the
+player list on a tick where `MinecraftServer.tickChildren` calls `synchronizeTime`, i.e. `tickCount % 20 == 0`;
+it walks every player calling `hasChannel` on a connection that has none. Long-running probes park on a duty
+cycle, short sequences wait for a window that cannot straddle a boundary. A probe that asserts on the gate's
+per-position state must also **pin the adaptive state** for its duration — a zone gives the gate work to do,
+which can push tick time over `activateTickMs` and stall the probe mid-sequence, and a stalled probe is still a
+parked one. And probes must never call a config-persisting setter: a run that does not reach its cleanup leaves
+the dev instance configured differently, and reads the altered value back as its "original" next time. That is
+what `debugSetHoldSeconds` / `debugSetEngageOnTeleport` / `debugSetActivateThresholds` exist for.
+
+**Two traps in running the suite itself, both of which cost a long misdiagnosis.** A probe that halts the
+server leaves the world lock held briefly, and the next run then dies at boot with
+`DirectoryLock$LockException`; the summary reports *no VERDICT line*, which points at the probe rather than the
+runner. And `timeout` kills the `gradlew` **wrapper**, not the server — the game JVM is a child of the
+persistent Gradle daemon and survives, at 99% CPU and holding the lock, poisoning every later run. Stop it by
+command-line match on **`fml.modFolders`** (not `serverRunProgramArgs`, which matches nothing and makes a
+liveness check silently report zero). Do not clear flag files with a bare `aerogel.*` glob either:
+`aerogel.writesafety.pos` is the state its two runs hand between them, and deleting it makes the probe redo
+its first half for ever while reporting success.
+
+**Probe defects found and fixed on the way, all older than this rewrite:** `aerogel.teleport` could not pass at
+all (it never declared its player's `mesh_batch` channel, so `optsIn` was false and no zone was ever pushed —
+broken since `adfd53a` inverted that set); `GenerationProbe.checkAdaptiveWindow` passed the veto argument as
+"no linger" where it now means "work outstanding", so its may-stop cases could never pass; `aerogel.vanillaclient`
+was passing vacuously because nothing was enforcing for it, so its square was never gated; and `aerogel.promote`
+scored itself the moment the *bulk* band finished, reading the late band mid-replay. `drain`, `vanillaclient`
+and `inflight` now fail rather than pass when the mechanism was never exercised.
+
+**Not covered by any probe**, and therefore on the in-game list: the refill's calm-threshold bypass under real
+play, and the tick order's effect on a live server — both want a player present for longer than a `FakePlayer`
+may stay in the list, so `drain` fills its queue with `debugEnqueue` instead and asserts the veto and the pacing
+rather than the refill itself.
 
 **Previous verified state** was the 2026-10-13 hardening pass: loads to the main menu and
 `:runServer` + `touch run/server/aerogel.promote` reporting **VERDICT PASS**.
@@ -215,13 +251,14 @@ choke at ~80 chunks/s swept).
   globally while the main-thread chunk-task backlog (`ServerChunkCache.getPendingTasksCount()`, max over every
   gated level) is ≥ `backlogActivate` (64) or smoothed tick time ≥ `activateTickMs` (35 ms), both taken as
   the max over the last `windowSeconds` (5). It **may** stop only once both windowed values fall back below the
-  deactivate values, `holdSeconds` (10) have passed since the last activating sample, **the promotion queue and
-  the in-flight set are both empty, and no fresh gated stub remains in a player's range** — read *after* the
-  refill, so "empty" can only mean "nothing left to generate", which is what makes disengaging safe. The last
-  clause is not redundant: the refill reads the window's calm state one tick behind the decision, so on the
-  tick the server goes calm the refill can still be on the busy path with nothing queued, and the very next
-  tick would queue the square after the gate had already dropped. `aerogel.drain` caught exactly that. The gate
-  may simply not disengage while chunks it gated are still stub terrain. The old veto was "no linger counter
+  deactivate values, `holdSeconds` (10) have passed since the last activating sample, **and the promotion queue
+  and the in-flight set are both empty** — read *after* the refill, so "empty" can only mean "nothing left to
+  generate", which is what makes disengaging safe. That is a complete answer only because of the tick order:
+  the window is sampled, then `refill` admits every fresh in-range stub the gate could promote, then the
+  decision is taken. The refill's calm flag used to be recomputed by the decision, so on the tick the window
+  maxima stepped down the refill read "busy", queued nothing, and the decision read "calm" against an empty
+  queue. `aerogel.drain` caught that; `AdaptiveMode.sample`/`decide` is the fix and there is no longer a
+  separate count of gated stubs. The old veto was "no linger counter
   remains"; universal
   linger invalidated it, because a predicate on those counters degenerates into "there are players" and pins
   enforcement on for the rest of the session. With `adaptive.engageOnTeleport` (default false, #14) a player
@@ -274,8 +311,9 @@ choke at ~80 chunks/s swept).
   cached futures to the **exact** unloaded sentinel object (`ChunkHolderAccessor.unloadedFuture()`), because
   `updateFutures`'s ENTITY_TICKING branch throws `IllegalStateException` on an identity mismatch (a throw there
   is swallowed, leaving the holder half-demoted and crashing the next vanilla `DistanceManager.runAllUpdates`).
-  `/aerogel generate` is the manual entry point. `PromotionManager.tick` must run **before**
-  `AdaptiveMode.tick` — the veto reads the queue. All knobs live in `config/aerogel-common.toml`
+  `/aerogel generate` is the manual entry point. The adaptive tick is split — `AdaptiveMode.sample` runs before
+  `PromotionManager.tick`, `AdaptiveMode.decide` after it — so the refill and the disengage decision read the
+  same window maxima; see the disengage model above. All knobs live in `config/aerogel-common.toml`
   (`AeroGelConfig`); the client switches/draw radius in `config/aerogel-client.toml` (`AeroGelClientConfig`).
   Cross-field pairs (idle/busy tick time, adaptive activate/deactivate, backlog, linger ordering) are checked at
   server start by `AeroGelConfig.validate()` and corrected with a warning, so a hand-edited file cannot produce

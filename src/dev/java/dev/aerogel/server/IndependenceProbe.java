@@ -47,6 +47,9 @@ final class IndependenceProbe {
     private static int ticks;
     private static int step;
     private static boolean fails;
+    private static boolean parked;
+    private static double originalActivateTickMs;
+    private static int originalBacklogActivate;
     private static final StringBuilder cells = new StringBuilder();
 
     private IndependenceProbe() {
@@ -54,12 +57,16 @@ final class IndependenceProbe {
 
     static void start(MinecraftServer server) {
         level = server.overworld();
+        originalActivateTickMs = AdaptiveMode.activateTickMs();
+        originalBacklogActivate = AdaptiveMode.backlogActivate();
         player = FakePlayerFactory.get(level,
             new GameProfile(UUID.fromString("ae0ae0ae-0000-4000-8000-0000000007d1"), "aerogel-independence"));
         AdaptiveMode.setHasAeroGel(player, true); // confirmed channel: both switches are meaningful
         ChunkPos spawn = new ChunkPos(level.getSharedSpawnPos());
         player.setPos((spawn.x + OFFSET) * 16.0 + 8.0, 200, (spawn.z + OFFSET) * 16.0 + 8.0);
-        park(server);
+        // NOT parked here: MinecraftServer.tickChildren calls synchronizeTime at tickCount % 20 == 0, and that
+        // walks every player calling hasChannel on its connection, which a fake does not have. The sequence
+        // below needs eight consecutive ticks, so it waits for a window that cannot straddle a boundary.
     }
 
     static void tick(MinecraftServer server) {
@@ -76,6 +83,21 @@ final class IndependenceProbe {
         }
         if (++step > 8) {
             return;
+        }
+        // The eight steps must run on consecutive ticks with the fake parked throughout, or pushZones drops it
+        // and the zone under test disappears. Wait for a window that cannot straddle a synchronizeTime
+        // boundary, then park for the whole sequence and leave.
+        if (!parked) {
+            if (server.getTickCount() % 20 > 9) {
+                step = 0;
+                return;
+            }
+            // Hold enforcement off for the sequence. Having a zone at all gives the streamer and the gate
+            // something to do, which can push tick time over the activate threshold -- and if enforcement
+            // engages mid-sequence the probe stalls *while still parked*, stretching the parked window across a
+            // synchronizeTime boundary. Measured, not assumed: that is how the first two runs died.
+            AdaptiveMode.debugSetActivateThresholds(1000.0, 1_000_000);
+            park(server);
         }
         long here = player.chunkPosition().toLong();
         switch (step) {
@@ -140,6 +162,7 @@ final class IndependenceProbe {
 
     private static void park(MinecraftServer server) {
         playerList(server).add(player);
+        parked = true;
     }
 
     private static void finish(MinecraftServer server, boolean pass, String detail) {
@@ -148,7 +171,11 @@ final class IndependenceProbe {
         } else {
             LOGGER.error("independence probe: VERDICT FAIL — {}", detail);
         }
-        playerList(server).remove(player);
+        if (parked) {
+            playerList(server).remove(player);
+            parked = false;
+        }
+        AdaptiveMode.debugSetActivateThresholds(originalActivateTickMs, originalBacklogActivate);
         AdaptiveMode.removePlayer(player.getUUID());
         level = null;
         player = null;

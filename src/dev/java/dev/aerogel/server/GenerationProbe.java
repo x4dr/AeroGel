@@ -157,17 +157,21 @@ final class GenerationProbe {
         for (int i = 0; i < swing.length * 4; i++, t += 50) {
             int backlog = swing[i % swing.length];
             lastSpike = backlog >= AdaptiveMode.backlogActivate() ? t : lastSpike;
-            boolean next = window.decide(on, t, backlog, 0.0, true); // nothing outstanding: stopping is allowed
+            window.sample(t, backlog, 0.0);
+            boolean next = window.decide(on, t, true); // nothing outstanding: stopping is allowed
             flips += next != on ? 1 : 0;
             on = next;
         }
         boolean heldOn = on && flips == 1;
         long holdMs = Math.max(AdaptiveMode.holdSeconds(), AdaptiveMode.windowSeconds()) * 1000L;
-        boolean stillOnBeforeHold = window.decide(on, lastSpike + holdMs - 50, 0, 0.0, true);
-        boolean offAfter = !window.decide(true, lastSpike + holdMs + 50, 0, 0.0, true);
+        window.sample(lastSpike + holdMs - 50, 0, 0.0);
+        boolean stillOnBeforeHold = window.decide(on, lastSpike + holdMs - 50, true);
+        window.sample(lastSpike + holdMs + 50, 0, 0.0);
+        boolean offAfter = !window.decide(true, lastSpike + holdMs + 50, true);
         // the veto, and the only reason the disengage model is safe: however calm the window, the gate stays
         // on while the queue or the in-flight set is non-empty
-        boolean pendingKeepsOn = window.decide(true, lastSpike + holdMs + 100, 0, 0.0, false);
+        window.sample(lastSpike + holdMs + 100, 0, 0.0);
+        boolean pendingKeepsOn = window.decide(true, lastSpike + holdMs + 100, false);
         boolean pass = heldOn && stillOnBeforeHold && offAfter && pendingKeepsOn;
         LOGGER.info(pass
             ? "VERDICT: PASS — adaptive window (558/0/234/0 swing flips on once, holds " + holdMs / 1000

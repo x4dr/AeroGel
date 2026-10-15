@@ -113,8 +113,8 @@ final class DrainProbe {
             }
             // engage enforcement on the real path (#14), then force-load the square so its holders can reach
             // FULL, and queue it. debugEnqueue is the dev hook that stands in for "these chunks qualified".
-            AdaptiveMode.setHoldSeconds(0);
-            AdaptiveMode.setEngageOnTeleport(true);
+            AdaptiveMode.debugSetHoldSeconds(0);
+            AdaptiveMode.debugSetEngageOnTeleport(true);
             EventHooks.onEntityTeleportCommand(pilot, center.getMiddleBlockX(), 200, center.getMiddleBlockZ());
             if (!AdaptiveMode.enforcing() || !ProxyChunkGate.isEnforcing(level)) {
                 finish(server, false, "enforcement did not engage on a teleport into fresh land (#14)");
@@ -205,8 +205,8 @@ final class DrainProbe {
                 }
             }
         }
-        AdaptiveMode.setHoldSeconds(originalHold);
-        AdaptiveMode.setEngageOnTeleport(originalEngage);
+        AdaptiveMode.debugSetHoldSeconds(originalHold);
+        AdaptiveMode.debugSetEngageOnTeleport(originalEngage);
         if (pilot != null) {
             AdaptiveMode.removePlayer(pilot.getUUID());
         }

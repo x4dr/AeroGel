@@ -142,10 +142,12 @@ actions bypass the budget, and they are not part of this.
 
 Two consequences worth stating rather than discovering:
 
-- The ordering inside a tick is load-bearing. `PromotionManager.tick` must run **before**
-  `AdaptiveMode.tick`, or the veto reads a queue that the drain pass has not refilled yet and drops
-  enforcement one tick early. With universal linger, `PromotionManager` no longer calls into
-  `AdaptiveMode`, so the swap is free.
+- The ordering inside a tick is load-bearing, and `AdaptiveMode`'s tick is split for it. `sample` folds the
+  load sample into the window **before** `PromotionManager.tick`; `decide` makes the enforcement decision
+  **after** it. Both the refill and the decision must read the *same* window maxima — a refill keyed on
+  `enforcing` could never take the calm path (the drain keeps enforcement on by design), and a refill keyed on
+  maxima that the decision has since recomputed disagrees with it on exactly the tick the maxima step down.
+  With the split, "queue empty and in-flight empty" is a complete answer and no stub count is needed.
 - Collapsing the threshold while calm means the fringe promotes on an idle server far sooner than the
   30s `max` would suggest. That is the intent — an idle server can afford the corridor at the paced
   rate, and the pacing is what makes it free — but it does mean a lone idle player is barely gated.
@@ -210,8 +212,8 @@ Per `AGENTS.md`, the posture is compiles / loads / probes PASS. Required before 
 
 - `probe`, `promote`, `promotestress`, `writesafety` (×2), `sablebody`, `teleport`, `vanillaclient` — all
   PASS. `vanillaclient` is re-specified below.
-- New/updated probes for: the drain arm (queued, not immediate); the disengage veto (queue, in-flight and
-  gated stubs, checked after the refill); stationary sampling; gate/proxy independence.
+- New/updated probes for: the drain arm (queued, not immediate); the disengage veto (queue and in-flight
+  empty, checked after the refill); stationary sampling; gate/proxy independence.
 - `promote` carries the restored late-batch write phase and therefore **fails until the write loss is
   diagnosed** — it is not a side quest, it gates the release.
 - Both mixin descriptors re-verified against the NeoForge version in use (done for 21.1.252, recorded in

@@ -35,12 +35,13 @@ rebase off the upstream tip rather than a set of reverts: `0e4a16b` + the surviv
 - **Universal linger invalidated the `hasLinger` veto.** That veto read "some chunk has a linger counter". Once
   linger accrues for every player it degenerates into "there are players", which pins enforcement on for the
   rest of the session — the opposite of what it was protecting. The replacement is the **disengage model**:
-  accrue → refill → drain → *may disengage* → prune, where the veto is "queue and in-flight both empty and no
-  fresh gated stub in a player's range", read
-  *after* the refill.
-- **`PromotionManager.tick` must run before `AdaptiveMode.tick`.** The veto reads the queue the refill writes;
-  in the old order it can see a queue that has not been refilled yet and drop the gate one tick early, which is
-  the burst arriving through the new code instead of around it.
+  sample the window → refill → drain → *decide* → prune, where the veto is "queue and in-flight both empty",
+  read *after* the refill.
+- **`AdaptiveMode`'s tick is split, and the split is what makes the veto sound.** `sample` runs before
+  `PromotionManager.tick`, `decide` after it. The refill and the decision must read the *same* window maxima:
+  read at two points they disagree on the tick the maxima step down, the refill queues nothing as "busy" while
+  the decision sees "calm" against an empty queue, and the gate drops on a square that generates the next tick.
+  With the split, "queue empty and in-flight empty" is a complete answer and no stub count is needed.
 - **The refill, not an eviction scan, is what makes nearest win.** The queue is rebuilt each pass from the
   union of what is queued and what just became a candidate, cut to the nearest `queueCap`. `evictOldest`, the
   FIFO `order` deque and `Promotion` went with it. Two things are never dropped for capacity: a chunk holding a
@@ -61,38 +62,63 @@ rebase off the upstream tip rather than a set of reverts: `0e4a16b` + the surviv
   body contact remain the only budget bypasses.
 
 **Found by the probes.** `aerogel.drain` caught a hole in the veto on its first run: the gate dropped with 25
-gated stubs sitting under the player. The refill keyed "calm" on `!enforcing`, but the drain is *supposed* to
-keep enforcement on until it finishes, so the refill could never take the calm path — nothing was queued, the
-queue read empty, the gate dropped, and the next tick the calm path queued 24 chunks that were ungated by
-then. Two fixes, both needed: the refill now reads the **window's** calm state rather than `enforcing`, and the
-veto counts **gated stubs in range** rather than only the queue and in-flight set. The one-tick staleness on
-the window is inherent (the refill runs first) and is what the count covers.
+gated stubs sitting under the player. Two things were wrong and both had to be fixed.
+
+The first was `calm` keyed on `!enforcing` — but the drain is *supposed* to keep enforcement on until it
+finishes, so the refill could never take the calm path and the gate would stay on for ever with nothing
+draining it. It now reads the window's own calm state.
+
+The second was subtler and is the reason the tick had to be split. `calm` is the window's maxima over
+`windowSeconds`, so it holds steady and then **steps down in a single tick** when the last spike ages out — not
+a gradual decay. `PromotionManager.tick` refilled and read the maxima as of the end of the previous tick;
+`AdaptiveMode.tick` then folded in the new sample and read them again. On the step-down tick those disagree:
+the refill reads "busy", applies the threshold and queues nothing, while the decision reads "calm", finds the
+queue empty and disengages. The next tick the refill queues the square with the gate already off. So
+`AdaptiveMode`'s tick is now `sample` before the promotion tick and `decide` after it, both reading one window,
+and the veto is plain "queue and in-flight empty" with no stub count. An interim version did carry such a
+count, patching the mismatch rather than removing it; that is gone.
 
 Also corrected: `GenerationProbe.checkAdaptiveWindow` was still passing `false` for the veto argument to mean
 "no linger" — under the new reading that means "work outstanding", so its "may stop" cases could never pass.
 It now tests both directions: a calm window with nothing outstanding stops, and a calm window with work
 outstanding does not.
 
-**Verified.** All ten probes in the gate pass: `probe` (5/5 sub-checks), `independence` (all four
-`travel`/`proxy` cells), `drain` (peak concurrent generation 2 against a cap of 2, veto held 37 ticks),
-`stationary` (one burst of 1681 chunks then 0 sent over 400 ticks), `promotestress`, `writesafety` ×2,
-`sablebody`, `teleport`, `promote` (`missing: none` on both bands, nothing left pending) and `vanillaclient`
-(peak 2 against a cap of 2 for an unmodded client).
+**Retry, not timeout.** The in-flight sweep used to conclude that a promotion was finished because time had
+passed, and reclaim its slot. That is the wrong direction on a server already behind: `inFlight` is what
+`processQueue` bounds concurrency on, so freeing a slot lets the next tick start another generation on top of
+one still running. It is now `retryInFlight`: the slot stays occupied, the gate is asked to drive the same
+chunk again every `IN_FLIGHT_RETRY_TICKS` (15 s) with a warning naming the chunk and the delay, and the entry is
+cleared only once the chunk is genuinely real. `aerogel.inflight` forces the interval to one tick — every
+in-flight chunk re-driven every tick — and passes: 9/9 real despite 65 re-drives, peak concurrent 2 against a
+cap of 2. So re-driving a *live* generation through `forcePrepare` does not disturb it, and a retry never frees
+a slot.
 
-`aerogel.promote`'s late batch drains fully once the probe stops declaring its verdict the moment the bulk
-finishes, so **the write loss in the plan's open questions was probe calibration, not a defect** — the `#16`
-two-queue split holds, and the bulk band is `6144/6144` with nothing missing.
+**Verified.** The whole set passes, re-run after the `AdaptiveMode.sample`/`decide` split, the merged refill and
+the in-flight retry: `probe` (5/5, including the reworked window check), `drain` (25 real, peak concurrent 2
+against a cap of 2, veto held 44 ticks), `promotestress` (25 real in 60 ticks), `promote` (real at 60 ticks,
+6144/6144 writes over 27 ticks, `missing: none`, late 512/512, nothing pending — at `MAX_TICKS = 100`),
+`vanillaclient` (9 real, peak 2 against the cap, no meshes), `sablebody`, `stationary` (one burst of 1681
+chunks then 0 over 400 ticks), `independence` (all four `travel`/`proxy` cells), `inflight` (9 real despite 65
+re-drives, peak 2 against the cap), `teleport` and `writesafety` ×2 (placement refused, then a deferred write survives the stop).
 
-Three probe defects were found and fixed, all older than this rewrite: `aerogel.teleport` could not pass at all
-(it never declared its player's `mesh_batch` channel, so no zone was ever pushed — broken since `adfd53a`
-inverted that set); `GenerationProbe.checkAdaptiveWindow` passed the veto argument as "no linger" where it now
-means "work outstanding"; and `aerogel.vanillaclient` was passing vacuously because nothing was enforcing for
-it, so its square was never gated. `drain` and `vanillaclient` now fail rather than pass when the veto was never
-exercised.
+`promote` at 100 ticks settles issue #16's own estimate: the chunk goes real at 60 ticks, so the ~575 ticks
+that body derived from the replay budget was simply wrong, and the bound is now a tripwire rather than a
+formality.
 
-**Still not covered by any probe**, and on the in-game list: the refill's calm-threshold bypass filling the
-queue, and the gated-stub count in `PromotionManager.drained`. Both need a player present for longer than a
-`FakePlayer` may stay in the player list.
+**Probe rules, learned by breaking them.** A `FakePlayer` may not be in the player list on a tick where
+`tickChildren` calls `synchronizeTime` (`tickCount % 20 == 0`) — it walks every player calling `hasChannel` on
+a connection that has none. Long probes park on a duty cycle; short sequences wait for a window that cannot
+straddle a boundary. A probe asserting on the gate's per-position state must also pin the adaptive state for its
+duration, because a zone gives the gate work to do and enforcement engaging mid-sequence stalls the probe while
+it is still parked. And no probe may call a config-persisting setter: a run that misses its cleanup leaves the
+dev instance altered and reads the altered value back as its "original" next time. That is what
+`debugSetHoldSeconds` / `debugSetEngageOnTeleport` / `debugSetActivateThresholds` are for.
+
+Four probe defects were found, all older than this rewrite: `aerogel.teleport` could not pass at all (it never
+declared its player's `mesh_batch` channel, so no zone was ever pushed — broken since `adfd53a` inverted that
+set); `GenerationProbe.checkAdaptiveWindow` passed the veto argument as "no linger" where it now means "work
+outstanding"; `aerogel.vanillaclient` passed vacuously because nothing was enforcing for it; and `aerogel.promote`
+scored itself the moment the bulk band finished, reading the late band mid-replay.
 
 **Also open from this session**: the drain-rate budget needs numbers, stationary sampling is unmeasured, and
 `PromotionManager.sweepInFlight`'s re-promotion of a stalled chunk is a no-op (it calls `promoteImmediate`,

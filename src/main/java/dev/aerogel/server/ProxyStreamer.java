@@ -496,14 +496,16 @@ public final class ProxyStreamer {
             srv.halt(false);
             return;
         }
-        // 0. automatic promotion: accrue -> refill -> drain. MUST run before AdaptiveMode: the refill writes
-        // the queue, and AdaptiveMode reads the queue as its disengage veto. Reversed, the veto would see a
-        // queue the refill had not filled yet and could drop the gate on a tick where a stub was about to be
-        // queued -- which is exactly the burst of instant generation the veto exists to prevent.
+        // 0. adaptive enforcement, phase 1: fold this tick's load sample into the window. Runs before the
+        // promotion tick so the refill and the decision below read the SAME window maxima -- they disagree on
+        // the tick the maxima step down, and the refill's "busy" against the decision's "calm" is the burst.
+        AdaptiveMode.sample(srv);
+        // 0a. automatic promotion: retry -> accrue -> refill -> drain. The refill writes the queue, and the
+        // decision below reads the queue as its disengage veto, so this must sit between the two phases.
         PromotionManager.tick(srv);
-        // 0a. adaptive enforcement: decide whether the gate is on at all this tick
-        AdaptiveMode.tick(srv);
-        // 0b. classification completions + placeholder cache pruning
+        // 0b. adaptive enforcement, phase 2: decide against the queue the refill just wrote
+        AdaptiveMode.decide(srv);
+        // 0c. classification completions + placeholder cache pruning
         ProxyChunkGate.tick(srv);
         if (!streamEnabled) {
             return; // bisect switch: no proxy sampling/sending; the gate and promotion still run

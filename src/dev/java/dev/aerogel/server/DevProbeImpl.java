@@ -51,6 +51,9 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.drain"))) {
             server.execute(() -> DrainProbe.start(server));
         }
+        if (Files.exists(dir.resolve("aerogel.inflight"))) {
+            server.execute(() -> InFlightProbe.start(server));
+        }
         if (Files.exists(dir.resolve("aerogel.stationary"))) {
             server.execute(() -> StationaryProbe.start(server));
         }
@@ -79,6 +82,7 @@ public final class DevProbeImpl implements DevProbe {
         WriteSafetyProbe.tick(server);
         SableBodyProbe.tick(server);
         DrainProbe.tick(server);
+        InFlightProbe.tick(server);
         StationaryProbe.tick(server);
         IndependenceProbe.tick(server);
         VanillaClientProbe.tick(server);

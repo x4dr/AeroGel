@@ -33,12 +33,16 @@ final class PromotionProbe {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.promoteprobe");
     private static final int OFFSET = 3000;
     /**
-     * Raised from 600 (#16's own "probe calibration" note). The replay budget is 1.5 ms/tick and a run
-     * measured ~10.7 writes/tick, so the 6144 bulk writes alone need ~575 ticks: the old cutoff fired a
-     * handful of ticks after they should have finished, which makes a slow host fail and hides whether
-     * anything was actually lost. 2400 leaves room for the late batch and a slow machine.
+     * How long the probe will wait for the writes to land before declaring a failure.
+     *
+     * <p><b>If this starts failing, investigate the delay — do not raise it.</b> This is a performance mod:
+     * a write that takes longer than expected is the finding, and pulling the bound back is how it surfaces.
+     * Raising a timeout to accommodate a suspected delay is the last resort, not the first, and it converts a
+     * real slowdown into a silent one. The earlier note on this issue estimated ~10.7 blocks/tick against the
+     * 1.5 ms/tick replay budget, i.e. ~575 ticks for the 6144 bulk writes; the bound is deliberately far below
+     * that, because if that estimate were right the replay would itself be the thing worth reporting.</p>
      */
-    private static final int MAX_TICKS = 2400;
+    private static final int MAX_TICKS = 100;
     /** in-flight writes: 16x16 columns x 24 layers, far above the 256 cap and above one tick's replay budget. */
     private static final int BULK_Y = 101;
     private static final int BULK_LAYERS = 24;

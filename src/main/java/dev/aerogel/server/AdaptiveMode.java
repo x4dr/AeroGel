@@ -118,16 +118,34 @@ public final class AdaptiveMode {
         optInCount = 0;
     }
 
-    public static void tick(MinecraftServer server) {
+    /**
+     * Phase 1 of the server tick. Folds this tick's load sample into the window and stops there.
+     *
+     * <p>Deliberately split from {@link #decide}: {@code PromotionManager} runs in between, and it reads
+     * {@link #windowCalm()} to decide whether to bypass the linger threshold. Both must read the <b>same</b>
+     * window maxima or they disagree on the tick the maxima step down — see {@link Window#sample}. Must run
+     * before {@code PromotionManager.tick}.</p>
+     */
+    public static void sample(MinecraftServer server) {
         if (!enabled) {
             enforcing = false;
             WINDOW.clear();
+            return;
+        }
+        WINDOW.sample(Util.getMillis(), backlog(server), server.getCurrentSmoothedTickTime());
+    }
+
+    /**
+     * Phase 2 of the server tick. Decides enforcement against the queue {@code PromotionManager} has just
+     * refilled, and pushes the per-level zone state. Must run after {@code PromotionManager.tick}.
+     */
+    public static void decide(MinecraftServer server) {
+        if (!enabled) {
             pushZones(server);
             return;
         }
         boolean was = enforcing;
-        enforcing = WINDOW.decide(enforcing, Util.getMillis(), backlog(server), server.getCurrentSmoothedTickTime(),
-            PromotionManager.drained());
+        enforcing = WINDOW.decide(enforcing, Util.getMillis(), PromotionManager.drained());
         if (enforcing != was) {
             LOGGER.info(enforcing ? "adaptive: enforcing on (backlog {}, tick {} ms over {} s)"
                     : "adaptive: enforcing off (backlog {}, tick {} ms over {} s, promotion drained)",
@@ -198,14 +216,15 @@ public final class AdaptiveMode {
             lastActivatingMs = nowMs;
         }
 
-        void clear() {
-            samples.clear();
-            lastActivatingMs = Long.MIN_VALUE;
-            maxBacklog = 0;
-            maxTickMs = 0;
-        }
-
-        boolean decide(boolean enforcingNow, long nowMs, int backlog, double tickMs, boolean drained) {
+        /**
+         * Fold one sample into the window and recompute its maxima. Separate from {@link #decide} so the whole
+         * tick reads one window: the maxima are a max over the last {@code windowSeconds}, so they hold steady
+         * and then step down in a single tick when the last spike ages out. Refreshing them between the
+         * promotion refill and the enforcement decision made those two read different values on exactly that
+         * tick — the refill saw "busy", applied the linger threshold and queued nothing, while the decision saw
+         * "calm", found the queue empty and disengaged.
+         */
+        void sample(long nowMs, int backlog, double tickMs) {
             samples.addLast(new Sample(nowMs, backlog, tickMs));
             while (samples.peekFirst().ms() < nowMs - windowSeconds * 1000L) {
                 samples.removeFirst();
@@ -219,6 +238,16 @@ public final class AdaptiveMode {
             if (backlog >= backlogActivate || tickMs >= activateTickMs) {
                 lastActivatingMs = nowMs;
             }
+        }
+
+        void clear() {
+            samples.clear();
+            lastActivatingMs = Long.MIN_VALUE;
+            maxBacklog = 0;
+            maxTickMs = 0;
+        }
+
+        boolean decide(boolean enforcingNow, long nowMs, boolean drained) {
             if (!enforcingNow) {
                 return maxBacklog >= backlogActivate || maxTickMs >= activateTickMs;
             }
@@ -411,6 +440,32 @@ public final class AdaptiveMode {
         holdSeconds = Math.clamp(seconds, 0, 600);
         AeroGelConfig.CFG.adaptiveHoldSeconds.set(holdSeconds);
         AeroGelConfig.SPEC.save();
+    }
+
+    /**
+     * Dev hook: set the hold without writing it back to the config. Probes must use this rather than
+     * {@link #setHoldSeconds}: that one persists, so a probe that sets a value and does not reach its cleanup
+     * — a crash, a timeout, a halt — leaves the dev instance configured differently, and the next run reads the
+     * altered value as its "original" and preserves it.
+     */
+    public static void debugSetHoldSeconds(int seconds) {
+        holdSeconds = Math.clamp(seconds, 0, 600);
+    }
+
+    /** Dev hook: see {@link #debugSetHoldSeconds}. */
+    public static void debugSetEngageOnTeleport(boolean on) {
+        engageOnTeleport = on;
+    }
+
+    /**
+     * Dev hook: raise the activate thresholds out of reach so enforcement cannot engage for the duration of a
+     * probe, without persisting them. A probe that reads the gate's per-position state has to keep the server
+     * out of global enforcement, and it must not do that by borrowing {@link #debugAlwaysOn} — that sets
+     * {@code adaptiveEnabled} false, which makes every position engaged and destroys the thing being measured.
+     */
+    public static void debugSetActivateThresholds(double tickMs, int backlog) {
+        activateTickMs = tickMs;
+        backlogActivate = backlog;
     }
 
     public static void setWindowSeconds(int seconds) {
