@@ -34,6 +34,12 @@ public class LevelWriteGuardMixin {
         if (!ProxyChunkGate.mayHaveProxy(serverLevel)) {
             return; // dormant level: no proxy and not engaged -> vanilla write
         }
+        if (PromotionManager.refuseStubWrite(serverLevel, pos)) {
+            // server-owner mode: the write did not happen, so tell the caller so. Placing/piston/deployer
+            // retry against real terrain; the chunk was promoted above, so the next attempt succeeds.
+            cir.setReturnValue(false);
+            return;
+        }
         if (PromotionManager.tryDeferWrite(serverLevel, pos, state, flags)) {
             cir.setReturnValue(true);
         }

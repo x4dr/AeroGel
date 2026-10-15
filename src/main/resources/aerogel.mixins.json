@@ -9,7 +9,9 @@
     "FlowingFluidMixin",
     "LevelWriteGuardMixin",
     "ServerChunkCachePlaceholderMixin",
-    "ServerGamePacketListenerImplMixin"
+    "ServerGamePacketListenerImplMixin",
+    "VanillaBlockTickMixin",
+    "VanillaChunkWriteMixin"
   ],
   "client": [
     "LevelRendererAccessor",

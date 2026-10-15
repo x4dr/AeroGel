@@ -187,6 +187,9 @@ public final class ServerHandlers {
                     .then(Commands.literal("replay")
                         .then(Commands.argument("ms", DoubleArgumentType.doubleArg(0.1, 50.0))
                             .executes(ctx -> setReplay(ctx, DoubleArgumentType.getDouble(ctx, "ms")))))
+                    .then(Commands.literal("refuse")
+                        .then(Commands.argument("state", BoolArgumentType.bool())
+                            .executes(ctx -> setRefuseStubWrites(ctx, BoolArgumentType.getBool(ctx, "state")))))
                     .then(Commands.literal("status")
                         .executes(ServerHandlers::promoteStatus)))
                 .then(Commands.literal("adaptive")
@@ -266,6 +269,13 @@ public final class ServerHandlers {
     private static int setThreads(CommandContext<CommandSourceStack> ctx, int count) {
         ProxyStreamer.setThreads(count);
         ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: sampler threads = " + ProxyStreamer.threads()), false);
+        return 1;
+    }
+
+    private static int setRefuseStubWrites(CommandContext<CommandSourceStack> ctx, boolean on) {
+        PromotionManager.setRefuseStubWrites(on);
+        ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: refusing writes into not-yet-generated chunks = "
+            + (on ? "on (placements fail until the chunk is real)" : "off (writes are deferred and replayed)")), false);
         return 1;
     }
 

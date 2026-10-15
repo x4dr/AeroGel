@@ -1,5 +1,7 @@
 package dev.aerogel.server;
 
+import java.util.ArrayList;
+import java.util.List;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -48,7 +50,7 @@ final class PromotionProbe {
         // keeping the probe repeatable without wiping the world (asked from disk directly: the first read of an
         // on-disk chunk may be the placeholder while the async disk check runs)
         for (int i = 0; i < 64 && probe == null; i++) {
-            ChunkPos candidate = new ChunkPos(spawn.x + OFFSET + i * 32, spawn.z + OFFSET);
+            ChunkPos candidate = new ChunkPos(spawn.x + OFFSET + i * 32, spawn.z - OFFSET - 4000);
             if (level.getChunkSource().chunkMap.read(candidate).join().isEmpty()) {
                 level.setChunkForced(candidate.x, candidate.z, true);
                 level.getChunk(candidate.x, candidate.z);
@@ -110,6 +112,27 @@ final class PromotionProbe {
         return present;
     }
 
+    /** #16: sample what actually occupies a few positions whose deferred write did not survive. */
+    private static String missingSummary(int present) {
+        if (present == BULK) {
+            return "none";
+        }
+        List<String> samples = new ArrayList<>();
+        BlockPos.MutableBlockPos at = new BlockPos.MutableBlockPos();
+        for (int y = BULK_Y; y < BULK_Y + BULK_LAYERS && samples.size() < 8; y++) {
+            for (int dx = 0; dx < 16 && samples.size() < 8; dx++) {
+                for (int dz = 0; dz < 16; dz++) {
+                    BlockState s = level.getBlockState(at.set(probe.getMinBlockX() + dx, y, probe.getMinBlockZ() + dz));
+                    if (!s.is(Blocks.GOLD_BLOCK)) {
+                        samples.add("y" + y + "=" + s.getBlock());
+                        break;
+                    }
+                }
+            }
+        }
+        return samples.toString();
+    }
+
     static void tick(MinecraftServer server) {
         if (level == null || probe == null) {
             return;
@@ -130,8 +153,9 @@ final class PromotionProbe {
             boolean realAfter = !(level.getChunk(probe.x, probe.z) instanceof EmptyLevelChunk);
             boolean pass = replayed && inFlightOk && present == BULK && spread > 1 && realAfter;
             LOGGER.info("promote probe: VERDICT {} — chunk {} real after {} ticks, deferred write replayed={} (block {}); "
-                    + "in-flight read {}; {}/{} in-flight writes landed over {} tick(s); real read after={}",
-                pass ? "PASS" : "FAIL", probe, ticks, replayed, at.getBlock(), inFlightRead, present, BULK, spread, realAfter);
+                    + "in-flight read {}; {}/{} in-flight writes landed over {} tick(s); real read after={}; missing: {}",
+                pass ? "PASS" : "FAIL", probe, ticks, replayed, at.getBlock(), inFlightRead, present, BULK, spread,
+                realAfter, missingSummary(present));
             testPushUp();
             finish(server);
         } else if (ticks > MAX_TICKS) {

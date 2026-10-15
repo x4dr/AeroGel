@@ -25,6 +25,7 @@ public final class AeroGelConfig {
     // promotion
     public final ModConfigSpec.BooleanValue promotionEnabled;
     public final ModConfigSpec.DoubleValue landingMargin;
+    public final ModConfigSpec.BooleanValue refuseStubWrites;
     public final ModConfigSpec.IntValue maxRange;
     public final ModConfigSpec.IntValue lingerMinIdleSeconds;
     public final ModConfigSpec.IntValue lingerMinBusySeconds;
@@ -80,6 +81,13 @@ public final class AeroGelConfig {
         maxRange = b.comment("How far out (chunks) a proxy can be linger-promoted. -1 = auto: server view-distance + 2,")
             .comment("the radius at which vanilla actually generates FULL chunks.")
             .defineInRange("maxRange", -1, -1, 64);
+
+        refuseStubWrites = b.comment("Server-owner opt-in: REFUSE every block write into a chunk that is not real")
+            .comment("terrain yet, instead of deferring and replaying it. Placement simply fails and the actor")
+            .comment("(player, piston, deployer) retries; the chunk is still promoted on the first attempt.")
+            .comment("Off = defer (a build made in flight survives). On = nothing is ever lost or reordered,")
+            .comment("at the cost of placements failing while the chunk generates (#16).")
+            .define("refuseStubWrites", false);
 
         b.comment("Linger time by distance: a proxy chunk accrues one tick per tick a player is within maxRange,")
             .comment("and is promoted once the counter reaches t(d) = min + (d/maxRange)*(max - min), where d is the")

@@ -80,6 +80,31 @@ public final class PromotionManager {
     private static final int MAX_LINGER_TICKS_LIMIT = 20 * 600;
     private static final int LINGER_GRACE_TICKS = 40;
     private static final int MAX_WRITE_LOG = 256;
+
+    /**
+     * Depth of vanilla-initiated writes on this thread (#16). Set by {@code VanillaChunkWriteMixin} around
+     * post-generation cleanup and by {@code VanillaBlockTickMixin} around the block-tick queue -- the two
+     * vanilla paths that reach {@code Level.setBlock} after a chunk stopped being a stub. A depth counter
+     * rather than a flag because those run on chunk-task workers and the server thread at the same time.
+     */
+    private static final ThreadLocal<int[]> VANILLA_WRITES = ThreadLocal.withInitial(() -> new int[1]);
+
+    /** called by the mixins; pair every call with {@link #popVanillaWrite()}. */
+    public static void pushVanillaWrite() {
+        VANILLA_WRITES.get()[0]++;
+    }
+
+    public static void popVanillaWrite() {
+        int[] depth = VANILLA_WRITES.get();
+        if (depth[0] > 0) {
+            depth[0]--;
+        }
+    }
+
+    /** true when the write in flight is vanilla fixing up a chunk rather than a caller changing it. */
+    static boolean isVanillaWrite() {
+        return VANILLA_WRITES.get()[0] > 0;
+    }
     private static final int MAX_RANGE = 64;
     private static final byte NO_DISTANCE = (byte) 127;
     /** how long (ticks) a queued chunk may go with no player within range before it is dropped. */
@@ -104,6 +129,7 @@ public final class PromotionManager {
     private static int lingerMaxIdleTicks = 600;
     private static int lingerMaxBusyTicks = 1200;
     private static double landingMargin = 8.0;
+    private static boolean refuseStubWrites;
     private static int maxInFlight = 2;
     private static double maxGenFraction = 0.5;
     private static double chunkCostMs = 100.0;
@@ -169,6 +195,7 @@ public final class PromotionManager {
         lingerMaxIdleTicks = cfg.lingerMaxIdleSeconds.get() * 20;
         lingerMaxBusyTicks = cfg.lingerMaxBusySeconds.get() * 20;
         landingMargin = cfg.landingMargin.get();
+        refuseStubWrites = cfg.refuseStubWrites.get();
         maxInFlight = cfg.maxInFlight.get();
         maxGenFraction = cfg.maxGenFraction.get();
         chunkCostMs = cfg.chunkCostMs.get();
@@ -257,6 +284,17 @@ public final class PromotionManager {
     public static void setLandingMargin(double blocks) {
         landingMargin = Math.clamp(blocks, 0.0, 64.0);
         AeroGelConfig.CFG.landingMargin.set(landingMargin);
+        AeroGelConfig.SPEC.save();
+    }
+
+    /** true when the server owner opted into refusing (not deferring) writes into a non-real chunk (#16). */
+    public static boolean refusesStubWrites() {
+        return refuseStubWrites;
+    }
+
+    public static void setRefuseStubWrites(boolean on) {
+        refuseStubWrites = on;
+        AeroGelConfig.CFG.refuseStubWrites.set(on);
         AeroGelConfig.SPEC.save();
     }
 
@@ -528,9 +566,9 @@ public final class PromotionManager {
             it.remove();
             state.inFlight.remove(pos);
             WriteLog log = state.deferredWrites.get(pos);
-            if (log != null && !log.writes.isEmpty()) {
+            if (log != null && !log.isEmpty()) {
                 LOGGER.warn("promotion of proxy chunk {} stalled for {} ticks; re-promoting with {} deferred write(s)",
-                    new ChunkPos(pos), IN_FLIGHT_TIMEOUT_TICKS, log.writes.size());
+                    new ChunkPos(pos), IN_FLIGHT_TIMEOUT_TICKS, log.size());
                 promoteImmediate(state, pos);
             } else {
                 LOGGER.warn("promotion of proxy chunk {} stalled for {} ticks; dropping it (vanilla will generate)",
@@ -612,8 +650,23 @@ public final class PromotionManager {
      * (no holder yet) is capped at {@link #MAX_WRITE_LOG}; once it is promoting nothing is dropped (#5). The
      * fast bail keeps the dormant case to one state lookup + one volatile flag read.
      */
+    /**
+     * Server-owner mode: refuse a write into a chunk that is not real terrain (#16), rather than deferring it.
+     * Returns true when the caller must be told the write failed. Promotes the chunk so the next attempt works.
+     */
+    public static boolean refuseStubWrite(ServerLevel serverLevel, BlockPos pos) {
+        if (!enabled || !refuseStubWrites) {
+            return false;
+        }
+        State promotion = state(serverLevel);
+        if (promotion == null || !ProxyChunkGate.mayHaveProxy(serverLevel)) {
+            return false;
+        }
+        return refuseInto(promotion, ChunkPos.asLong(pos));
+    }
+
     public static boolean tryDeferWrite(ServerLevel serverLevel, BlockPos pos, BlockState state, int flags) {
-        if (!enabled) {
+        if (!enabled || refuseStubWrites) {
             return false;
         }
         State promotion = state(serverLevel);
@@ -626,8 +679,13 @@ public final class PromotionManager {
         }
         promoteImmediate(promotion, chunkPos); // no-op once it is generating or real
         WriteLog log = promotion.deferredWrites.computeIfAbsent(chunkPos, k -> new WriteLog());
-        if (log.writes.size() < MAX_WRITE_LOG || !ProxyChunkGate.isProxy(serverLevel, chunkPos)) {
-            log.writes.add(new DeferredWrite(pos.immutable(), state, flags));
+        // the cap is about the caller's writes: vanilla's own terrain writes are not the caller's to lose
+        if (isVanillaWrite()) {
+            log.vanilla.addLast(new DeferredWrite(pos.immutable(), state, flags));
+            log.vanillaCount++;
+        } else if (log.caller.size() < MAX_WRITE_LOG || !ProxyChunkGate.isProxy(serverLevel, chunkPos)) {
+            log.caller.addLast(new DeferredWrite(pos.immutable(), state, flags));
+            log.callerCount++;
         } else {
             LOGGER.warn("proxy chunk {} has more than {} deferred writes; dropping the newest", new ChunkPos(chunkPos), MAX_WRITE_LOG);
         }
@@ -688,7 +746,7 @@ public final class PromotionManager {
         for (State state : STATES.values()) {
             for (var entry : state.deferredWrites.long2ObjectEntrySet()) {
                 LOGGER.error("server stop: proxy chunk {} not finished within {} ms; {} deferred write(s) lost",
-                    new ChunkPos(entry.getLongKey()), STOP_FINISH_NANOS / 1_000_000, entry.getValue().writes.size());
+                    new ChunkPos(entry.getLongKey()), STOP_FINISH_NANOS / 1_000_000, entry.getValue().size());
             }
         }
         LOGGER.info("server stop: finished pending deferred writes in {} ms", (System.nanoTime() - start) / 1_000_000);
@@ -901,7 +959,7 @@ public final class PromotionManager {
         if (log != null && state.level.getChunkSource().getChunkNow(ChunkPos.getX(pos), ChunkPos.getZ(pos)) == null) {
             // regeneration did not produce real terrain (or the chunk unloaded): the writes stay logged and
             // replay whenever the chunk is real, rather than silently dropping the player's edit.
-            LOGGER.warn("proxy chunk {} not real after promotion; keeping {} deferred write(s)", new ChunkPos(pos), log.writes.size());
+            LOGGER.warn("proxy chunk {} not real after promotion; keeping {} deferred write(s)", new ChunkPos(pos), log.size());
         }
     }
 
@@ -931,7 +989,7 @@ public final class PromotionManager {
             replayingPos = pos;
             try {
                 DeferredWrite write;
-                while ((write = log.writes.pollFirst()) != null) {
+                while ((write = log.next()) != null) {
                     state.level.setBlock(write.pos(), write.state(), write.flags());
                     log.replayed++;
                     if (System.nanoTime() >= deadline) {
@@ -942,10 +1000,10 @@ public final class PromotionManager {
                 replaying = false;
             }
             log.ticks++;
-            if (log.writes.isEmpty()) {
+            if (log.isEmpty()) {
                 state.deferredWrites.remove(pos);
-                LOGGER.info("replayed {} deferred write(s) into promoted chunk {} over {} tick(s)",
-                    log.replayed, new ChunkPos(pos), log.ticks);
+                LOGGER.info("replayed {} deferred write(s) into promoted chunk {} over {} tick(s) ({} caller, {} vanilla)",
+                    log.replayed, new ChunkPos(pos), log.ticks, log.callerCount, log.vanillaCount);
             }
             if (System.nanoTime() >= deadline) {
                 return;
@@ -968,11 +1026,38 @@ public final class PromotionManager {
     private record DeferredWrite(BlockPos pos, BlockState state, int flags) {
     }
 
-    /** one chunk's deferred writes in arrival order, plus replay progress for the log line. */
+    /**
+     * One chunk's deferred writes, split by origin, plus replay progress for the log line.
+     *
+     * <p>Two queues, not one: vanilla's own writes into a chunk that is no longer a stub (post-generation
+     * cleanup, a scheduled leaf tick) are this chunk's real terrain and must land <b>before</b> the caller's
+     * writes, whatever order they arrived in. A single FIFO put them in arrival order, so a leaf tick that
+     * fired after promotion was replayed on top of the player's block and erased it (#16).</p>
+     */
     private static final class WriteLog {
-        final ArrayDeque<DeferredWrite> writes = new ArrayDeque<>();
+        /** vanilla's own terrain writes; drained first so the caller's always land last. */
+        final ArrayDeque<DeferredWrite> vanilla = new ArrayDeque<>();
+        /** the caller's writes — player, piston, mod code. Drained last; this is what the cap applies to. */
+        final ArrayDeque<DeferredWrite> caller = new ArrayDeque<>();
         int replayed;
         int ticks;
+
+        boolean isEmpty() {
+            return vanilla.isEmpty() && caller.isEmpty();
+        }
+
+        int size() {
+            return vanilla.size() + caller.size();
+        }
+
+        int callerCount;
+        int vanillaCount;
+
+        /** vanilla first, so a caller write is never overwritten by terrain it was meant to replace. */
+        DeferredWrite next() {
+            DeferredWrite write = vanilla.pollFirst();
+            return write != null ? write : caller.pollFirst();
+        }
     }
 
     private static final class Promotion {
