@@ -8,6 +8,13 @@ Sable is absent.
 
 ## Re-staging
 
+`scripts/stage-libs.sh` fetches everything below from upstream automatically — create from the
+createmod maven, sable from the ryanhcode maven, and the create-aeronautics bundle from Modrinth
+(whose `META-INF/jarjar` children are aeronautics/simulated/offroad). It is a no-op wherever the
+files are already present, so it is safe to run at any time, and CI runs it on every fresh checkout
+because `libs/` is gitignored. Use the manual route below only when you specifically want the jars
+your test instance is currently running.
+
 Copy the jars out of the test instance's `mods/` folder into this directory, keeping each filename in
 the `create-<mc>-<version>.jar` / `<mod>-neoforge-<mc>-<version>.jar` shape. Use `javap -p` on the jar's
 own `META-INF/neoforge.mods.toml` (or check the launcher's mod list) to confirm the version you copied.

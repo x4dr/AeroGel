@@ -497,6 +497,15 @@ JAVA_HOME=<jdk21> ./gradlew :deployDemo   # assemble + copy to AeroGelDemo
 JAVA_HOME=<jdk21> ./gradlew :runServer    # dev server (boots Create+Aero+Sable)
 ```
 
+**Releases are tag-driven and built on GitHub.** Pushing a `v*` tag runs `.github/workflows/release.yml`,
+which builds that exact tag and attaches the jar (plus `SHA256SUMS.txt`) to a GitHub Release and to the
+workflow run. Two things about it are easy to trip over: the release version comes from the **tag**
+(`-Pmod_version=<tag>` overrides `gradle.properties`, which keeps only the local dev default), and `libs/`
+is gitignored, so the workflow runs `scripts/stage-libs.sh` first — that script fetches Create/Sable/the
+Create Aeronautics bundle from upstream (createmod + ryanhcode maven, Modrinth for the bundle, unpacking
+its `META-INF/jarjar` children) and is a no-op wherever the jars are already staged, so it is safe to run
+locally too. There is no branch or PR trigger; the workflow only ever publishes.
+
 **Dev-loop facts (so a new agent does not have to rediscover them):**
 - The **test client is the launcher instance `AeroGelDemo`** (launched from the launcher, not `:runClient`). It
   loads `aerogel-*.jar` from that instance's `mods/`; **restart the client** to pick up a

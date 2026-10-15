@@ -1,0 +1,112 @@
+name: Release
+
+# Tag-driven release: pushing v* builds the mod from that tag and attaches the jar to a GitHub
+# Release. There is deliberately no branch or pull-request trigger -- this workflow only ever runs
+# to publish, and the artifact is always a tagged commit rather than a moving branch head.
+#
+# The declared version comes from the tag, not from gradle.properties: the tag is the source of
+# truth for a release, and gradle.properties keeps the version a local dev build reports. The two
+# are expected to agree but nothing breaks if they drift -- the jar follows the tag.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # The NeoForm runtime (decompile + patch of the game sources) is the slow part of a cold
+      # build and lands outside the Gradle action's own caches, so it gets its own.
+      - name: Cache the NeoForm runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches/neoformruntime
+          key: neoform-${{ runner.os }}-${{ hashFiles('gradle.properties', 'settings.gradle', 'build.gradle') }}
+          restore-keys: neoform-${{ runner.os }}-
+
+      - name: Derive the version from the tag
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          # Anchored, and deliberately restricted to characters that are safe in a filename and a
+          # release title: the tag is written into the jar name and the Gradle command line.
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z._-]+)?$ ]]; then
+            echo "::error::tag '$tag' does not look like a release version (expected v<major>.<minor>.<patch>)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building $tag as version $version"
+
+      # libs/ is gitignored and holds the Create / Sable / Create Aeronautics jars the build
+      # compiles against. This fetches them from upstream -- nothing is redistributed by the repo.
+      - name: Stage the dependency jars
+        run: scripts/stage-libs.sh
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./gradlew :build -Pmod_version="$VERSION" --stacktrace
+
+      - name: Collect the artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          jars=(build/libs/aerogel-*.jar)
+          if [ "${#jars[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one jar in build/libs, found ${#jars[@]}: ${jars[*]}"
+            exit 1
+          fi
+          jar="${jars[0]}"
+          case "$(basename "$jar")" in
+            *"-${VERSION}.jar") ;;
+            *) echo "::error::$(basename "$jar") does not carry version ${VERSION}"; exit 1 ;;
+          esac
+          mkdir -p dist
+          cp "$jar" dist/
+          ( cd dist && sha256sum -- *.jar > SHA256SUMS.txt )
+          ls -l dist
+
+      - name: Upload the workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aerogel-${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Re-pushed tag: keep the release, replace the assets.
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "AeroGel ${GITHUB_REF_NAME#v}" \
+              --generate-notes \
+              --verify-tag
+          fi
