@@ -311,12 +311,18 @@ public final class AdaptiveMode {
     }
 
     /**
-     * True when the adaptive window has no reason to enforce. Read by {@code PromotionManager}'s refill: while
-     * calm the linger threshold is bypassed so the gate can reach a state where it may disengage. A one-tick
-     * lag is harmless — the drain simply waits a tick longer.
+     * True when the adaptive window has no reason to enforce, read off the window's own maxima rather than
+     * off {@code enforcing}. Read by {@code PromotionManager}'s refill: while calm the linger threshold is
+     * bypassed so the gate can reach a state where it may disengage.
+     *
+     * <p>This is deliberately <b>not</b> {@code !enforcing}. The refill runs before {@link #tick}, and the
+     * drain keeps {@code enforcing} on by design (the veto holds the gate until the drain is done), so keying
+     * on {@code enforcing} would mean the drain could never use the calm path — the gate would stay on for
+     * ever with nothing draining it. One tick of staleness on the window is harmless: the veto is what
+     * actually stops the gate dropping early.</p>
      */
-    public static boolean serverCalm() {
-        return !enforcing;
+    public static boolean windowCalm() {
+        return WINDOW.maxBacklog <= backlogDeactivate && WINDOW.maxTickMs <= deactivateTickMs;
     }
 
     /** test hook: force the legacy always-on gate for a headless probe, without touching the config. */

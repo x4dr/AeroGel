@@ -213,6 +213,11 @@ public final class PromotionManager {
         final List<ServerPlayer> playersScratch = new ArrayList<>();
         /** how many chunks the refill will hold: {@code maxInFlight} plus {@link #QUEUE_HEADROOM}. */
         int queueCap = QUEUE_HEADROOM;
+        /**
+         * Fresh in-range stubs a promotion could still start, counted by {@link #refill} whether or not the
+         * threshold admitted them this tick. Part of the disengage veto: see {@link #drained}.
+         */
+        int unpromoted;
         /** tick the last promotion started; drives the progress guarantee (see FORCE_START_TICKS). */
         int lastStartTick;
 
@@ -403,19 +408,27 @@ public final class PromotionManager {
     }
 
     /**
-     * True when nothing is left for the promotion path to do: every level's queue and in-flight set are both
-     * empty. This is the gate's disengage veto, and it is only safe because {@link #refill} runs first and,
-     * while the server is calm, makes every fresh lingered stub eligible. A queued chunk is one that will
-     * generate; an ungated chunk would generate on its player's own ticket. So "queue and in-flight empty",
-     * read after the refill, can only mean "nothing is left that would burst on disengagement".
+     * True when nothing is left for the promotion path to do: no fresh in-range stub a promotion could still
+     * start, and an empty queue and in-flight set. This is the gate's disengage veto.
      *
-     * <p>This is deliberately <em>not</em> "some chunk is lingering". Linger is universal, so a predicate on
-     * the linger maps degenerates into "there are players" and would pin enforcement on forever; that is what
-     * the previous {@code hasLinger} veto did once linger stopped being opt-in-only.</p>
+     * <p><b>Why it counts stubs and not just the queue.</b> The queue alone is not enough, and the drain probe
+     * caught why. The refill reads the window's calm state, which is one tick behind the decision, so on the
+     * tick the server goes calm the refill can still be on the busy path — threshold applied, nothing queued,
+     * queue empty, gate would drop — and the very next tick the calm path queues the whole square. Those
+     * chunks are ungated by then, so they build their own FULL futures: the burst this veto exists to prevent,
+     * arriving one tick late. Counting the stubs that are still gated closes it, and it is the invariant
+     * stated directly rather than by proxy: <b>the gate may not disengage while chunks it gated are still
+     * stub terrain.</b></p>
+     *
+     * <p>It does not degenerate the way the old {@code hasLinger} veto did. That one was a predicate on the
+     * linger maps, which is "there are players" once linger is universal; this counts real gated terrain, and
+     * it reaches zero because the drain promotes it. It also cannot pin on a chunk vanilla would not have
+     * generated: {@link #refill} only counts positions with a loaded FULL holder, so a fringe stub outside
+     * every ticket's reach is not counted and cannot hold the gate.</p>
      */
     public static boolean drained() {
         for (State state : STATES.values()) {
-            if (!state.queue.isEmpty() || !state.inFlight.isEmpty()) {
+            if (state.unpromoted > 0 || !state.queue.isEmpty() || !state.inFlight.isEmpty()) {
                 return false;
             }
         }
@@ -491,6 +504,10 @@ public final class PromotionManager {
 
     private static void tickState(MinecraftServer server, State state) {
         state.tickCounter++;
+        // Reset before every return below, including the !enabled one and the mayHaveProxy guard that skips
+        // the scan. Nothing else clears it, so a stale non-zero count would hold adaptive enforcement on for
+        // the rest of the session.
+        state.unpromoted = 0;
         if (!enabled) {
             return;
         }
@@ -515,7 +532,7 @@ public final class PromotionManager {
                 // is calm it bypasses the linger threshold so every fresh stub is eligible at once. That
                 // ordering is the whole reason "queue empty" can only mean "nothing left to generate": a
                 // chunk that would generate on disengagement is in the queue by the time the veto is asked.
-                refill(state, players, range, AdaptiveMode.serverCalm(), minTicks, maxTicks);
+                refill(state, players, range, AdaptiveMode.windowCalm(), minTicks, maxTicks);
             }
         }
         if (state.tickCounter % 100 == 0 && System.currentTimeMillis() - lastStatusLog > 30_000) {
@@ -629,6 +646,10 @@ public final class PromotionManager {
                 // not have generated either, and admitting it would only occupy a slot it can never use.
                 continue;
             }
+            // Counted whether or not the threshold admits it this tick: it is gated terrain either way, so
+            // the gate may not disengage over it. This is what closes the one-tick hole where the refill is
+            // still on the busy path while the window has already gone calm.
+            state.unpromoted++;
             // the walk above already recorded this tick's distance for every in-range stub; only an entry
             // that is fresh but no longer in range needs the scan
             int distance = state.occupied.get(pos);

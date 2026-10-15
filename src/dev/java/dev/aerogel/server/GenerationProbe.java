@@ -139,6 +139,13 @@ final class GenerationProbe {
     /**
      * #2: the issue's backlog swing (558 -> 0 -> 234 -> 0 -> 74 -> 2, one sample per tick) must turn enforcing
      * on once and keep it on; it may drop only after the window has cleared and the hold has run out.
+     *
+     * <p>The last argument is the disengage veto read backwards: {@code drained} = true means the promotion
+     * queue and in-flight set are empty, so the gate <em>may</em> stop. The old version of this check passed
+     * {@code false} for the stop cases, which under that reading means "work outstanding" — under the current
+     * model that keeps enforcement on for ever, so the check could never pass. What it tests now is both
+     * directions: a calm window with nothing outstanding stops, and a calm window with work outstanding does
+     * not.</p>
      */
     private void checkAdaptiveWindow() {
         AdaptiveMode.Window window = new AdaptiveMode.Window();
@@ -150,21 +157,23 @@ final class GenerationProbe {
         for (int i = 0; i < swing.length * 4; i++, t += 50) {
             int backlog = swing[i % swing.length];
             lastSpike = backlog >= AdaptiveMode.backlogActivate() ? t : lastSpike;
-            boolean next = window.decide(on, t, backlog, 0.0, false);
+            boolean next = window.decide(on, t, backlog, 0.0, true); // nothing outstanding: stopping is allowed
             flips += next != on ? 1 : 0;
             on = next;
         }
         boolean heldOn = on && flips == 1;
         long holdMs = Math.max(AdaptiveMode.holdSeconds(), AdaptiveMode.windowSeconds()) * 1000L;
-        boolean stillOnBeforeHold = window.decide(on, lastSpike + holdMs - 50, 0, 0.0, false);
-        boolean offAfter = !window.decide(true, lastSpike + holdMs + 50, 0, 0.0, false);
-        boolean lingerKeepsOn = window.decide(true, lastSpike + holdMs + 100, 0, 0.0, true);
-        boolean pass = heldOn && stillOnBeforeHold && offAfter && lingerKeepsOn;
+        boolean stillOnBeforeHold = window.decide(on, lastSpike + holdMs - 50, 0, 0.0, true);
+        boolean offAfter = !window.decide(true, lastSpike + holdMs + 50, 0, 0.0, true);
+        // the veto, and the only reason the disengage model is safe: however calm the window, the gate stays
+        // on while the queue or the in-flight set is non-empty
+        boolean pendingKeepsOn = window.decide(true, lastSpike + holdMs + 100, 0, 0.0, false);
+        boolean pass = heldOn && stillOnBeforeHold && offAfter && pendingKeepsOn;
         LOGGER.info(pass
             ? "VERDICT: PASS — adaptive window (558/0/234/0 swing flips on once, holds " + holdMs / 1000
-                + " s, then off; linger keeps it on)"
+                + " s, then off once drained; pending promotion keeps it on)"
             : "VERDICT: FAIL — adaptive window flips=" + flips + " heldOn=" + heldOn + " stillOnBeforeHold="
-                + stillOnBeforeHold + " offAfter=" + offAfter + " lingerKeepsOn=" + lingerKeepsOn);
+                + stillOnBeforeHold + " offAfter=" + offAfter + " pendingKeepsOn=" + pendingKeepsOn);
     }
 
     /** #1/#11: a non-op cannot flip a server-wide switch, an op can; movecheck bypass defaults off. */

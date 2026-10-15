@@ -12,6 +12,10 @@ import net.minecraft.server.MinecraftServer;
  * {@code aerogel.probe} (gate smoke test), {@code aerogel.promote} (promotion + deferred-write + push-up),
  * {@code aerogel.promotestress} (25-chunk promotion burst), {@code aerogel.writesafety} (#6: player placement
  * refused + pending write survives a stop; two starts), {@code aerogel.sablebody} (#9: Sable bodies over proxies),
+ * {@code aerogel.drain} (the disengage model: paced drain + the queue/in-flight disengage veto),
+ * {@code aerogel.stationary} (sampling is one burst, then nothing while a player stands still),
+ * {@code aerogel.independence} (gating and proxy rendering are independent axes),
+ * {@code aerogel.vanillaclient} (#15: a client without AeroGel gets a paced, not uncapped, square),
  * {@code aerogel.teleport} (#14: engage on teleport into fresh land),
  * {@code aerogel.flight} (fast-flight benchmark matrix).
  * Each one deletes its own flag before a normal run.</p>
@@ -42,6 +46,19 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.sablebody"))) {
             server.execute(() -> SableBodyProbe.start(server));
         }
+        // these four keep the REAL adaptive path (no debugAlwaysOn): they observe enforcement and the zones
+        if (Files.exists(dir.resolve("aerogel.drain"))) {
+            server.execute(() -> DrainProbe.start(server));
+        }
+        if (Files.exists(dir.resolve("aerogel.stationary"))) {
+            server.execute(() -> StationaryProbe.start(server));
+        }
+        if (Files.exists(dir.resolve("aerogel.independence"))) {
+            server.execute(() -> IndependenceProbe.start(server));
+        }
+        if (Files.exists(dir.resolve("aerogel.vanillaclient"))) {
+            server.execute(() -> VanillaClientProbe.start(server));
+        }
         // #14 needs the real adaptive path too: it waits until the server idles, then teleports a FakePlayer
         if (Files.exists(dir.resolve("aerogel.teleport"))) {
             server.execute(() -> TeleportProbe.start(server));
@@ -60,6 +77,10 @@ public final class DevProbeImpl implements DevProbe {
         PromotionStressProbe.tick(server);
         WriteSafetyProbe.tick(server);
         SableBodyProbe.tick(server);
+        DrainProbe.tick(server);
+        StationaryProbe.tick(server);
+        IndependenceProbe.tick(server);
+        VanillaClientProbe.tick(server);
         TeleportProbe.tick(server);
     }
 }

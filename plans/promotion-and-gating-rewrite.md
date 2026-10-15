@@ -110,17 +110,31 @@ deactivation veto has always been guarding against.
 every tick:
   accrue     for each player, for each stub in range: touch lingerSeen;
              write startLinger on first approach
-  refill     if calm   -> candidates = fresh lingered stubs, threshold BYPASSED
-             else      -> candidates = stubs that passed their distance-dependent threshold
+  refill     if the WINDOW is calm -> candidates = fresh lingered stubs, threshold BYPASSED
+             else                    -> candidates = stubs that passed their distance-dependent threshold
              sort by distance to the nearest player; fill the queue to its soft cap from the nearest
              (admission requires a startable holder)
+             count every fresh in-range stub with a startable holder, admitted or not
   drain      while inFlight < maxInFlight and the budget allows, start the nearest queued chunk
-  may disengage  <= calm AND queue empty AND in-flight empty
+  may disengage  <= calm AND queue empty AND in-flight empty AND no counted stub remains
   prune      lazily drop expired linger entries during the scan
 ```
 
-"Calm" is the existing adaptive test: windowed backlog and tick time below their deactivate values and
-`holdSeconds` elapsed since the last activating sample. While calm the linger **threshold is bypassed** —
+"Calm" is the existing adaptive test — windowed backlog and tick time below their deactivate values —
+read off the **window**, not off `enforcing`. That distinction is load-bearing and was found the hard way:
+the drain is supposed to keep enforcement on until it finishes, so a refill keyed on `enforcing` would
+never take the calm path and the gate would stay on for ever with nothing draining it.
+
+The gated-stub count is the second half, and it is not redundant with the queue. The refill reads the
+window one tick behind the decision, so on the tick the server goes calm the refill can still be on the
+busy path with nothing queued; the queue is empty, the gate drops, and the next tick the calm path queues
+the whole square — now ungated, so those chunks build their own FULL futures. That is the burst arriving
+one tick late, and it is what `aerogel.drain` caught. The invariant, stated directly: **the gate may not
+disengage while chunks it gated are still stub terrain.** The count reaches zero because the drain promotes
+them, and it cannot pin on a chunk vanilla would not have generated, because only positions with a loaded
+FULL holder are counted.
+
+While calm the linger **threshold is bypassed** —
 not the budget. The drain arm makes every fresh lingered stub immediately *eligible*; the queue's
 existing pacer still decides when each one actually starts, at `maxInFlight` / budget / hard-gate, with
 the one-concurrent-chunk floor guaranteeing progress on a server that is already lagging. Only player
@@ -196,8 +210,8 @@ Per `AGENTS.md`, the posture is compiles / loads / probes PASS. Required before 
 
 - `probe`, `promote`, `promotestress`, `writesafety` (×2), `sablebody`, `teleport`, `vanillaclient` — all
   PASS. `vanillaclient` is re-specified below.
-- New/updated probes for: the drain arm (queued, not immediate); the disengage veto (queue and in-flight
-  empty, checked after the refill); stationing sampling; gate/proxy independence.
+- New/updated probes for: the drain arm (queued, not immediate); the disengage veto (queue, in-flight and
+  gated stubs, checked after the refill); stationary sampling; gate/proxy independence.
 - `promote` carries the restored late-batch write phase and therefore **fails until the write loss is
   diagnosed** — it is not a side quest, it gates the release.
 - Both mixin descriptors re-verified against the NeoForge version in use (done for 21.1.252, recorded in

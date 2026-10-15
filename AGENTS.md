@@ -197,9 +197,14 @@ choke at ~80 chunks/s swept).
   globally while the main-thread chunk-task backlog (`ServerChunkCache.getPendingTasksCount()`, max over every
   gated level) is ≥ `backlogActivate` (64) or smoothed tick time ≥ `activateTickMs` (35 ms), both taken as
   the max over the last `windowSeconds` (5). It **may** stop only once both windowed values fall back below the
-  deactivate values, `holdSeconds` (10) have passed since the last activating sample, **and the promotion queue
-  and the in-flight set are both empty** — read *after* the refill, so "empty" can only mean "nothing left to
-  generate", which is what makes disengaging safe. The old veto was "no linger counter remains"; universal
+  deactivate values, `holdSeconds` (10) have passed since the last activating sample, **the promotion queue and
+  the in-flight set are both empty, and no fresh gated stub remains in a player's range** — read *after* the
+  refill, so "empty" can only mean "nothing left to generate", which is what makes disengaging safe. The last
+  clause is not redundant: the refill reads the window's calm state one tick behind the decision, so on the
+  tick the server goes calm the refill can still be on the busy path with nothing queued, and the very next
+  tick would queue the square after the gate had already dropped. `aerogel.drain` caught exactly that. The gate
+  may simply not disengage while chunks it gated are still stub terrain. The old veto was "no linger counter
+  remains"; universal
   linger invalidated it, because a predicate on those counters degenerates into "there are players" and pins
   enforcement on for the rest of the session. With `adaptive.engageOnTeleport` (default false, #14) a player
   teleporting (any `EntityTeleportEvent`: `/tp`, pearl, chorus) to a chunk that is neither loaded nor known
@@ -379,7 +384,12 @@ run/server/aerogel.sablebody` (#9: Sable bodies over proxies promote near the su
 `touch run/server/aerogel.teleport` (#14: engage on teleport, real adaptive path; waits for the server to idle),
 `touch run/server/aerogel.vanillaclient` (#15: a client without AeroGel is gated like anyone else, so its
 in-range stubs must enter the paced queue rather than being force-generated — assert *paced, not uncapped*;
-a `FakePlayer` issues no chunk requests, so the probe asserts the mechanism, not the storm).
+a `FakePlayer` issues no chunk requests, so the probe asserts the mechanism, not the storm), `touch
+run/server/aerogel.drain` (the disengage model on the real adaptive path: the drain is paced, the gate never
+drops with work outstanding, and everything eventually generates), `touch run/server/aerogel.stationary`
+(sampling is one burst then nothing while a player stands still), `touch
+run/server/aerogel.independence` (gating and proxy rendering are independent axes — all four
+`travel`/`proxy` combinations).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 

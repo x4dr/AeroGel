@@ -35,7 +35,8 @@ rebase off the upstream tip rather than a set of reverts: `0e4a16b` + the surviv
 - **Universal linger invalidated the `hasLinger` veto.** That veto read "some chunk has a linger counter". Once
   linger accrues for every player it degenerates into "there are players", which pins enforcement on for the
   rest of the session — the opposite of what it was protecting. The replacement is the **disengage model**:
-  accrue → refill → drain → *may disengage* → prune, where the veto is "queue and in-flight both empty", read
+  accrue → refill → drain → *may disengage* → prune, where the veto is "queue and in-flight both empty and no
+  fresh gated stub in a player's range", read
   *after* the refill.
 - **`PromotionManager.tick` must run before `AdaptiveMode.tick`.** The veto reads the queue the refill writes;
   in the old order it can see a queue that has not been refilled yet and drop the gate one tick early, which is
@@ -59,10 +60,24 @@ rebase off the upstream tip rather than a set of reverts: `0e4a16b` + the surviv
   The threshold bypasses; **the budget never does** — touchdown, block write, refused right-click and Sable
   body contact remain the only budget bypasses.
 
-**Not verified.** No probe has been run against this model. `aerogel.vanillaclient` is re-specified (it
-asserted the opt-out subtraction, which no longer exists) and now asserts *paced, not uncapped*. `aerogel.promote`
-carries the restored late-batch write phase and fails until that loss is diagnosed — still open, see
-`promotion-and-gating-rewrite.md` §Open questions.
+**Found by the probes.** `aerogel.drain` caught a hole in the veto on its first run: the gate dropped with 25
+gated stubs sitting under the player. The refill keyed "calm" on `!enforcing`, but the drain is *supposed* to
+keep enforcement on until it finishes, so the refill could never take the calm path — nothing was queued, the
+queue read empty, the gate dropped, and the next tick the calm path queued 24 chunks that were ungated by
+then. Two fixes, both needed: the refill now reads the **window's** calm state rather than `enforcing`, and the
+veto counts **gated stubs in range** rather than only the queue and in-flight set. The one-tick staleness on
+the window is inherent (the refill runs first) and is what the count covers.
+
+Also corrected: `GenerationProbe.checkAdaptiveWindow` was still passing `false` for the veto argument to mean
+"no linger" — under the new reading that means "work outstanding", so its "may stop" cases could never pass.
+It now tests both directions: a calm window with nothing outstanding stops, and a calm window with work
+outstanding does not.
+
+**Not verified beyond that.** `aerogel.probe`, `aerogel.independence`, `aerogel.vanillaclient` and the
+corrected `aerogel.drain` are the runs so far; the rest of the gate is outstanding.
+`aerogel.vanillaclient` is re-specified (it asserted the opt-out subtraction, which no longer exists) and now
+asserts *paced, not uncapped*. `aerogel.promote` carries the restored late-batch write phase and fails until
+that loss is diagnosed — still open, see `promotion-and-gating-rewrite.md` §Open questions.
 
 **Also open from this session**: the drain-rate budget needs numbers, stationary sampling is unmeasured, and
 `PromotionManager.sweepInFlight`'s re-promotion of a stalled chunk is a no-op (it calls `promoteImmediate`,

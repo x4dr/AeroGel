@@ -23,7 +23,8 @@
 5. ~~Automatic promotion + block-write guard~~ — DONE (`PromotionManager`, `LevelWriteGuardMixin`); in-game
    verification pending. Immediate promotion is plain vanilla generation (see
    `proxy-chunk-state-machine.md`); linger is budget-paced, and the gate may only disengage once the server is
-   calm **and** the promotion queue and the in-flight set are both empty — read after the refill, so "empty"
+   calm **and** the promotion queue and the in-flight set are both empty **and** no fresh gated stub remains in
+   a player's range — read after the refill, so "empty"
    can only mean "nothing left to generate". Superseded in part by entry 7.
 6. ~~Hardening pass~~ — DONE (2026-10-13). Void plane deleted, config validated, probes moved to the `dev`
    source set, outbound mesh batches split and `mesh_request` rate-limited, promotion de-urgented. Verified:
@@ -33,7 +34,8 @@
    server-side, and the server no longer branches on whether a client renders proxies — `AdaptiveMode.renders`
    gates mesh *sending* only, which is what removes the uncapped leftover arm behind #15. The disengage model
    replaces the `hasLinger` veto: accrue → refill (threshold bypassed while calm, budget never) → drain →
-   may-disengage on queue *and* in-flight empty → lazy prune. `PromotionManager.tick` must run before
+   may-disengage on queue *and* in-flight empty *and* no fresh gated stub in range → lazy prune.
+   `PromotionManager.tick` must run before
    `AdaptiveMode.tick`. `vanillaclient` is re-specified to assert *paced, not uncapped*. Design and open
    questions: `promotion-and-gating-rewrite.md`.
 8. **In-game checks** — detail tiers, then the rewritten enforcement + promotion, and the mass-write path. See
