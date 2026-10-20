@@ -77,7 +77,8 @@ automatic promotion) and the "Next session" list in `AGENTS.md`.
 The pacer now charges a start for the chunk-steps it causes (`ProxyChunkGate.stepsToPromote`, holder statuses
 of its FULL square and the pyramid), scaled by `chunkCostMs` as the price of an untouched neighbourhood; the
 knob is what the pacer charges again. Measured by `aerogel.footprint`: void 1387 steps vs a frontier 420, CPU
-15-19 s vs 2-6 s, prediction exact. The record below is kept as the history.
+15-19 s vs 2-6 s, prediction exact. Touchdown, block writes and refused clicks now queue for this pacer too
+(only Sable body contact stays immediate; `aerogel.masswrite`). The record below is kept as the history.
 
 Measured (`aerogel.footprint`, 2026-10-15): one promotion fully generates its 5x5 (25 chunks) and raises a
 partial pyramid around it — ring 3 `initialize_light`, ring 4 `carvers`, ring 5 `biomes`, rings 6-13

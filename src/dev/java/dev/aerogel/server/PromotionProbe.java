@@ -17,10 +17,11 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Headless smoke test of {@link PromotionManager} (flag file: &lt;serverDir&gt;/aerogel.promote). Loads a fresh
- * proxy chunk, writes a block into it (must be cancelled + deferred), lets the manager promote the chunk,
- * then verifies the write was replayed onto the real terrain. While the promotion is generating it also checks
- * that a main-thread read returns the placeholder at once instead of blocking (#13), and writes more than the
- * 256-per-chunk cap into the chunk, which must all land, replayed over more than one tick (#5). Self-halting.
+ * proxy chunk, writes a block into it (must be cancelled + deferred, and the chunk queued for the pacer rather
+ * than started), lets the manager promote the chunk, then verifies the write was replayed onto the real
+ * terrain. Once the promotion is generating it also checks that a main-thread read returns the placeholder at
+ * once instead of blocking (#13), and writes 6144 blocks into the chunk, which must all land, replayed over
+ * more than one tick (#5). Self-halting.
  *
  * <p><b>KNOWN FAILING (#16).</b> The late batch below was last observed landing only partially (267/512,
  * 257/512 and 70/512 across three runs), so this probe currently FAILs and that question is unresolved:
@@ -43,7 +44,7 @@ final class PromotionProbe {
      * that, because if that estimate were right the replay would itself be the thing worth reporting.</p>
      */
     private static final int MAX_TICKS = 100;
-    /** in-flight writes: 16x16 columns x 24 layers, far above the 256 cap and above one tick's replay budget. */
+    /** in-flight writes: 16x16 columns x 24 layers, above one tick's replay budget. */
     private static final int BULK_Y = 101;
     private static final int BULK_LAYERS = 24;
     private static final int BULK = 16 * 16 * BULK_LAYERS;
@@ -64,6 +65,8 @@ final class PromotionProbe {
     private static BlockPos writePos;
     private static int ticks;
     private static boolean written;
+    private static boolean queuedAtWrite;
+    private static boolean bulkWritten;
     private static String inFlightRead = "not checked";
     private static boolean inFlightOk;
     private static int bulkFirstTick = -1;
@@ -99,12 +102,16 @@ final class PromotionProbe {
         // the write must be intercepted (cancelled + remembered) because the chunk is a proxy
         boolean deferred = level.setBlock(writePos, Blocks.STONE.defaultBlockState(), 3);
         LevelChunk after = level.getChunkSource().getChunkNow(probe.x, probe.z);
-        LOGGER.info("promote probe: write into proxy -> deferred={}, still proxy={}", deferred, after == null);
+        // a write is a player trigger: it queues the chunk for the pacer instead of starting it here
+        queuedAtWrite = PromotionManager.debugIsQueued(level, probe.toLong()) && !ProxyChunkGate.isPromoting(level, probe.toLong());
+        LOGGER.info("promote probe: write into proxy -> deferred={}, still proxy={}, queued not started={}",
+            deferred, after == null, queuedAtWrite);
         written = true;
-        if (!ProxyChunkGate.isPromoting(level, probe.toLong())) {
-            inFlightRead = "promotion not in flight after the write";
-            return;
-        }
+    }
+
+    /** once the pacer started the promotion: the in-flight read and the bulk writes into the generating chunk. */
+    private static void bulk() {
+        bulkWritten = true;
         // #13: a read of the generating chunk must not managedBlock on its FULL future
         long t0 = System.nanoTime();
         ChunkAccess read = level.getChunk(probe.x, probe.z, ChunkStatus.FULL, true);
@@ -207,6 +214,8 @@ final class PromotionProbe {
         }
         if (!written && ProxyChunkGate.hasHolder(level, probe.toLong())) {
             write();
+        } else if (written && !bulkWritten && ProxyChunkGate.isPromoting(level, probe.toLong())) {
+            bulk();
         }
         ++ticks;
         if (!lateWritten && ticks == LATE_TICK) {
@@ -233,11 +242,11 @@ final class PromotionProbe {
             int late = latePresent();
             int pending = PromotionManager.debugDeferredWrites(level, probe.toLong());
             LOGGER.info("promote probe: late batch (caller AFTER vanilla) {}/{}", late, LATE);
-            boolean pass = replayed && inFlightOk && present == BULK && late == LATE && spread > 1 && realAfter;
-            LOGGER.info("promote probe: VERDICT {} — chunk {} real after {} ticks, deferred write replayed={} (block {}); "
+            boolean pass = queuedAtWrite && replayed && inFlightOk && present == BULK && late == LATE && spread > 1 && realAfter;
+            LOGGER.info("promote probe: VERDICT {} — queued at write={}, chunk {} real after {} ticks, deferred write replayed={} (block {}); "
                     + "in-flight read {}; {}/{} in-flight writes landed over {} tick(s); real read after={}; "
                     + "missing: {}; late missing: {}; deferred still pending={}",
-                pass ? "PASS" : "FAIL", probe, ticks, replayed, at.getBlock(), inFlightRead, present, BULK, spread,
+                pass ? "PASS" : "FAIL", queuedAtWrite, probe, ticks, replayed, at.getBlock(), inFlightRead, present, BULK, spread,
                 realAfter, missingSummary(present), lateMissingSummary(late), pending);
             testPushUp();
             finish(server);

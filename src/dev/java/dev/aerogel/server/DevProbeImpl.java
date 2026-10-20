@@ -21,6 +21,7 @@ import net.minecraft.server.MinecraftServer;
  * starvation floor under an injected load),
  * {@code aerogel.footprint} (what one promotion generates: its 5x5 at FULL plus the partial pyramid around it,
  * and #17: a void vs a frontier promotion against what the pacer predicts and charges),
+ * {@code aerogel.masswrite} (a /fill-sized write over 16 proxies queues them for the pacer and every block lands),
  * {@code aerogel.flight} (fast-flight benchmark matrix).
  * Each one deletes its own flag before a normal run.</p>
  */
@@ -33,7 +34,8 @@ public final class DevProbeImpl implements DevProbe {
             || Files.exists(dir.resolve("aerogel.promotestress"))
             || Files.exists(dir.resolve("aerogel.writesafety"))
             || Files.exists(dir.resolve("aerogel.vanillaclient"))
-            || Files.exists(dir.resolve("aerogel.sablebody"))) {
+            || Files.exists(dir.resolve("aerogel.sablebody"))
+            || Files.exists(dir.resolve("aerogel.masswrite"))) {
             AdaptiveMode.debugAlwaysOn(); // headless probes have no players to opt in
         }
         if (Files.exists(dir.resolve("aerogel.writesafety"))) {
@@ -50,6 +52,9 @@ public final class DevProbeImpl implements DevProbe {
         }
         if (Files.exists(dir.resolve("aerogel.sablebody"))) {
             server.execute(() -> SableBodyProbe.start(server));
+        }
+        if (Files.exists(dir.resolve("aerogel.masswrite"))) {
+            server.execute(() -> MassWriteProbe.start(server));
         }
         // these four keep the REAL adaptive path (no debugAlwaysOn): they observe enforcement and the zones
         if (Files.exists(dir.resolve("aerogel.drain"))) {
@@ -100,6 +105,7 @@ public final class DevProbeImpl implements DevProbe {
         TeleportProbe.tick(server);
         RateProbe.tick(server);
         FootprintProbe.tick(server);
+        MassWriteProbe.tick(server);
     }
 
     @Override

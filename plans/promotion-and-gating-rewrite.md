@@ -74,8 +74,9 @@ the only thing between a player's block placement and being re-lingered from zer
 A chunk's threshold is distance-dependent, `t(d) = min + (d/range)·(max − min)`, interpolated between
 idle and busy load. Crossing it makes the chunk a *candidate*.
 
-**Touchdown, block writes, right-clicks and Sable body contact stay immediate.** They are player
-actions, they bypass the budget, and nothing here changes that.
+**Sable body contact stays immediate** (no proxy collider, #9). Touchdown, block writes and refused
+right-clicks were immediate too until 2026-10-20; they now queue for the same pacer (Maric: "enqueue these
+where possible, generate the chunks through normal queue").
 
 **The queue is a work buffer, not a backlog.** It holds roughly what the drain rate can consume
 between two refill passes — derived from `maxInFlight`, not from a computed drain rate, because a
