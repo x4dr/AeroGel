@@ -72,7 +72,12 @@ The draw decision is no longer involved; this is sampling and delivery latency. 
 Longer-running items are in `plans/README.md` (collider PoC; in-game verification of detail tiers and
 automatic promotion) and the "Next session" list in `AGENTS.md`.
 
-## 4. What one promotion actually costs, and the pacing math that ignores it
+## 4. What one promotion actually costs, and the pacing math that ignores it — RESOLVED (#17)
+
+The pacer now charges a start for the chunk-steps it causes (`ProxyChunkGate.stepsToPromote`, holder statuses
+of its FULL square and the pyramid), scaled by `chunkCostMs` as the price of an untouched neighbourhood; the
+knob is what the pacer charges again. Measured by `aerogel.footprint`: void 1387 steps vs a frontier 420, CPU
+15-19 s vs 2-6 s, prediction exact. The record below is kept as the history.
 
 Measured (`aerogel.footprint`, 2026-10-15): one promotion fully generates its 5x5 (25 chunks) and raises a
 partial pyramid around it — ring 3 `initialize_light`, ring 4 `carvers`, ring 5 `biomes`, rings 6-13
