@@ -18,6 +18,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import org.joml.Matrix4f;
+import org.lwjgl.opengl.GL11;
 import dev.aerogel.common.ProxyChunkUtil;
 import dev.aerogel.common.ProxyTopology;
 import dev.aerogel.mixin.LevelRendererAccessor;
@@ -396,13 +397,15 @@ public final class ProxyRenderer {
                 RenderSystem.setShader(GameRenderer::getPositionColorShader);
                 RenderSystem.disableCull();
                 RenderSystem.disableBlend();
-                // Drawn BEFORE the terrain, depth-tested but not depth-writing: real geometry painted
-                // afterwards covers these pixels wherever it exists, so the proxy is visible exactly where
-                // nothing else draws. That is what removes the need to know what the renderer is drawing
-                // (Sodium never tells us), and it cannot leave a hole — the worst case is a proxy pixel
-                // being painted over, never a real-terrain pixel being hidden by a proxy.
+                // Drawn BEFORE the terrain: real geometry painted afterwards covers these pixels wherever it
+                // exists, so the proxy is visible exactly where nothing else draws. That is what removes the
+                // need to know what the renderer is drawing (Sodium never tells us), and it cannot leave a
+                // hole — the worst case is a proxy pixel being painted over, never a real-terrain pixel
+                // being hidden by a proxy. Within the layer we DO write depth, so proxy tops and walls
+                // resolve against each other instead of in buffer submission (hash) order (#21: walls drawn
+                // through nearer tops); the finally clears that depth again before the terrain draws.
                 RenderSystem.enableDepthTest();
-                RenderSystem.depthMask(false);
+                RenderSystem.depthMask(true);
                 // proxy chunks are textured: bind the block atlas and use the position_tex_color shader
                 RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
                 // proxy terrain is lit by sky light 15 only (no block light): multiply the baked biome tint by
@@ -446,6 +449,8 @@ public final class ProxyRenderer {
                 RenderSystem.enableCull();
                 RenderSystem.enableBlend();
                 RenderSystem.depthMask(true);
+                // vanilla cleared depth just before the sky, which writes none: back to exactly that state
+                RenderSystem.clear(GL11.GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX);
             }
         } finally {
             perfRenderNanos += System.nanoTime() - renderStart;
