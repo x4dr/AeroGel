@@ -67,7 +67,8 @@ per-position state must also **pin the adaptive state** for its duration — a z
 which can push tick time over `activateTickMs` and stall the probe mid-sequence, and a stalled probe is still
 a parked one. And probes must never call a config-persisting setter: a run that does not reach its cleanup
 leaves the dev instance configured differently, and reads the altered value back as its "original" next time.
-That is what `debugSetHoldSeconds` / `debugSetEngageOnTeleport` / `debugSetActivateThresholds` exist for.
+That is what `debugSetHoldSeconds` / `debugSetEngageOnTeleport` / `debugSetActivateThresholds` /
+`debugSetRefuseStubWrites` exist for.
 
 **Two traps in running the suite itself, both of which cost a long misdiagnosis.** A probe that halts the
 server leaves the world lock held briefly, and the next run then dies at boot with
@@ -358,11 +359,14 @@ choke at ~80 chunks/s swept).
   by `mixin/VanillaChunkWriteMixin` / `mixin/VanillaBlockTickMixin` with a thread-local depth. Vanilla writes do
   not count against the per-chunk drop cap.
   **This is white-box**: it works by hooking the vanilla paths that write into a chunk after generation reports
-  done. A future vanilla version adding a third such path reintroduces the bug silently — no probe catches it,
-  because the trigger is a vegetated chunk. If that happens, the fallback is `promotion.refuseStubWrites` /
+  done. `aerogel.promote` witnesses the order on every run (#19): with two caller writes still pending it drives
+  one write down each hooked path (`postProcessGeneration` over glass, a leaf `tickBlock` over leaves), asserts
+  both were deferred, and that the caller's block is what remains — replaying `caller` first or merging the
+  queues fails it. What no probe can catch is a future vanilla version adding a *third* such path; that
+  reintroduces the bug silently. If that happens, the fallback is `promotion.refuseStubWrites` /
   `/aerogel promote refuse true`, which has no detection at all: refuse every write into a chunk that is not real
   terrain instead of deferring it (the placement fails and the actor retries; the chunk is promoted on the first
-  attempt). Default off.
+  attempt). Default off; covered by `aerogel.refuse`.
   A **player's** right-click into such a chunk is refused instead (click on it cancelled; placement through a real
   block's face into it: item use denied, block use still runs; item kept, chunk promoted at once; #6), and
   server stop finishes every chunk with pending writes before the save (bounded 10 s, leftovers logged).
@@ -460,7 +464,8 @@ compiled into every dev run and into **no published jar**. There is no runtime f
 exists — the code either is in the build or is not. `ProbeFakePlayer` is the shared fake-player helper (parking,
 and the draining channel described under the probe rules above):
 `touch run/server/aerogel.probe` (gate smoke test), `touch run/server/aerogel.promote` (promotion +
-deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (25-chunk promotion burst),
+deferred-write + push-up smoke test, plus the #16 write-order witness), `touch run/server/aerogel.refuse`
+(`refuseStubWrites`: a write into a stub is refused, promotes the chunk on the first attempt, banks nothing), `touch run/server/aerogel.promotestress` (25-chunk promotion burst),
 `touch run/server/aerogel.flight` (fast-flight benchmark matrix), `touch run/server/aerogel.writesafety` (#6;
 start twice: player placement refused, then a pending write must survive the stop), `touch
 run/server/aerogel.sablebody` (#9: Sable bodies over proxies promote near the surface, not when flying high),
