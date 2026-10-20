@@ -500,12 +500,15 @@ public final class ProxyStreamer {
         // promotion tick so the refill and the decision below read the SAME window maxima -- they disagree on
         // the tick the maxima step down, and the refill's "busy" against the decision's "calm" is the burst.
         AdaptiveMode.sample(srv);
+        // 0+. finished promotions first, so onComplete frees each slot before retryInFlight's backstop looks:
+        // drained after it, every promotion read as a reclaimed lost callback (#20)
+        ProxyChunkGate.drainCompletions(srv);
         // 0a. automatic promotion: retry -> accrue -> refill -> drain. The refill writes the queue, and the
         // decision below reads the queue as its disengage veto, so this must sit between the two phases.
         PromotionManager.tick(srv);
         // 0b. adaptive enforcement, phase 2: decide against the queue the refill just wrote
         AdaptiveMode.decide(srv);
-        // 0c. classification completions + placeholder cache pruning
+        // 0c. classification completions, resends + placeholder cache pruning
         ProxyChunkGate.tick(srv);
         if (!streamEnabled) {
             return; // bisect switch: no proxy sampling/sending; the gate and promotion still run

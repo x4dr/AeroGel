@@ -10,7 +10,8 @@ import net.minecraft.server.MinecraftServer;
  *
  * <p>Flags (all optional, all created next to {@code server.properties} in the game directory):
  * {@code aerogel.probe} (gate smoke test), {@code aerogel.promote} (promotion + deferred-write + push-up),
- * {@code aerogel.promotestress} (25-chunk promotion burst), {@code aerogel.writesafety} (#6: player placement
+ * {@code aerogel.promotestress} (25-chunk promotion burst, no in-flight reclaim), {@code aerogel.demote} (#20: a
+ * promotion whose holder is demoted is not taken as promoted), {@code aerogel.writesafety} (#6: player placement
  * refused + pending write survives a stop; two starts), {@code aerogel.sablebody} (#9: Sable bodies over proxies),
  * {@code aerogel.drain} (the disengage model: paced drain + the queue/in-flight disengage veto),
  * {@code aerogel.stationary} (sampling is one burst, then nothing while a player stands still),
@@ -30,6 +31,7 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.probe"))
             || Files.exists(dir.resolve("aerogel.promote"))
             || Files.exists(dir.resolve("aerogel.promotestress"))
+            || Files.exists(dir.resolve("aerogel.demote"))
             || Files.exists(dir.resolve("aerogel.writesafety"))
             || Files.exists(dir.resolve("aerogel.vanillaclient"))
             || Files.exists(dir.resolve("aerogel.sablebody"))) {
@@ -46,6 +48,9 @@ public final class DevProbeImpl implements DevProbe {
         }
         if (Files.exists(dir.resolve("aerogel.promotestress"))) {
             server.execute(() -> PromotionStressProbe.start(server));
+        }
+        if (Files.exists(dir.resolve("aerogel.demote"))) {
+            server.execute(() -> DemoteProbe.start(server));
         }
         if (Files.exists(dir.resolve("aerogel.sablebody"))) {
             server.execute(() -> SableBodyProbe.start(server));
@@ -89,6 +94,7 @@ public final class DevProbeImpl implements DevProbe {
         PromotionProbe.tick(server);
         GenerationProbe.tick(server);
         PromotionStressProbe.tick(server);
+        DemoteProbe.tick(server);
         WriteSafetyProbe.tick(server);
         SableBodyProbe.tick(server);
         DrainProbe.tick(server);

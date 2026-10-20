@@ -17,8 +17,8 @@ makes are:
   the `proxy` switch on) gates *sending meshes* and nothing else; promotion is a server-side generation
   decision with no interest in what any client draws. This is what deletes the nearby-leftover arm instead of
   merely re-pacing it, and with it #15's uncapped generation storm.
-- **The disengage model replaces the linger-counter veto.** Per tick: sample the window → retry → accrue →
-  refill → drain → *decide*. Refill runs before the emptiness check, so "queue empty" can only mean "nothing
+- **The disengage model replaces the linger-counter veto.** Per tick: sample the window → finish completed promotions →
+  retry → accrue → refill → drain → *decide*. Refill runs before the emptiness check, so "queue empty" can only mean "nothing
   left to generate", which is why disengaging cannot burst instant generation. Refill bypasses the linger
   **threshold** while calm, never the budget; only player actions (touchdown, block write, refused
   right-click, Sable body contact) bypass the budget. The adaptive tick is **split in two** — `AdaptiveMode.sample`
@@ -369,6 +369,14 @@ choke at ~80 chunks/s swept).
 - **Promotion in flight reads like a proxy**: until the promoted chunk's FULL future completes
   (`ProxyChunkGate.isPromoting`), main-thread reads get the placeholder (`requireChunk=false`: `null`), fluid
   spread is cancelled and the clamp net stays on; vanilla `getChunk` would `managedBlock` on the generation (#13).
+- **Promotion completion** (#20): the FULL future's callback only queues a record; `ProxyChunkGate.drainCompletions`
+  runs it (push, resend, `onComplete` freeing the slot) **before** `PromotionManager.tick`, and logs one
+  `drained promotion of proxy chunk … push=… resend=… N tick(s) since start` line each. Success is the future's
+  `ChunkResult`, not the absence of an exception: a holder demoted mid-generation completes it with an error
+  result, which is logged as `ended without a chunk` and neither pushed nor resent. `retryInFlight` reclaims a
+  slot only for a real chunk that is no longer promoting — FULL status (`isLoadedReal`) lands ticks before the
+  FULL future, which also waits for the 3x3 — so a reclaim (counted, `debugInFlightReclaims`) is an anomaly; a
+  lost callback stays promoting and is recovered by the re-drive.
 - **Clamp**: client `ClientTickEvent.Post` owns standing (snap + onGround claim → sprint/jump work); server
   `PlayerTickEvent.Post` is a through-floor net only (2-block deadzone, skipped over REAL chunks so you can
   cave underground). Per-tick server teleports caused rubber-banding — don't reintroduce.
@@ -460,7 +468,9 @@ compiled into every dev run and into **no published jar**. There is no runtime f
 exists — the code either is in the build or is not. `ProbeFakePlayer` is the shared fake-player helper (parking,
 and the draining channel described under the probe rules above):
 `touch run/server/aerogel.probe` (gate smoke test), `touch run/server/aerogel.promote` (promotion +
-deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (25-chunk promotion burst),
+deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (25-chunk promotion burst; FAILS on any in-flight reclaim, #20),
+`touch run/server/aerogel.demote` (#20: a promotion whose holder is demoted mid-generation is not taken as
+promoted — not pushed, not resent),
 `touch run/server/aerogel.flight` (fast-flight benchmark matrix), `touch run/server/aerogel.writesafety` (#6;
 start twice: player placement refused, then a pending write must survive the stop), `touch
 run/server/aerogel.sablebody` (#9: Sable bodies over proxies promote near the surface, not when flying high),
