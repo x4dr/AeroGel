@@ -143,6 +143,8 @@ public final class ProxyRenderer {
         long removeStart;
         /** the client held real terrain here at the last sync: this proxy draws without depth (see render). */
         boolean real;
+        /** the real chunk was in the renderer's drawn set at the last sync: nothing to fill, skip the draw. */
+        boolean hidden;
     }
 
     private static final Long2ObjectOpenHashMap<ChunkGpu> gpu = new Long2ObjectOpenHashMap<>();
@@ -402,9 +404,9 @@ public final class ProxyRenderer {
                 // terrain write depth, so they resolve against each other and hide whatever is really behind
                 // them (#21: walls drawn through nearer tops, real cut faces and clouds painted over the
                 // layer). Nothing real can be inside such a chunk, so only geometry behind the proxy loses.
-                // Pass 1: proxies over real chunks stay depth-less, as before: the real terrain painted
-                // afterwards covers them wherever it exists, the proxy only fills what the renderer skips
-                // (Sodium never says what that is), and the proxy surface never hides a real-terrain pixel.
+                // Pass 1: proxies over real chunks the renderer does NOT draw (not compiled yet, culled) stay
+                // depth-less, as before: real terrain painted afterwards covers them wherever it exists, and
+                // the proxy surface never hides a real-terrain pixel. Real chunks it draws get no proxy at all.
                 RenderSystem.enableDepthTest();
                 // proxy chunks are textured: bind the block atlas and use the position_tex_color shader
                 RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
@@ -420,7 +422,7 @@ public final class ProxyRenderer {
                     RenderSystem.depthMask(pass == 0);
                     for (Long2ObjectMap.Entry<ChunkGpu> entry : gpu.long2ObjectEntrySet()) {
                         ChunkGpu g = entry.getValue();
-                        if (g.buffer == null || g.real != (pass == 1)) {
+                        if (g.buffer == null || g.hidden || g.real != (pass == 1)) {
                             continue;
                         }
                         float off = ClientFeatures.anim ? offset(g, now) : 0.0f;
@@ -538,13 +540,15 @@ public final class ProxyRenderer {
             }
             ClientMeshStore.Mesh mesh = e.getValue();
             ChunkGpu g = gpu.get(pos);
-            // Real terrain is no longer a reason to stop drawing a proxy: the layer is painted before the
-            // terrain and does not write depth, so anything the renderer draws covers it. Uploading
-            // unconditionally is also what guarantees no hole — a chunk the renderer happens not to draw is
-            // still covered by us.
+            // Upload unconditionally: a real chunk the renderer stops drawing must be coverable at once.
+            // Whether it is drawn is decided per frame from the flags below.
             boolean real = isRealCached(level, pos);   // ponytail: one getChunkNow (+ air scan) per mesh per sync
+            // a real chunk the renderer draws needs no fill: drawing its old plane anyway shows it wherever the
+            // real geometry leaves sky (a pit, valley, overhang, looking up from below its surface; #21 shot 2)
+            boolean hidden = real && isRenderedCached(level, pos);
             if (g != null) {
                 g.real = real;
+                g.hidden = hidden;
             }
             if (g != null && g.removeStart != 0L) {
                 // the real chunk left view again before the sink finished -> bring the proxy back
@@ -559,6 +563,7 @@ public final class ProxyRenderer {
                 g = new ChunkGpu();
                 g.riseStart = now;
                 g.real = real;
+                g.hidden = hidden;
                 gpu.put(pos, g);
                 uploadChunk(level, pos, mesh, wallMask(level, pos), g);
                 uploads++;
