@@ -18,7 +18,6 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import org.joml.Matrix4f;
-import org.lwjgl.opengl.GL11;
 import dev.aerogel.common.ProxyChunkUtil;
 import dev.aerogel.common.ProxyTopology;
 import dev.aerogel.mixin.LevelRendererAccessor;
@@ -142,6 +141,8 @@ public final class ProxyRenderer {
         long riseStart;
         /** when the sink started (ms); 0 while not being removed. */
         long removeStart;
+        /** the client held real terrain here at the last sync: this proxy draws without depth (see render). */
+        boolean real;
     }
 
     private static final Long2ObjectOpenHashMap<ChunkGpu> gpu = new Long2ObjectOpenHashMap<>();
@@ -397,15 +398,14 @@ public final class ProxyRenderer {
                 RenderSystem.setShader(GameRenderer::getPositionColorShader);
                 RenderSystem.disableCull();
                 RenderSystem.disableBlend();
-                // Drawn BEFORE the terrain: real geometry painted afterwards covers these pixels wherever it
-                // exists, so the proxy is visible exactly where nothing else draws. That is what removes the
-                // need to know what the renderer is drawing (Sodium never tells us), and it cannot leave a
-                // hole — the worst case is a proxy pixel being painted over, never a real-terrain pixel
-                // being hidden by a proxy. Within the layer we DO write depth, so proxy tops and walls
-                // resolve against each other instead of in buffer submission (hash) order (#21: walls drawn
-                // through nearer tops); the finally clears that depth again before the terrain draws.
+                // Drawn BEFORE the terrain, in two passes. Pass 0: proxies where the client holds no real
+                // terrain write depth, so they resolve against each other and hide whatever is really behind
+                // them (#21: walls drawn through nearer tops, real cut faces and clouds painted over the
+                // layer). Nothing real can be inside such a chunk, so only geometry behind the proxy loses.
+                // Pass 1: proxies over real chunks stay depth-less, as before: the real terrain painted
+                // afterwards covers them wherever it exists, the proxy only fills what the renderer skips
+                // (Sodium never says what that is), and the proxy surface never hides a real-terrain pixel.
                 RenderSystem.enableDepthTest();
-                RenderSystem.depthMask(true);
                 // proxy chunks are textured: bind the block atlas and use the position_tex_color shader
                 RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
                 // proxy terrain is lit by sky light 15 only (no block light): multiply the baked biome tint by
@@ -416,22 +416,25 @@ public final class ProxyRenderer {
                     ? Math.clamp(level.getSkyDarken(1.0f), 0.2f, 1.0f) : 1.0f;
                 RenderSystem.setShaderColor(sky, sky, sky, 1.0f);
                 int activeAnims = 0;
-                for (Long2ObjectMap.Entry<ChunkGpu> entry : gpu.long2ObjectEntrySet()) {
-                    ChunkGpu g = entry.getValue();
-                    if (g.buffer == null) {
-                        continue;
+                for (int pass = 0; pass < 2; pass++) {
+                    RenderSystem.depthMask(pass == 0);
+                    for (Long2ObjectMap.Entry<ChunkGpu> entry : gpu.long2ObjectEntrySet()) {
+                        ChunkGpu g = entry.getValue();
+                        if (g.buffer == null || g.real != (pass == 1)) {
+                            continue;
+                        }
+                        float off = ClientFeatures.anim ? offset(g, now) : 0.0f;
+                        if (off != 0.0f) {
+                            activeAnims++;
+                        }
+                        scratch.set(base);
+                        if (off != 0.0f) {
+                            scratch.translate(0.0f, off, 0.0f);
+                        }
+                        g.buffer.bind();
+                        g.buffer.drawWithShader(scratch, event.getProjectionMatrix(), GameRenderer.getPositionTexColorShader());
+                        perfDraws++;
                     }
-                    float off = ClientFeatures.anim ? offset(g, now) : 0.0f;
-                    if (off != 0.0f) {
-                        activeAnims++;
-                    }
-                    scratch.set(base);
-                    if (off != 0.0f) {
-                        scratch.translate(0.0f, off, 0.0f);
-                    }
-                    g.buffer.bind();
-                    g.buffer.drawWithShader(scratch, event.getProjectionMatrix(), GameRenderer.getPositionTexColorShader());
-                    perfDraws++;
                 }
                 lastActiveAnims = activeAnims;
                 perfAnimSum += activeAnims;
@@ -449,8 +452,6 @@ public final class ProxyRenderer {
                 RenderSystem.enableCull();
                 RenderSystem.enableBlend();
                 RenderSystem.depthMask(true);
-                // vanilla cleared depth just before the sky, which writes none: back to exactly that state
-                RenderSystem.clear(GL11.GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX);
             }
         } finally {
             perfRenderNanos += System.nanoTime() - renderStart;
@@ -541,6 +542,10 @@ public final class ProxyRenderer {
             // terrain and does not write depth, so anything the renderer draws covers it. Uploading
             // unconditionally is also what guarantees no hole — a chunk the renderer happens not to draw is
             // still covered by us.
+            boolean real = isRealCached(level, pos);   // ponytail: one getChunkNow (+ air scan) per mesh per sync
+            if (g != null) {
+                g.real = real;
+            }
             if (g != null && g.removeStart != 0L) {
                 // the real chunk left view again before the sink finished -> bring the proxy back
                 g.removeStart = 0L;
@@ -553,6 +558,7 @@ public final class ProxyRenderer {
                 }
                 g = new ChunkGpu();
                 g.riseStart = now;
+                g.real = real;
                 gpu.put(pos, g);
                 uploadChunk(level, pos, mesh, wallMask(level, pos), g);
                 uploads++;
