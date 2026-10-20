@@ -369,6 +369,9 @@ choke at ~80 chunks/s swept).
 - **Promotion in flight reads like a proxy**: until the promoted chunk's FULL future completes
   (`ProxyChunkGate.isPromoting`), main-thread reads get the placeholder (`requireChunk=false`: `null`), fluid
   spread is cancelled and the clamp net stays on; vanilla `getChunk` would `managedBlock` on the generation (#13).
+  Its **neighbours** mid-generation (the 5x5 and the pyramid) need nothing of the kind: `getChunkNow` is null for
+  them until FULL (NeoForge's `currentlyLoading` answers early only inside the FULL step itself), so they stay
+  proxies and reads get the placeholder — measured by `aerogel.midgen`, 0 stalls over ~67k reads (#18, `TODO.md` 5).
 - **Clamp**: client `ClientTickEvent.Post` owns standing (snap + onGround claim → sprint/jump work); server
   `PlayerTickEvent.Post` is a through-floor net only (2-block deadzone, skipped over REAL chunks so you can
   cave underground). Per-tick server teleports caused rubber-banding — don't reintroduce.
@@ -475,7 +478,8 @@ run/server/aerogel.independence` (gating and proxy rendering are independent axe
 `travel`/`proxy` combinations), `touch run/server/aerogel.footprint` (what one promotion generates: its 5x5 at
 FULL plus the partial pyramid around it, and that the pyramid terminates), `touch run/server/aerogel.rate` (the
 linger drain's rate, the refill's calm-threshold bypass, and the pacer's brake and starvation floor under an
-injected load).
+injected load), `touch run/server/aerogel.midgen` (#18: every main-thread read path on a promotion's
+mid-generation neighbours, timed every tick and from inside `ChunkEvent.Load`, must never run chunk tasks).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 
