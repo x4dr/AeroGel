@@ -10,7 +10,9 @@ import net.minecraft.server.MinecraftServer;
  *
  * <p>Flags (all optional, all created next to {@code server.properties} in the game directory):
  * {@code aerogel.probe} (gate smoke test), {@code aerogel.promote} (promotion + deferred-write + push-up),
- * {@code aerogel.promotestress} (25-chunk promotion burst), {@code aerogel.writesafety} (#6: player placement
+ * {@code aerogel.refuse} (#19: {@code refuseStubWrites} refuses, promotes on the first attempt, banks nothing),
+ * {@code aerogel.promotestress} (25-chunk promotion burst, no in-flight reclaim), {@code aerogel.demote} (#20: a
+ * promotion whose holder is demoted is not taken as promoted), {@code aerogel.writesafety} (#6: player placement
  * refused + pending write survives a stop; two starts), {@code aerogel.sablebody} (#9: Sable bodies over proxies),
  * {@code aerogel.drain} (the disengage model: paced drain + the queue/in-flight disengage veto),
  * {@code aerogel.stationary} (sampling is one burst, then nothing while a player stands still),
@@ -21,6 +23,7 @@ import net.minecraft.server.MinecraftServer;
  * starvation floor under an injected load),
  * {@code aerogel.footprint} (what one promotion generates: its 5x5 at FULL plus the partial pyramid around it,
  * and #17: a void vs a frontier promotion against what the pacer predicts and charges),
+ * {@code aerogel.midgen} (#18: main-thread reads on a promotion's mid-generation neighbours never stall),
  * {@code aerogel.flight} (fast-flight benchmark matrix).
  * Each one deletes its own flag before a normal run.</p>
  */
@@ -30,7 +33,9 @@ public final class DevProbeImpl implements DevProbe {
         Path dir = server.getServerDirectory();
         if (Files.exists(dir.resolve("aerogel.probe"))
             || Files.exists(dir.resolve("aerogel.promote"))
+            || Files.exists(dir.resolve("aerogel.refuse"))
             || Files.exists(dir.resolve("aerogel.promotestress"))
+            || Files.exists(dir.resolve("aerogel.demote"))
             || Files.exists(dir.resolve("aerogel.writesafety"))
             || Files.exists(dir.resolve("aerogel.vanillaclient"))
             || Files.exists(dir.resolve("aerogel.sablebody"))) {
@@ -45,8 +50,14 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.promote"))) {
             server.execute(() -> PromotionProbe.start(server));
         }
+        if (Files.exists(dir.resolve("aerogel.refuse"))) {
+            server.execute(() -> RefuseProbe.start(server));
+        }
         if (Files.exists(dir.resolve("aerogel.promotestress"))) {
             server.execute(() -> PromotionStressProbe.start(server));
+        }
+        if (Files.exists(dir.resolve("aerogel.demote"))) {
+            server.execute(() -> DemoteProbe.start(server));
         }
         if (Files.exists(dir.resolve("aerogel.sablebody"))) {
             server.execute(() -> SableBodyProbe.start(server));
@@ -78,6 +89,9 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.footprint"))) {
             server.execute(() -> FootprintProbe.start(server));
         }
+        if (Files.exists(dir.resolve("aerogel.midgen"))) {
+            server.execute(() -> MidGenReadProbe.start(server));
+        }
         // the flight harness keeps the REAL adaptive path (no debugAlwaysOn) and waits for a player
         if (Files.exists(dir.resolve("aerogel.flight"))) {
             FlightProbe.start(server);
@@ -88,8 +102,10 @@ public final class DevProbeImpl implements DevProbe {
     public void onServerTick(MinecraftServer server) {
         FlightProbe.tick(server); // move the pilot first, so the streamer sees the new position
         PromotionProbe.tick(server);
+        RefuseProbe.tick(server);
         GenerationProbe.tick(server);
         PromotionStressProbe.tick(server);
+        DemoteProbe.tick(server);
         WriteSafetyProbe.tick(server);
         SableBodyProbe.tick(server);
         DrainProbe.tick(server);
@@ -100,6 +116,7 @@ public final class DevProbeImpl implements DevProbe {
         TeleportProbe.tick(server);
         RateProbe.tick(server);
         FootprintProbe.tick(server);
+        MidGenReadProbe.tick(server);
     }
 
     @Override
