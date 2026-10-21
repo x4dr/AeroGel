@@ -1,16 +1,19 @@
 package dev.aerogel.server;
 
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.EmptyLevelChunk;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.ProtoChunk;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,12 +25,13 @@ import org.slf4j.LoggerFactory;
  * that a main-thread read returns the placeholder at once instead of blocking (#13), and writes more than the
  * 256-per-chunk cap into the chunk, which must all land, replayed over more than one tick (#5). Self-halting.
  *
- * <p><b>KNOWN FAILING (#16).</b> The late batch below was last observed landing only partially (267/512,
- * 257/512 and 70/512 across three runs), so this probe currently FAILs and that question is unresolved:
- * caller writes issued after a chunk went real are partly lost, and it is not yet established whether that
- * is AeroGel or vanilla semantics. The probe was reconstructed after being deleted; the run that produced
- * those numbers and its logs are gone, so the finding is currently unreproducible. Fix or verdict it before
- * treating a PASS here as meaningful.</p>
+ * <p><b>#16 write-order witness (#19).</b> Two caller writes (diamond) are deferred behind the bulk batch, and
+ * on the first tick the chunk is real, while both are still pending, the probe drives one write down each of
+ * the two vanilla paths that used to erase them: {@code LevelChunk.postProcessGeneration} over glass at
+ * {@link #witnessPost} and a leaf block tick ({@code ServerLevel.tickBlock}) over leaves at
+ * {@link #witnessLeaf}. Each must be deferred (the chunk's pending count grows), and the diamond must
+ * still be there at the end. Replaying {@code caller} before {@code vanilla}, or one merged FIFO, lets the
+ * vanilla write land last and fails the probe; a chunk with no vegetation can no longer pass it by luck.</p>
  */
 final class PromotionProbe {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.promoteprobe");
@@ -58,6 +62,16 @@ final class PromotionProbe {
     private static final int LATE_LAYERS = 2;
     private static final int LATE = 16 * 16 * LATE_LAYERS;
     private static boolean lateWritten;
+
+    // ---- WRITE-ORDER WITNESS (#19) -------------------------------------------------------------------------
+    // y=90 is clear of every band above; both positions get their terrain written straight into the chunk, the
+    // way worldgen places it, so what vanilla writes back is known.
+    private static final int WITNESS_Y = 90;
+    private static BlockPos witnessPost;
+    private static BlockPos witnessLeaf;
+    private static boolean raced;
+    private static String race = "never raced (chunk not real within the bound)";
+    private static boolean raceOk;
 
     private static ServerLevel level;
     private static ChunkPos probe;
@@ -91,6 +105,8 @@ final class PromotionProbe {
             return;
         }
         writePos = new BlockPos(probe.getMinBlockX() + 8, 100, probe.getMinBlockZ() + 8);
+        witnessPost = new BlockPos(probe.getMinBlockX() + 2, WITNESS_Y, probe.getMinBlockZ() + 2);
+        witnessLeaf = new BlockPos(probe.getMinBlockX() + 12, WITNESS_Y, probe.getMinBlockZ() + 12);
         LOGGER.info("promote probe: chunk {} loaded as proxy (no FULL future)", probe);
     }
 
@@ -122,6 +138,46 @@ final class PromotionProbe {
             }
         }
         LOGGER.info("promote probe: in-flight read {}; {} writes into the generating chunk", inFlightRead, BULK);
+        // queued after the bulk, so both are still pending on the tick the chunk turns real
+        level.setBlock(witnessPost, Blocks.DIAMOND_BLOCK.defaultBlockState(), 3);
+        level.setBlock(witnessLeaf, Blocks.DIAMOND_BLOCK.defaultBlockState(), 3);
+    }
+
+    /**
+     * #19: with the caller's diamonds still pending, drive one write down each vanilla path into the now-real
+     * chunk. Both must be deferred; whether they then land before the diamonds is what the verdict checks.
+     */
+    private static void race(LevelChunk chunk) {
+        raced = true;
+        boolean pendingCaller = !level.getBlockState(witnessPost).is(Blocks.DIAMOND_BLOCK)
+            && !level.getBlockState(witnessLeaf).is(Blocks.DIAMOND_BLOCK);
+        long pos = probe.toLong();
+        int p0 = PromotionManager.debugDeferredWrites(level, pos);
+        // postProcessGeneration: mark the glass for post-processing and run the real method. It has not run for
+        // this chunk yet (that happens when it starts ticking), so vanilla's own post-processing entries go too:
+        // the count grows by at least one, not exactly one.
+        chunk.setBlockState(witnessPost, Blocks.GLASS.defaultBlockState(), false);
+        ChunkAccess.getOrCreateOffsetList(chunk.getPostProcessing(), chunk.getSectionIndex(WITNESS_Y))
+            .add(ProtoChunk.packOffsetCoordinates(witnessPost));
+        chunk.postProcessGeneration();
+        int p1 = PromotionManager.debugDeferredWrites(level, pos);
+        // the leaf decay tick: ServerLevel.tickBlock is what the scheduled tick calls; LeavesBlock.tick writes back
+        chunk.setBlockState(witnessLeaf, Blocks.OAK_LEAVES.defaultBlockState(), false);
+        String tickErr = "";
+        try {
+            Method tickBlock = ServerLevel.class.getDeclaredMethod("tickBlock", BlockPos.class, Block.class);
+            tickBlock.setAccessible(true);
+            tickBlock.invoke(level, witnessLeaf, Blocks.OAK_LEAVES);
+        } catch (ReflectiveOperationException e) {
+            tickErr = " (tickBlock failed: " + e + ")";
+        }
+        int p2 = PromotionManager.debugDeferredWrites(level, pos);
+        raceOk = pendingCaller && p1 > p0 && p2 == p1 + 1;
+        race = String.format("caller diamonds pending=%s; postProcessGeneration over %s at %s deferred %d->%d; "
+                + "leaf tick over %s at %s deferred %d->%d%s", pendingCaller, level.getBlockState(witnessPost).getBlock(),
+            witnessPost.toShortString(), p0, p1, level.getBlockState(witnessLeaf).getBlock(),
+            witnessLeaf.toShortString(), p1, p2, tickErr);
+        LOGGER.info("promote probe: witness raced at tick {}: {}", ticks, race);
     }
 
     private static int bulkPresent() {
@@ -221,11 +277,14 @@ final class PromotionProbe {
             lateWritten = true;
         }
         LevelChunk chunk = level.getChunkSource().getChunkNow(probe.x, probe.z);
+        if (written && !raced && chunk != null) {
+            race(chunk);
+        }
         int present = chunk == null ? 0 : bulkPresent();
         if (present > 0 && bulkFirstTick < 0) {
             bulkFirstTick = ticks;
         }
-        if (chunk != null && (present == BULK && latePresent() == LATE || ticks > MAX_TICKS)) {
+        if (chunk != null && (present == BULK && latePresent() == LATE && witnessLanded() || ticks > MAX_TICKS)) {
             BlockState at = level.getBlockState(writePos);
             boolean replayed = at.is(Blocks.STONE);
             int spread = present > 0 ? ticks - bulkFirstTick + 1 : 0;
@@ -233,7 +292,12 @@ final class PromotionProbe {
             int late = latePresent();
             int pending = PromotionManager.debugDeferredWrites(level, probe.toLong());
             LOGGER.info("promote probe: late batch (caller AFTER vanilla) {}/{}", late, LATE);
-            boolean pass = replayed && inFlightOk && present == BULK && late == LATE && spread > 1 && realAfter;
+            String post = level.getBlockState(witnessPost).getBlock().toString();
+            String leaf = level.getBlockState(witnessLeaf).getBlock().toString();
+            boolean witness = raceOk && witnessLanded();
+            LOGGER.info("promote probe: witness (#19) {} — caller's write after the race: postProcess pos {}, leaf-tick pos {}; {}",
+                witness ? "PASS" : "FAIL", post, leaf, race);
+            boolean pass = replayed && inFlightOk && present == BULK && late == LATE && spread > 1 && realAfter && witness;
             LOGGER.info("promote probe: VERDICT {} — chunk {} real after {} ticks, deferred write replayed={} (block {}); "
                     + "in-flight read {}; {}/{} in-flight writes landed over {} tick(s); real read after={}; "
                     + "missing: {}; late missing: {}; deferred still pending={}",
@@ -245,6 +309,11 @@ final class PromotionProbe {
             LOGGER.error("promote probe: VERDICT FAIL — chunk {} still a proxy after {} ticks", probe, ticks);
             finish(server);
         }
+    }
+
+    private static boolean witnessLanded() {
+        return level.getBlockState(witnessPost).is(Blocks.DIAMOND_BLOCK)
+            && level.getBlockState(witnessLeaf).is(Blocks.DIAMOND_BLOCK);
     }
 
     /** place a zombie inside a block and check the push-up frees it. */
