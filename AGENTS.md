@@ -17,8 +17,8 @@ makes are:
   the `proxy` switch on) gates *sending meshes* and nothing else; promotion is a server-side generation
   decision with no interest in what any client draws. This is what deletes the nearby-leftover arm instead of
   merely re-pacing it, and with it #15's uncapped generation storm.
-- **The disengage model replaces the linger-counter veto.** Per tick: sample the window → retry → accrue →
-  refill → drain → *decide*. Refill runs before the emptiness check, so "queue empty" can only mean "nothing
+- **The disengage model replaces the linger-counter veto.** Per tick: sample the window → finish completed promotions →
+  retry → accrue → refill → drain → *decide*. Refill runs before the emptiness check, so "queue empty" can only mean "nothing
   left to generate", which is why disengaging cannot burst instant generation. Refill bypasses the linger
   **threshold** while calm, never the budget; only Sable body contact and the server stop's pending-write finish
   bypass the budget (touchdown, block writes, refused right-clicks and refused stub writes queue for the same pacer
@@ -68,7 +68,8 @@ per-position state must also **pin the adaptive state** for its duration — a z
 which can push tick time over `activateTickMs` and stall the probe mid-sequence, and a stalled probe is still
 a parked one. And probes must never call a config-persisting setter: a run that does not reach its cleanup
 leaves the dev instance configured differently, and reads the altered value back as its "original" next time.
-That is what `debugSetHoldSeconds` / `debugSetEngageOnTeleport` / `debugSetActivateThresholds` exist for.
+That is what `debugSetHoldSeconds` / `debugSetEngageOnTeleport` / `debugSetActivateThresholds` /
+`debugSetRefuseStubWrites` exist for.
 
 **Two traps in running the suite itself, both of which cost a long misdiagnosis.** A probe that halts the
 server leaves the world lock held briefly, and the next run then dies at boot with
@@ -366,11 +367,14 @@ choke at ~80 chunks/s swept).
   by `mixin/VanillaChunkWriteMixin` / `mixin/VanillaBlockTickMixin` with a thread-local depth. Vanilla writes do
   not count against the global drop cap.
   **This is white-box**: it works by hooking the vanilla paths that write into a chunk after generation reports
-  done. A future vanilla version adding a third such path reintroduces the bug silently — no probe catches it,
-  because the trigger is a vegetated chunk. If that happens, the fallback is `promotion.refuseStubWrites` /
+  done. `aerogel.promote` witnesses the order on every run (#19): with two caller writes still pending it drives
+  one write down each hooked path (`postProcessGeneration` over glass, a leaf `tickBlock` over leaves), asserts
+  both were deferred, and that the caller's block is what remains — replaying `caller` first or merging the
+  queues fails it. What no probe can catch is a future vanilla version adding a *third* such path; that
+  reintroduces the bug silently. If that happens, the fallback is `promotion.refuseStubWrites` /
   `/aerogel promote refuse true`, which has no detection at all: refuse every write into a chunk that is not real
   terrain instead of deferring it (the placement fails and the actor retries; the first attempt queues the chunk).
-  Default off.
+  Default off; covered by `aerogel.refuse`.
   A **player's** right-click into such a chunk is refused instead (click on it cancelled; placement through a real
   block's face into it: item use denied, block use still runs; item kept, chunk queued for the pacer and clicks
   refused until it is real; #6), and
@@ -378,6 +382,17 @@ choke at ~80 chunks/s swept).
 - **Promotion in flight reads like a proxy**: until the promoted chunk's FULL future completes
   (`ProxyChunkGate.isPromoting`), main-thread reads get the placeholder (`requireChunk=false`: `null`), fluid
   spread is cancelled and the clamp net stays on; vanilla `getChunk` would `managedBlock` on the generation (#13).
+  Its **neighbours** mid-generation (the 5x5 and the pyramid) need nothing of the kind: `getChunkNow` is null for
+  them until FULL (NeoForge's `currentlyLoading` answers early only inside the FULL step itself), so they stay
+  proxies and reads get the placeholder — measured by `aerogel.midgen`, 0 stalls over ~67k reads (#18, `TODO.md` 5).
+- **Promotion completion** (#20): the FULL future's callback only queues a record; `ProxyChunkGate.drainCompletions`
+  runs it (push, resend, `onComplete` freeing the slot) **before** `PromotionManager.tick`, and logs one
+  `drained promotion of proxy chunk … push=… resend=… N tick(s) since start` line each. Success is the future's
+  `ChunkResult`, not the absence of an exception: a holder demoted mid-generation completes it with an error
+  result, which is logged as `ended without a chunk` and neither pushed nor resent. `retryInFlight` reclaims a
+  slot only for a real chunk that is no longer promoting — FULL status (`isLoadedReal`) lands ticks before the
+  FULL future, which also waits for the 3x3 — so a reclaim (counted, `debugInFlightReclaims`) is an anomaly; a
+  lost callback stays promoting and is recovered by the re-drive.
 - **Clamp**: client `ClientTickEvent.Post` owns standing (snap + onGround claim → sprint/jump work); server
   `PlayerTickEvent.Post` is a through-floor net only (2-block deadzone, skipped over REAL chunks so you can
   cave underground). Per-tick server teleports caused rubber-banding — don't reintroduce.
@@ -470,7 +485,11 @@ compiled into every dev run and into **no published jar**. There is no runtime f
 exists — the code either is in the build or is not. `ProbeFakePlayer` is the shared fake-player helper (parking,
 and the draining channel described under the probe rules above):
 `touch run/server/aerogel.probe` (gate smoke test), `touch run/server/aerogel.promote` (promotion +
-deferred-write + push-up smoke test), `touch run/server/aerogel.promotestress` (25-chunk promotion burst),
+deferred-write + push-up smoke test, plus the #16 write-order witness), `touch run/server/aerogel.refuse`
+(`refuseStubWrites`: a write into a stub is refused, promotes the chunk on the first attempt, banks nothing),
+`touch run/server/aerogel.promotestress` (25-chunk promotion burst; FAILS on any in-flight reclaim, #20),
+`touch run/server/aerogel.demote` (#20: a promotion whose holder is demoted mid-generation is not taken as
+promoted — not pushed, not resent),
 `touch run/server/aerogel.flight` (fast-flight benchmark matrix), `touch run/server/aerogel.writesafety` (#6;
 start twice: player placement refused, then a pending write must survive the stop), `touch
 run/server/aerogel.sablebody` (#9: Sable bodies over proxies promote near the surface, not when flying high),
@@ -487,9 +506,10 @@ queued, not started, at the write; all 16 starts from the pacer under a raised `
 nothing dropped, every block lands), `touch run/server/aerogel.footprint` (what one promotion generates: its 5x5 at
 FULL plus the partial pyramid around it, and that the pyramid terminates; then a frontier promotion beside it,
 #17: chunk-steps, CPU and backlog of both against the pacer's prediction and charge), `touch
-run/server/aerogel.rate` (the linger drain's rate, the refill's calm-threshold bypass, and the pacer's brake
-and starvation floor under an
-injected load).
+run/server/aerogel.midgen` (#18: every main-thread read path on a promotion's
+mid-generation neighbours, timed every tick and from inside `ChunkEvent.Load`, must never run chunk tasks),
+`touch run/server/aerogel.rate` (the linger drain's rate, the refill's calm-threshold bypass, and the pacer's
+brake and starvation floor under an injected load).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 

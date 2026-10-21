@@ -110,6 +110,19 @@ Not a one-line fix: tightening `loadedNow` makes `isProxy` report true for a pos
 flight, which changes which path serves reads during a promotion (`isPromoting` vs the placeholder) — verified
 behaviour, so it needs its own change and a re-run of the gate probes. Recorded as a comment at the accessor.
 
+**Measured (`aerogel.midgen`, 2026-10-20): a mid-generation neighbour does not stall a read.** The premise is
+narrower than stated: NeoForge sets `currentlyLoading` only inside the FULL step's own main-thread work
+(`ChunkStatusTasks.full`: `runPostLoad`, block-entity registration, `ChunkEvent.Load`), so `getChunkNow` is null
+for a chunk that is merely generating. A partial neighbour therefore stays a proxy and gets the placeholder (a
+peek gets `null`) unless it is already in memory at the requested status. Over one promotion and its settle — 80
+ticks, ~67k timed main-thread reads on its 5x5 and pyramid rings 3-6 through `getChunk(FULL, false/true)`,
+`getChunk(STRUCTURE_REFERENCES)`, `getChunkNow` and `Level.getBlockState`, ~12k of them on partial chunks — no
+read went through vanilla's future chain and no chunk task ran inside a read; per-path maxima 0.1-1.5 ms, one
+first-tick 18.5 ms `STRUCTURE_REFERENCES` read that returned an already available chunk. Inside the 24 load
+windows, where `getChunkNow` does run ahead of FULL, reads of the loading chunk's 3x3 took at most 0.05 ms.
+Sabotaged so that any started holder reads as loaded (the premise above), the same probe saw 168 chunks generated
+inside its reads and a 1.08 s `getChunk(FULL, true)`. No production change was made.
+
 ## 6. Drain-rate numbers — RESOLVED, and the answer was not a number
 
 Measured (`aerogel.rate`, 2026-10-15): the drain's own starts do not move smoothed tick time near the brake

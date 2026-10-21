@@ -164,6 +164,11 @@ public final class PromotionManager {
     /** total retries issued, so a probe can tell the retry path actually ran. */
     private static int inFlightRetries;
     /**
+     * slots {@link #retryInFlight} freed for a real chunk no longer promoting that no completion had cleared:
+     * with the completions drained before this tick, each one is an anomaly (#20).
+     */
+    private static int inFlightReclaims;
+    /**
      * The pacer's decisions since {@link #debugResetRateCounters}, so a probe can tell a drain that was paced
      * by the budget from one that was paced by the concurrency cap, and see the brake and the starvation floor
      * bite instead of inferring them from timing.
@@ -371,6 +376,11 @@ public final class PromotionManager {
     /** true when the server owner opted into refusing (not deferring) writes into a non-real chunk (#16). */
     public static boolean refusesStubWrites() {
         return refuseStubWrites;
+    }
+
+    /** Dev hook: {@link #setRefuseStubWrites} without persisting it, so a probe cannot leave it set. */
+    public static void debugSetRefuseStubWrites(boolean on) {
+        refuseStubWrites = on;
     }
 
     public static void setRefuseStubWrites(boolean on) {
@@ -782,6 +792,10 @@ public final class PromotionManager {
      * genuinely real. {@code ProxyChunkGate.promote} re-runs {@code forcePrepare}, so asking again is a real
      * re-drive rather than the no-op {@code promoteImmediate} would be for an already-allowed position.</p>
      *
+     * <p>The completions are drained before this runs ({@code ProxyChunkGate.drainCompletions}), so a slot
+     * whose promotion finished normally is already free here; a reclaim, counted and logged, is the anomaly.
+     * A lost callback leaves the position promoting and is recovered by the re-drive, not the reclaim.</p>
+     *
      * <p>The trade: a chunk whose generation is genuinely stuck now holds its concurrency slot and keeps being
      * retried, instead of quietly letting the in-flight count drift below the number of generations actually
      * running. A stall is loud in the log; amplification is not.</p>
@@ -794,12 +808,16 @@ public final class PromotionManager {
         while (it.hasNext()) {
             var entry = it.next();
             long pos = entry.getLongKey();
-            if (ProxyChunkGate.isLoadedReal(state.level, pos)) {
-                // it finished, whether or not the callback ever arrived: the slot is genuinely free now
+            // FULL status (what isLoadedReal reads) lands before the FULL future the callback waits on, which
+            // also waits for the 3x3 around it, so a real chunk still promoting is not evidence of a lost
+            // callback: it is left to the retry timer below, whose re-drive registers a fresh one (#20)
+            if (ProxyChunkGate.isLoadedReal(state.level, pos) && !ProxyChunkGate.isPromoting(state.level, pos)) {
+                // real and nothing pending, yet no completion cleared the slot: it is genuinely free now
                 it.remove();
                 state.inFlight.remove(pos);
-                LOGGER.warn("promotion of proxy chunk {} finished without clearing its slot; reclaimed",
-                    new ChunkPos(pos));
+                inFlightReclaims++;
+                LOGGER.warn("promotion of proxy chunk {} finished without clearing its slot; reclaimed ({} so far)",
+                    new ChunkPos(pos), inFlightReclaims);
                 continue;
             }
             if (state.tickCounter - entry.getLongValue() < inFlightRetryTicks) {
@@ -1024,6 +1042,11 @@ public final class PromotionManager {
     /** Dev hook: how many retries have been issued, so a probe can tell the retry path ran. */
     public static int debugInFlightRetries() {
         return inFlightRetries;
+    }
+
+    /** Dev hook: how many in-flight slots were reclaimed without a completion (see {@link #retryInFlight}). */
+    public static int debugInFlightReclaims() {
+        return inFlightReclaims;
     }
 
     /**
