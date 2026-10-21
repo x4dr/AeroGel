@@ -53,9 +53,13 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>Rate limiting.</b> Only <em>linger</em> promotion is paced. A token bucket holds a wall-clock
  * budget that refills at {@code maxGenFraction} ms per ms (default 0.5, i.e. at most half the server's
- * time) and each linger promotion start costs {@code chunkCostMs}; linger starts are also blocked while the
- * smoothed tick time is at or above a brake, which is the tighter of {@code hardGateMs} and the adaptive
- * activate threshold so the drain cannot push load back to the level that would re-engage enforcement.
+ * time) and each linger promotion start costs what it will make vanilla generate (#17): {@code chunkCostMs}
+ * prices a promotion in untouched land, and a start pays the share of that neighbourhood's chunk-steps it
+ * still lacks (see {@link #startCost}), so advancing a generated frontier is cheap and a lone chunk in the
+ * void is not: {@code maxInFlight} bounds sites, the budget bounds generation. Linger starts are also
+ * blocked while the smoothed tick time is at or above a brake, which is the tighter of {@code hardGateMs}
+ * and the adaptive activate threshold so the drain cannot push load back to the level that would re-engage
+ * enforcement.
  * {@code maxInFlight} bounds how many linger regenerations run concurrently, and a long dry spell forces one
  * start anyway, which is the floor that guarantees progress on a server that is already lagging. Immediate
  * promotions are deliberately outside all of this: a player action is a player action.</p>
@@ -1008,6 +1012,11 @@ public final class PromotionManager {
             && !ProxyChunkGate.isLoadedReal(state.level, chunkPos);
     }
 
+    /** Dev hook: what the pacer would charge to start this chunk now ({@link #startCost}). */
+    public static double debugStartCost(ServerLevel lvl, long chunkPos) {
+        return startCost(lvl, chunkPos);
+    }
+
     /** Dev hook: how many retries have been issued, so a probe can tell the retry path ran. */
     public static int debugInFlightRetries() {
         return inFlightRetries;
@@ -1157,8 +1166,8 @@ public final class PromotionManager {
     /**
      * Drain the queue, nearest-player-first, under the generation budget. A single start per level and tick,
      * so the budget and {@code maxInFlight} are what set the rate rather than the loop. The budget is charged
-     * the *measured* main-thread cost of finishing a promotion (push + replay + resend), so an idle server
-     * starts as fast as the concurrency cap allows while a lagging one backs off. A long dry spell forces one
+     * {@link #startCost}: the generation this start causes plus the *measured* main-thread cost of finishing a
+     * promotion (push + replay + resend), so a lagging server backs off. A long dry spell forces one
      * start anyway, which is the floor that guarantees progress on a server that is already lagging.
      */
     private static void processQueue(State state, List<ServerPlayer> players, float tickMs) {
@@ -1169,7 +1178,7 @@ public final class PromotionManager {
         if (pos == Long.MIN_VALUE) {
             return; // nothing with a loaded holder; try again next tick
         }
-        double cost = Math.clamp(ProxyChunkGate.postCostMs(state.level), 2.0, 2000.0);
+        double cost = startCost(state.level, pos);
         boolean starved = state.tickCounter - state.lastStartTick >= FORCE_START_TICKS;
         if (!starved) {
             // The drain must not push tick time to the level that would re-engage enforcement, so the brake
@@ -1181,7 +1190,9 @@ public final class PromotionManager {
                 brakeBlocks++;
                 return; // server already at the level that would re-engage enforcement: queue, do not start
             }
-            if (state.budgetMs < cost) {
+            // a start dearer than the burst cap could never be afforded: let it in at a full bucket and run the
+            // budget into debt, so the next start waits for the rest
+            if (state.budgetMs < Math.min(cost, burstMs)) {
                 budgetBlocks++;
                 return; // no generation time left this window
             }
@@ -1209,6 +1220,17 @@ public final class PromotionManager {
             }
             state.lastStartTick = state.tickCounter;
         }
+    }
+
+    /**
+     * What one linger start costs the budget (#17): {@code chunkCostMs} is the price of a promotion in
+     * untouched land, scaled by the share of that neighbourhood's chunk-steps this start will actually make
+     * vanilla generate ({@link ProxyChunkGate#stepsToPromote}), plus the measured main-thread finish cost. A
+     * start in the void pays the whole pyramid; one that advances a generated frontier pays a fraction.
+     */
+    private static double startCost(ServerLevel level, long pos) {
+        return chunkCostMs * ProxyChunkGate.stepsToPromote(level, pos) / ProxyChunkGate.VOID_STEPS
+            + Math.clamp(ProxyChunkGate.postCostMs(level), 2.0, 2000.0);
     }
 
     /**

@@ -320,18 +320,23 @@ choke at ~80 chunks/s swept).
   `structure_starts` and nothing beyond ring 13. So one promotion is 25 FULL chunks plus ~700 partial
   chunk-stages, and that work is real main-thread chunk-task backlog. The dependency path is
   `ChunkMap.getChunkRangeFuture` → `scheduleChunkGenerationTask` on each neighbour, which **deliberately goes
-  ungated**: intercepting it is what "not being more invasive" buys, and the price is that the pacing below
-  bounds *how many sites convert*, not how many chunks a conversion brings (see `TODO.md` and the issue on
-  accounting for the pyramid). Two consequences worth knowing before tuning: the pyramid's backlog is what
-  raises the adaptive backlog signal during a drain (measured 92 and 576 against `adaptive backlog` 64, while
+  ungated**: intercepting it is what "not being more invasive" buys, so the pacing below prices each start by
+  the chunk-steps it will cause instead (#17). Two consequences worth knowing before tuning: the pyramid's
+  backlog is what raises the adaptive backlog signal during a drain (measured 92 and 576 against
+  `adaptive backlog` 64, while
   smoothed tick time peaked near 6 ms against 35 ms), and because the pyramid leaves that whole area partially
   generated, the marginal cost of the next promotion in the same place collapses — a promotion spends the
   proxies over roughly a 25x25 area.
   **Linger promotion is the only paced path**: a token bucket refilled at `maxGenFraction` ms/ms (default 0.5 =
-  at most half the server's wall time) charged the **measured** post-cost per start (`ProxyChunkGate.postCostMs`,
-  an EMA seeded at 5 ms — the `chunkCostMs` config value is *not* what the pacer charges, see `TODO.md`),
-  blocked while smoothed tick time ≥
-  `hardGateMs`, and bounded by `maxInFlight`; the queue drains strictly nearest-player-first. While the
+  at most half the server's wall time) charged **what a start will make vanilla generate** (#17):
+  `ProxyChunkGate.stepsToPromote` counts the chunk-steps (status advances) still missing in the start's FULL
+  square (5x5 for an entity-ticking holder, 3x3 block-ticking, 1 border) and vanilla's pyramid around it, read
+  from holder statuses; the charge is `chunkCostMs` × steps / `VOID_STEPS` (1387, an untouched entity-ticking
+  neighbourhood) plus the measured finish cost (`ProxyChunkGate.postCostMs`). Measured by `aerogel.footprint`:
+  a void promotion is 1387 steps, 65-180 ms server thread and 15-19 s CPU over all threads; a frontier one four
+  chunks over is 420 steps, 25-80 ms and 2-6 s (six runs); the prediction matched the generated steps exactly. A start dearer
+  than `burstMs` is let in at a full bucket and runs the budget into debt. Starts are blocked while smoothed
+  tick time ≥ `hardGateMs`, and bounded by `maxInFlight`; the queue drains strictly nearest-player-first. While the
   server is **calm** the linger threshold is bypassed — the budget is not — so every fresh lingered stub is
   eligible at once and the same pacer decides when each starts. Promotion **forces the FULL future forward**
   from the chunk's persisted status — no backwards reset. `ProxyChunkGate.forcePrepare` first resets the three
@@ -453,7 +458,8 @@ choke at ~80 chunks/s swept).
     <minBusy> <maxIdle> <maxBusy>` (seconds; default 10 20 30 60), `promote landing <0-64>` (blocks above the
     proxy surface; default 8), `promote concurrency <1-16>` (concurrent **linger** regenerations; default 2),
     `promote budget <0.05-1.0>` (fraction of wall time for linger; default 0.5), `promote cost <ms>` (budget
-    charged per linger promotion; default 100), `promote hardgate <ms>` (linger tick-time brake; default 60),
+    charged for a linger promotion in untouched land; a start pays its share of those chunk-steps; default
+    100), `promote hardgate <ms>` (linger tick-time brake; default 60),
     `promote replay <ms>` (per-tick wall time for replaying deferred writes; default 1.5),
     `promote status` (effective thresholds, budget, queue/in-flight). Every setter writes the COMMON config.
     Immediate (touch / write / right-click / Sable body) promotion ignores `concurrency`, `budget` and
@@ -492,10 +498,12 @@ drops with work outstanding, and everything eventually generates), `touch run/se
 (sampling is one burst then nothing while a player stands still), `touch
 run/server/aerogel.independence` (gating and proxy rendering are independent axes — all four
 `travel`/`proxy` combinations), `touch run/server/aerogel.footprint` (what one promotion generates: its 5x5 at
-FULL plus the partial pyramid around it, and that the pyramid terminates), `touch run/server/aerogel.rate` (the
-linger drain's rate, the refill's calm-threshold bypass, and the pacer's brake and starvation floor under an
-injected load), `touch run/server/aerogel.midgen` (#18: every main-thread read path on a promotion's
-mid-generation neighbours, timed every tick and from inside `ChunkEvent.Load`, must never run chunk tasks).
+ FULL plus the partial pyramid around it, and that the pyramid terminates; then a frontier promotion beside it,
+ #17: chunk-steps, CPU and backlog of both against the pacer's prediction and charge), `touch
+ run/server/aerogel.midgen` (#18: every main-thread read path on a promotion's
+ mid-generation neighbours, timed every tick and from inside `ChunkEvent.Load`, must never run chunk tasks),
+ `touch run/server/aerogel.rate` (the linger drain's rate, the refill's calm-threshold bypass, and the pacer's
+ brake and starvation floor under an injected load).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 

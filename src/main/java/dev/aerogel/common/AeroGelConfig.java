@@ -104,15 +104,18 @@ public final class AeroGelConfig {
             .defineInRange("maxSecondsBusy", 60, 1, 600);
         b.pop();
 
-        b.comment("Generation-time budget. A token bucket refilled at maxGenFraction ms/ms is charged chunkCostMs")
-            .comment("per promotion. Touched/write promotions bypass the budget but still debit it, slowing ordinary")
-            .comment("linger promotion down.")
+        b.comment("Generation-time budget for linger promotion. A token bucket refilled at maxGenFraction ms/ms is")
+            .comment("charged, per start, chunkCostMs scaled by the share of an untouched neighbourhood's chunk-steps")
+            .comment("that start makes vanilla generate, plus the measured finish cost. Touch/write/right-click/Sable")
+            .comment("promotions bypass the budget.")
             .push("rate");
         maxInFlight = b.comment("Maximum promotion regenerations in flight at once (burst cap; applies to all).")
             .defineInRange("maxInFlight", 2, 1, 16);
         maxGenFraction = b.comment("Fraction of wall time the budget may fund (0.5 = at most half).")
             .defineInRange("maxGenFraction", 0.5, 0.05, 1.0);
-        chunkCostMs = b.comment("Budget cost charged per promotion, in ms (chunk generation is ~100 ms).")
+        chunkCostMs = b.comment("Budget charged for promoting a chunk in untouched land (its 5x5 to FULL plus the")
+            .comment("partial pyramid, 1387 chunk-steps; measured 65-180 ms server thread); advancing a generated")
+            .comment("frontier is charged its share of those steps, e.g. ~1/3 beside a promoted chunk.")
             .defineInRange("chunkCostMs", 100.0, 1.0, 5000.0);
         burstMs = b.comment("Maximum banked budget (a burst of back-to-back promotions).")
             .defineInRange("burstMs", 200.0, 0.0, 10000.0);

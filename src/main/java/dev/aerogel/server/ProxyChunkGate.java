@@ -459,6 +459,49 @@ public final class ProxyChunkGate {
         return state == null ? 5.0 : state.postCostEmaNanos / 1_000_000.0;
     }
 
+    /** {@link #stepsToPromote} for an entity-ticking chunk in untouched land: the price list's unit (#17). */
+    public static final int VOID_STEPS = neighbourhoodSteps(null, 0L, 2);
+
+    /**
+     * How many chunk-steps (status advances) promoting this position makes vanilla generate (#17). The FULL
+     * radius comes from the holder's ticket: an entity-ticking chunk needs its 5x5 at FULL, a block-ticking
+     * one its 3x3, a border chunk itself. Around that, every position needs the status vanilla's own pyramid
+     * asks for at that distance ({@link ChunkLevel#getStatusAroundFullChunk}, flat {@code structure_starts}
+     * top included). Each position counts only the steps it still lacks, so a promotion in untouched land
+     * costs the whole pyramid and one that advances a generated frontier a fraction of it. Holder reads only;
+     * a chunk on disk but not in memory counts from scratch, which over- rather than under-charges.
+     * ponytail: statuses lag an in-flight neighbour's generation, so a start beside one is priced as if alone
+     * until those steps land; subtract the in-flight neighbourhoods if that over-charge ever slows a drain.
+     */
+    public static int stepsToPromote(ServerLevel lvl, long pos) {
+        State state = state(lvl);
+        if (state == null) {
+            return VOID_STEPS;
+        }
+        ChunkHolder holder = state.chunkMap.getVisibleChunkIfPresent(pos);
+        int fullLevel = ChunkLevel.byStatus(FullChunkStatus.FULL);
+        int fullRadius = holder == null ? 2 : Math.clamp(fullLevel - holder.getTicketLevel(), 0, 2);
+        return neighbourhoodSteps(state.chunkMap, pos, fullRadius);
+    }
+
+    /** the steps a FULL square of {@code fullRadius} around {@code pos} still needs; null map = nothing exists. */
+    private static int neighbourhoodSteps(ChunkMap map, long pos, int fullRadius) {
+        int reach = fullRadius + ChunkLevel.RADIUS_AROUND_FULL_CHUNK;
+        int x = ChunkPos.getX(pos);
+        int z = ChunkPos.getZ(pos);
+        int steps = 0;
+        for (int dx = -reach; dx <= reach; dx++) {
+            for (int dz = -reach; dz <= reach; dz++) {
+                int distance = Math.max(Math.abs(dx), Math.abs(dz)) - fullRadius;
+                ChunkStatus want = ChunkLevel.getStatusAroundFullChunk(distance);
+                ChunkHolder holder = map == null ? null : map.getVisibleChunkIfPresent(ChunkPos.asLong(x + dx, z + dz));
+                ChunkStatus have = holder == null ? null : holder.getPersistedStatus();
+                steps += Math.max(0, want.getIndex() - (have == null ? 0 : have.getIndex()));
+            }
+        }
+        return steps;
+    }
+
     // ---- classification ----
 
     /** called at {@code ChunkHolder.updateFutures} HEAD on the server thread. */
