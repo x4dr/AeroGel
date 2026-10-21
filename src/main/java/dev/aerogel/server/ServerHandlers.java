@@ -319,7 +319,8 @@ public final class ServerHandlers {
     private static int setCost(CommandContext<CommandSourceStack> ctx, double ms) {
         PromotionManager.setChunkCostMs(ms);
         ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: promotion cost = "
-            + String.format("%.1f", PromotionManager.chunkCostMs()) + " ms"), false);
+            + String.format("%.1f", PromotionManager.chunkCostMs()) + " ms for a promotion in untouched land; a start"
+            + " pays the share of those chunk-steps it generates"), false);
         return 1;
     }
 

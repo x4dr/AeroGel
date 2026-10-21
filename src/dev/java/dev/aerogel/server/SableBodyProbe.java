@@ -90,13 +90,18 @@ final class SableBodyProbe {
             double by = bodyY(bx, bz);
             boolean aStarted = ProxyChunkGate.isPromoting(level, a.toLong()) || realNow(a);
             boolean bProxy = ProxyChunkGate.isProxy(level, b.toLong()) && !ProxyChunkGate.isPromoting(level, b.toLong());
-            early = String.format("A body y=%.1f promotion started=%s; B body y=%.1f (surface %d) still proxy=%s",
-                ay, aStarted, by, surfaceB, bProxy);
+            // Sable bodies stay immediate (#9; no proxy collider): no player is online, so a pacer start means A
+            // went through the queue
+            int paced = PromotionManager.debugLingerStarts();
+            early = String.format("A body y=%.1f promotion started=%s (pacer starts %d); B body y=%.1f (surface %d) still proxy=%s",
+                ay, aStarted, paced, by, surfaceB, bProxy);
             LOGGER.info("sable probe: {}", early);
             if (Double.isNaN(ay) || Double.isNaN(by)) {
                 fail(server, "a body is missing: " + early);
             } else if (!aStarted) {
                 fail(server, "body A did not start the promotion of its proxy chunk: " + early);
+            } else if (paced > 0) {
+                fail(server, "body A's promotion went through the pacer, not immediate: " + early);
             } else if (!bProxy) {
                 fail(server, "body B flying high promoted its proxy chunk: " + early);
             }

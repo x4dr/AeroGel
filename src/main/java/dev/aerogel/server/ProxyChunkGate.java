@@ -158,8 +158,11 @@ public final class ProxyChunkGate {
     }
 
     /** a promotion that finished on the chunk-task thread; its main-thread work runs on the next tick. */
-    private record Completed(ChunkPos pos, boolean push, Runnable onComplete) {
+    private record Completed(ChunkPos pos, boolean push, int startTick, Runnable onComplete) {
     }
+
+    /** promotions whose FULL future ended without a chunk (an exception, or a demoted holder's error result). */
+    private static int failedPromotions;
 
     /** installs the gate for one level (called from {@link ProxyStreamer#init} for every noise-based level). */
     public static void init(ServerLevel lvl) {
@@ -393,6 +396,11 @@ public final class ProxyChunkGate {
         return isActive(lvl) && !state.real.contains(pos) && !state.allowed.contains(pos) && !loadedNow(state, pos);
     }
 
+    /** test hook (dev probe): promotions that completed without a chunk (see {@link #promote}). */
+    public static int debugFailedPromotions() {
+        return failedPromotions;
+    }
+
     /** test hook (dev probe): forget a position's classification, as if this session never touched it. */
     public static void debugForget(ServerLevel lvl, long pos) {
         State state = state(lvl);
@@ -408,15 +416,15 @@ public final class ProxyChunkGate {
     /**
      * Whether vanilla would serve this position from a real chunk right now.
      *
-     * <p><b>Trap, and it is deliberate on NeoForge's side.</b> {@code ServerChunkCache.getChunkNow} is patched
-     * to return {@code chunkHolder.currentlyLoading} when the chunk is merely <i>being</i> generated ("to
-     * prevent a deadlock"), so this answers true for a chunk that has no data yet and would block the main
-     * thread if something asked for it. Callers here treat true as "vanilla will serve it, so it is not a
-     * proxy", which holds for a loaded chunk but not for one mid-generation. It is why a partially generated
-     * neighbour reads as real to a probe (and why the first footprint measurement had to read holder statuses
-     * instead). Tightening it is not a one-line change: {@code isProxy} would start reporting true for a
-     * position whose promotion is in flight, which changes which path serves reads during a promotion — see
-     * {@code TODO.md}, "a mid-generation chunk reads as real".
+     * <p><b>NeoForge's {@code currentlyLoading} bypass.</b> {@code ServerChunkCache.getChunkNow} (and
+     * {@code getChunk}) return {@code chunkHolder.currentlyLoading} "to prevent a deadlock", but NeoForge sets it
+     * only inside {@code ChunkStatusTasks.full}, around {@code runPostLoad}, block-entity registration and
+     * {@code ChunkEvent.Load}: the chunk already holds its data then. A neighbour that is merely partially
+     * generated returns null here, so {@code isProxy} reports it as a proxy and reads get the placeholder.
+     * Measured by the {@code aerogel.midgen} probe (#18): no main-thread read on a promotion's mid-generation
+     * neighbours went through vanilla's future chain. Separate effect: the holder's FULL status completes before
+     * its {@code fullChunkFuture} (which also waits on the 3x3), so {@link #isLoadedReal} can turn true a tick or
+     * more before a promotion's completion callback runs.</p>
      */
     private static boolean loadedNow(State state, long pos) {
         return state != null
@@ -449,6 +457,49 @@ public final class ProxyChunkGate {
     public static double postCostMs(ServerLevel lvl) {
         State state = state(lvl);
         return state == null ? 5.0 : state.postCostEmaNanos / 1_000_000.0;
+    }
+
+    /** {@link #stepsToPromote} for an entity-ticking chunk in untouched land: the price list's unit (#17). */
+    public static final int VOID_STEPS = neighbourhoodSteps(null, 0L, 2);
+
+    /**
+     * How many chunk-steps (status advances) promoting this position makes vanilla generate (#17). The FULL
+     * radius comes from the holder's ticket: an entity-ticking chunk needs its 5x5 at FULL, a block-ticking
+     * one its 3x3, a border chunk itself. Around that, every position needs the status vanilla's own pyramid
+     * asks for at that distance ({@link ChunkLevel#getStatusAroundFullChunk}, flat {@code structure_starts}
+     * top included). Each position counts only the steps it still lacks, so a promotion in untouched land
+     * costs the whole pyramid and one that advances a generated frontier a fraction of it. Holder reads only;
+     * a chunk on disk but not in memory counts from scratch, which over- rather than under-charges.
+     * ponytail: statuses lag an in-flight neighbour's generation, so a start beside one is priced as if alone
+     * until those steps land; subtract the in-flight neighbourhoods if that over-charge ever slows a drain.
+     */
+    public static int stepsToPromote(ServerLevel lvl, long pos) {
+        State state = state(lvl);
+        if (state == null) {
+            return VOID_STEPS;
+        }
+        ChunkHolder holder = state.chunkMap.getVisibleChunkIfPresent(pos);
+        int fullLevel = ChunkLevel.byStatus(FullChunkStatus.FULL);
+        int fullRadius = holder == null ? 2 : Math.clamp(fullLevel - holder.getTicketLevel(), 0, 2);
+        return neighbourhoodSteps(state.chunkMap, pos, fullRadius);
+    }
+
+    /** the steps a FULL square of {@code fullRadius} around {@code pos} still needs; null map = nothing exists. */
+    private static int neighbourhoodSteps(ChunkMap map, long pos, int fullRadius) {
+        int reach = fullRadius + ChunkLevel.RADIUS_AROUND_FULL_CHUNK;
+        int x = ChunkPos.getX(pos);
+        int z = ChunkPos.getZ(pos);
+        int steps = 0;
+        for (int dx = -reach; dx <= reach; dx++) {
+            for (int dz = -reach; dz <= reach; dz++) {
+                int distance = Math.max(Math.abs(dx), Math.abs(dz)) - fullRadius;
+                ChunkStatus want = ChunkLevel.getStatusAroundFullChunk(distance);
+                ChunkHolder holder = map == null ? null : map.getVisibleChunkIfPresent(ChunkPos.asLong(x + dx, z + dz));
+                ChunkStatus have = holder == null ? null : holder.getPersistedStatus();
+                steps += Math.max(0, want.getIndex() - (have == null ? 0 : have.getIndex()));
+            }
+        }
+        return steps;
     }
 
     // ---- classification ----
@@ -555,17 +606,26 @@ public final class ProxyChunkGate {
         }
         forcePrepare(holder, state.chunkMap);
         state.promoting.add(p);
+        int startTick = server.getTickCount();
         holder.getFullChunkFuture().whenComplete((result, error) -> server.execute(() -> {
             // This runs inline on the chunk-task completion (main thread). Do NOT read/collide/load chunks
             // here: Level.getChunk would managedBlock the task queue it is running on (watchdog deadlock).
-            // Only enqueue the post-promotion work; ProxyChunkGate.tick runs it as a normal tick task.
+            // Only enqueue the post-promotion work; drainCompletions runs it as a normal tick task.
             state.promoting.remove(p);
+            // a holder demoted mid-generation completes this future with an error RESULT and no exception
+            // (updateFutures), so success is the result, not the absence of an exception (#20)
+            boolean real = error == null && result != null && result.isSuccess();
             if (error != null) {
+                failedPromotions++;
                 LOGGER.error("proxy chunk {} promotion failed", pos, error);
+            } else if (!real) {
+                failedPromotions++;
+                LOGGER.warn("proxy chunk {} promotion ended without a chunk ({}); not pushed or resent", pos,
+                    result == null ? "no result" : result.getError());
             } else {
                 LOGGER.info("promoted proxy chunk {} to real terrain (vanilla pipeline)", pos);
             }
-            state.completedQueue.add(new Completed(pos, error == null, onComplete));
+            state.completedQueue.add(new Completed(pos, real, startTick, onComplete));
         }));
         return true;
     }
@@ -662,13 +722,15 @@ public final class ProxyChunkGate {
 
     // ---- tick ----
 
-    /** drain classification completions/resends and prune the per-level caches; called from the server tick. */
+    /**
+     * drain classification completions/resends and prune the per-level caches; called from the server tick.
+     * Finished promotions are drained separately, by {@link #drainCompletions}, before the promotion tick.
+     */
     public static void tick(MinecraftServer srv) {
         if (!active) {
             return;
         }
         drainDeferred(srv);
-        drainCompletions(srv);
         drainResends(srv);
         for (State state : STATES.values()) {
             if (++state.pruneTicks % RESCUE_INTERVAL_TICKS == 0) {
@@ -763,8 +825,15 @@ public final class ProxyChunkGate {
      * Drain finished promotions on the server tick (a normal main-thread task, not nested inside
      * chunk-task processing): push entities out of the new terrain, replay deferred writes, queue the
      * client resend. {@link #pushOutOfTerrain} additionally guards against unloaded neighbour chunks.
+     *
+     * <p>Must run <b>before</b> {@code PromotionManager.tick}: its {@code retryInFlight} reclaims the slot of
+     * any in-flight chunk that is already real, so draining after it made every promotion read as a lost
+     * callback (#20). Drained first, a reclaim only happens when no completion arrived.</p>
      */
-    private static void drainCompletions(MinecraftServer srv) {
+    public static void drainCompletions(MinecraftServer srv) {
+        if (!active) {
+            return;
+        }
         for (State state : STATES.values()) {
             Completed completed;
             while ((completed = state.completedQueue.poll()) != null) {
@@ -779,6 +848,9 @@ public final class ProxyChunkGate {
                 } catch (Throwable t) {
                     LOGGER.error("post-promotion work failed for {}", completed.pos(), t);
                 } finally {
+                    LOGGER.info("drained promotion of proxy chunk {}: push={}, resend={}, {} tick(s) since start",
+                        completed.pos(), completed.push(), completed.push() && resendEnabled,
+                        srv.getTickCount() - completed.startTick());
                     if (completed.onComplete() != null) {
                         completed.onComplete().run();
                     }

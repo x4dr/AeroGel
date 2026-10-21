@@ -25,10 +25,10 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Headless check of #6 (flag file: &lt;serverDir&gt;/aerogel.writesafety), two server starts.
- * <p>Start 1: a fake player places stone into a fresh proxy — must be refused (item kept) and promote the chunk,
- * and the same placement must work once the chunk is real (VERDICT place). Then a non-player write into a
- * second fresh proxy is deferred and the server halts at once, with the promotion still in flight; its
- * position goes to {@code aerogel.writesafety.pos}.</p>
+ * <p>Start 1: a fake player places stone into a fresh proxy — must be refused (item kept) and queue the chunk,
+ * not start it; the pacer must then start it, and the same placement must work once the chunk is real (VERDICT
+ * place). Then a non-player write into a second fresh proxy is deferred and the server halts at once, with the
+ * promotion still queued; its position goes to {@code aerogel.writesafety.pos}.</p>
  * <p>Start 2 (pos file present): the written block must be on disk (VERDICT stop).</p>
  */
 final class WriteSafetyProbe {
@@ -47,6 +47,7 @@ final class WriteSafetyProbe {
     private static boolean refused;
     private static boolean checking;
     private static int ticks;
+    private static int startsAtClick;
 
     private WriteSafetyProbe() {
     }
@@ -100,24 +101,31 @@ final class WriteSafetyProbe {
             new BlockHitResult(Vec3.atCenterOf(at), face, at, false));
     }
 
+    /** queued for the pacer and not started: what a refused click does since player triggers queue. */
+    private static boolean queuedNotStarted(ChunkPos c) {
+        return PromotionManager.debugIsQueued(level, c.toLong()) && ProxyChunkGate.isProxy(level, c.toLong())
+            && !ProxyChunkGate.isPromoting(level, c.toLong());
+    }
+
     /**
      * The path a real client takes (it has no proxy chunks to click): the side of a block in a real chunk whose
-     * face points into a proxy. The placement must be refused (item kept, neighbour promoted), the click itself
+     * face points into a proxy. The placement must be refused (item kept, neighbour queued), the click itself
      * not cancelled. Returns null when the east neighbour is not a fresh proxy (nothing to check).
      */
     private static String faceCheck() {
         ChunkPos east = new ChunkPos(place.x + 1, place.z);
-        if (!ProxyChunkGate.isProxy(level, east.toLong()) || ProxyChunkGate.isPromoting(level, east.toLong())) {
+        if (!ProxyChunkGate.isProxy(level, east.toLong()) || ProxyChunkGate.isPromoting(level, east.toLong())
+            || PromotionManager.debugIsQueued(level, east.toLong())) {
             return null;
         }
         BlockPos edge = new BlockPos(place.getMaxBlockX(), Y, place.getMinBlockZ() + 8);
         level.setBlock(edge, Blocks.STONE.defaultBlockState(), 3); // place is real now: a direct write
         int before = stack.getCount();
         InteractionResult result = use(edge, Direction.EAST);
-        boolean promoting = ProxyChunkGate.isPromoting(level, east.toLong()) || !ProxyChunkGate.isProxy(level, east.toLong());
-        boolean ok = !result.consumesAction() && stack.getCount() == before && promoting;
-        return String.format("%s (result %s, items %d->%d, neighbour promotion started=%s)",
-            ok ? "PASS" : "FAIL", result, before, stack.getCount(), promoting);
+        boolean queued = queuedNotStarted(east);
+        boolean ok = !result.consumesAction() && stack.getCount() == before && queued;
+        return String.format("%s (result %s, items %d->%d, neighbour queued not started=%s)",
+            ok ? "PASS" : "FAIL", result, before, stack.getCount(), queued);
     }
 
     static void tick(MinecraftServer server) {
@@ -138,10 +146,11 @@ final class WriteSafetyProbe {
                 return;
             }
             stack = new ItemStack(Items.STONE, 4);
+            startsAtClick = PromotionManager.debugLingerStarts();
             InteractionResult result = use(at);
-            boolean promoting = ProxyChunkGate.isPromoting(level, place.toLong()) || !ProxyChunkGate.isProxy(level, place.toLong());
-            refused = !result.consumesAction() && stack.getCount() == 4 && promoting;
-            refusal = String.format("result %s, items %d/4, promotion started=%s", result, stack.getCount(), promoting);
+            boolean queued = queuedNotStarted(place);
+            refused = !result.consumesAction() && stack.getCount() == 4 && queued;
+            refusal = String.format("result %s, items %d/4, queued not started=%s", result, stack.getCount(), queued);
             LOGGER.info("write safety: placement into proxy {} -> {}", place, refusal);
             return;
         }
@@ -154,8 +163,10 @@ final class WriteSafetyProbe {
         }
         InteractionResult retry = use(at);
         boolean placed = retry.consumesAction() && level.getBlockState(at).is(Blocks.STONE) && stack.getCount() == 3;
-        LOGGER.info("write safety: VERDICT place {} — into proxy: {}; after promotion: result {}, block {}, items {}/4",
-            refused && placed ? "PASS" : "FAIL", refusal, retry, level.getBlockState(at).getBlock(), stack.getCount());
+        int paced = PromotionManager.debugLingerStarts() - startsAtClick; // no player online: only the queue starts
+        LOGGER.info("write safety: VERDICT place {} — into proxy: {}; pacer starts {}; after promotion: result {}, block {}, items {}/4",
+            refused && placed && paced >= 1 ? "PASS" : "FAIL", refusal, paced, retry, level.getBlockState(at).getBlock(),
+            stack.getCount());
         String face = faceCheck();
         LOGGER.info("write safety: VERDICT face {}", face == null ? "SKIP — east neighbour of " + place + " is not a fresh proxy" : face);
         haltWithPendingWrite(server);
@@ -169,14 +180,14 @@ final class WriteSafetyProbe {
             return;
         }
         boolean deferred = level.setBlock(at, Blocks.GOLD_BLOCK.defaultBlockState(), 3);
-        boolean inFlight = ProxyChunkGate.isPromoting(level, stop.toLong());
+        boolean inFlight = PromotionManager.debugIsQueued(level, stop.toLong()) || ProxyChunkGate.isPromoting(level, stop.toLong());
         try {
             Files.writeString(posFile, Long.toString(stop.toLong()));
         } catch (IOException e) {
             fail(server, "cannot write " + posFile);
             return;
         }
-        LOGGER.info("write safety: write into proxy {} deferred={}, promotion in flight={}; halting now", stop, deferred, inFlight);
+        LOGGER.info("write safety: write into proxy {} deferred={}, promotion queued or in flight={}; halting now", stop, deferred, inFlight);
         level.getChunkSource().updateChunkForced(place, false);
         level = null;
         server.halt(false);
