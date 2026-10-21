@@ -20,8 +20,9 @@ makes are:
 - **The disengage model replaces the linger-counter veto.** Per tick: sample the window → finish completed promotions →
   retry → accrue → refill → drain → *decide*. Refill runs before the emptiness check, so "queue empty" can only mean "nothing
   left to generate", which is why disengaging cannot burst instant generation. Refill bypasses the linger
-  **threshold** while calm, never the budget; only player actions (touchdown, block write, refused
-  right-click, Sable body contact) bypass the budget. The adaptive tick is **split in two** — `AdaptiveMode.sample`
+  **threshold** while calm, never the budget; only Sable body contact and the server stop's pending-write finish
+  bypass the budget (touchdown, block writes, refused right-clicks and refused stub writes queue for the same pacer
+  since 2026-10-20, Maric: "enqueue these where possible"). The adaptive tick is **split in two** — `AdaptiveMode.sample`
   before the promotion tick and `AdaptiveMode.decide` after it — because the refill and the decision must read
   the **same** window maxima. They are a max over `windowSeconds`, so they hold and then step down in one tick;
   read at two points, the refill saw "busy" and queued nothing while the decision saw "calm" and disengaged,
@@ -175,13 +176,14 @@ Next session, priority order:
    promotes after ~10 s (`d=0` min), the fringe (view-distance+2 = 12 ch) after ~30 s (max), linearly
    between; while the server is **calm** the threshold is bypassed and every fresh lingered stub is eligible
    at once, still paced by `maxInFlight` and the budget (`/aerogel promote status`). Touching/landing, a
-   block write, a refused right-click and Sable body contact generate at once, uncapped. Watch
+   block write and a refused right-click queue the chunk for that pacer (no linger threshold); only Sable body
+   contact generates at once, uncapped. Watch
    `server tick stall` / `stream perf`. Tune
    `promote range/linger/landing/concurrency/budget/cost` (the budget and concurrency knobs shape **linger**
    promotion only).
-3. **Watch the write→promotion path under a mass write** — an immediate trigger now starts the promotion
-   inside `Level.setBlock`, one per chunk (not one per write). Confirm a wide `/fill` over proxies stays
-   smooth; it is deliberately not rate-limited.
+3. **Watch the write→promotion path under a mass write** — a write queues its chunk inside `Level.setBlock`,
+   one entry per chunk (not one per write), and the pacer starts them. Confirm a wide `/fill` over proxies stays
+   smooth and appears chunk by chunk (`aerogel.masswrite` proves it headless).
 4. **Sable/Rapier collider PoC** — feed the proxy surface into the physics path near the hull (hook points in
    `plans/investigations/aeronautics-sable-physics.md` §7). Only the crude player clamp exists today.
 5. **Morphing (optional)** — the user accepts pop-over on promotion; a vertex slide is only worth it if the
@@ -351,10 +353,11 @@ choke at ~80 chunks/s swept).
   server start by `AeroGelConfig.validate()` and corrected with a warning, so a hand-edited file cannot produce
   NaN thresholds.
 - **Block-write guard**: `mixin/LevelWriteGuardMixin` intercepts `Level.setBlock`; for a proxy it cancels the
-  write, records it, and starts the promotion immediately, then `PromotionManager.replayWrites` re-applies it after promotion
+  write, records it, and queues the chunk for the pacer, then `PromotionManager.replayWrites` re-applies it after promotion
   (returning true preserves the client's prediction). `mixin/FlowingFluidMixin` cancels fluid spread into
-  proxies (fluid does not promote). Only a proxy whose promotion has not started is capped (`MAX_WRITE_LOG=256`);
-  writes into a generating chunk, or a real one with replay pending, are logged uncapped and replayed in order
+  proxies (fluid does not promote). Caller writes are capped **globally**, not per chunk
+  (`MAX_PENDING_WRITES` = 2^19, 16 full `/fill`s; beyond it the newest is dropped with a rate-limited WARN), because a
+  `/fill` over queued proxies is the normal case; they replay in order
   under `promotion.rate.replayBudgetMs` (1.5 ms/tick, `/aerogel promote replay`), the rest carried to the next tick.
   **Each chunk's log is two queues, not one** (#16): `vanilla` (this chunk's own terrain, replayed first) and
   `caller` (the caller's writes, replayed last). Feature placement never reaches the guard — `WorldGenRegion`
@@ -362,7 +365,7 @@ choke at ~80 chunks/s swept).
   used to arrive after the caller's writes and erase them: `LevelChunk.postProcessGeneration`, and the block-tick
   queue, where a leaf that worldgen placed schedules a decay tick that fires *after* promotion. They are flagged
   by `mixin/VanillaChunkWriteMixin` / `mixin/VanillaBlockTickMixin` with a thread-local depth. Vanilla writes do
-  not count against the per-chunk drop cap.
+  not count against the global drop cap.
   **This is white-box**: it works by hooking the vanilla paths that write into a chunk after generation reports
   done. `aerogel.promote` witnesses the order on every run (#19): with two caller writes still pending it drives
   one write down each hooked path (`postProcessGeneration` over glass, a leaf `tickBlock` over leaves), asserts
@@ -370,10 +373,11 @@ choke at ~80 chunks/s swept).
   queues fails it. What no probe can catch is a future vanilla version adding a *third* such path; that
   reintroduces the bug silently. If that happens, the fallback is `promotion.refuseStubWrites` /
   `/aerogel promote refuse true`, which has no detection at all: refuse every write into a chunk that is not real
-  terrain instead of deferring it (the placement fails and the actor retries; the chunk is promoted on the first
-  attempt). Default off; covered by `aerogel.refuse`.
+  terrain instead of deferring it (the placement fails and the actor retries; the first attempt queues the chunk).
+  Default off; covered by `aerogel.refuse`.
   A **player's** right-click into such a chunk is refused instead (click on it cancelled; placement through a real
-  block's face into it: item use denied, block use still runs; item kept, chunk promoted at once; #6), and
+  block's face into it: item use denied, block use still runs; item kept, chunk queued for the pacer and clicks
+  refused until it is real; #6), and
   server stop finishes every chunk with pending writes before the save (bounded 10 s, leftovers logged).
 - **Promotion in flight reads like a proxy**: until the promoted chunk's FULL future completes
   (`ProxyChunkGate.isPromoting`), main-thread reads get the placeholder (`requireChunk=false`: `null`), fluid
@@ -462,8 +466,8 @@ choke at ~80 chunks/s swept).
     100), `promote hardgate <ms>` (linger tick-time brake; default 60),
     `promote replay <ms>` (per-tick wall time for replaying deferred writes; default 1.5),
     `promote status` (effective thresholds, budget, queue/in-flight). Every setter writes the COMMON config.
-    Immediate (touch / write / right-click / Sable body) promotion ignores `concurrency`, `budget` and
-    `hardgate` by design.
+    Touchdown, writes and refused clicks go through the same queue and knobs; only Sable body contact (no proxy
+    collider, #9) ignores `concurrency`, `budget` and `hardgate`.
   - `/aerogel adaptive status` (backlog/tick now + window max, hold left, opt-in count, and the promotion
     queue/in-flight the disengage veto reads), `adaptive activate <1-200 ms>`, `adaptive deactivate <1-200 ms>`,
     `adaptive backlog <activate> <deactivate>` (default 64/16), `adaptive hold <0-600 s>` (default 10),
@@ -497,13 +501,15 @@ run/server/aerogel.drain` (the disengage model on the real adaptive path: the dr
 drops with work outstanding, and everything eventually generates), `touch run/server/aerogel.stationary`
 (sampling is one burst then nothing while a player stands still), `touch
 run/server/aerogel.independence` (gating and proxy rendering are independent axes — all four
-`travel`/`proxy` combinations), `touch run/server/aerogel.footprint` (what one promotion generates: its 5x5 at
- FULL plus the partial pyramid around it, and that the pyramid terminates; then a frontier promotion beside it,
- #17: chunk-steps, CPU and backlog of both against the pacer's prediction and charge), `touch
- run/server/aerogel.midgen` (#18: every main-thread read path on a promotion's
- mid-generation neighbours, timed every tick and from inside `ChunkEvent.Load`, must never run chunk tasks),
- `touch run/server/aerogel.rate` (the linger drain's rate, the refill's calm-threshold bypass, and the pacer's
- brake and starvation floor under an injected load).
+`travel`/`proxy` combinations), `touch run/server/aerogel.masswrite` (a 32768-block `/fill`-sized write over a 4x4 of proxies: every chunk
+queued, not started, at the write; all 16 starts from the pacer under a raised `maxInFlight`, the budget binds,
+nothing dropped, every block lands), `touch run/server/aerogel.footprint` (what one promotion generates: its 5x5 at
+FULL plus the partial pyramid around it, and that the pyramid terminates; then a frontier promotion beside it,
+#17: chunk-steps, CPU and backlog of both against the pacer's prediction and charge), `touch
+run/server/aerogel.midgen` (#18: every main-thread read path on a promotion's
+mid-generation neighbours, timed every tick and from inside `ChunkEvent.Load`, must never run chunk tasks),
+`touch run/server/aerogel.rate` (the linger drain's rate, the refill's calm-threshold bypass, and the pacer's
+brake and starvation floor under an injected load).
 
 ## Build / run commands (run from repo root, use the Prism Java 21)
 

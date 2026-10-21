@@ -43,26 +43,30 @@ import org.slf4j.LoggerFactory;
  * player and both endpoints are interpolated between idle and busy server load, makes a chunk a
  * <em>candidate</em>.</p>
  *
- * <p><b>Immediate.</b> Touching the surface (descending/landing within {@code landingMargin} above the
- * sampled height), any runtime block write or right-click into a stub, and a Sable physics body asking for the
- * terrain section it is about to hit are not queued at all: the chunk is handed straight to vanilla
- * generation the moment it is triggered, with no budget, hard gate or concurrency cap. That is the "let
- * vanilla do it" path — the only limit is that the same chunk is not started twice while it is still
- * generating, so a mass block write starts one promotion per chunk rather than one per write. These are the
- * <em>only</em> budget bypasses; linger promotion never takes this path, including the drain.</p>
+ * <p><b>Player triggers queue.</b> Touching the surface (descending/landing within {@code landingMargin} above
+ * the sampled height), any runtime block write, a refused right-click and a refused stub write put the chunk in
+ * the same queue linger feeds, with no linger threshold, and the same pacer starts it (Maric 2026-10-20:
+ * "enqueue these where possible, generate the chunks through normal queue"). Nothing is lost meanwhile: the
+ * clamp holds a lander on the proxy surface, a refused click stays refused until the chunk is real, and a
+ * write waits in the deferred-write log. A mass write queues one entry per chunk, not one per write.</p>
+ *
+ * <p><b>Immediate.</b> Only a Sable physics body asking for the terrain section it is about to hit (#9) and
+ * the server stop's {@link #finishPendingWrites} still go straight to vanilla generation, with no budget, hard
+ * gate or concurrency cap: AeroGel has no proxy collider for Sable, so a queued section is a hull clipping
+ * through terrain. These are the <em>only</em> budget bypasses.</p>
  *
  * <p><b>Rate limiting.</b> Only <em>linger</em> promotion is paced. A token bucket holds a wall-clock
  * budget that refills at {@code maxGenFraction} ms per ms (default 0.5, i.e. at most half the server's
  * time) and each linger promotion start costs what it will make vanilla generate (#17): {@code chunkCostMs}
  * prices a promotion in untouched land, and a start pays the share of that neighbourhood's chunk-steps it
  * still lacks (see {@link #startCost}), so advancing a generated frontier is cheap and a lone chunk in the
- * void is not: {@code maxInFlight} bounds sites, the budget bounds generation. Linger starts are also
+ * void is not: {@code maxInFlight} bounds sites, the budget bounds generation. Queued starts are also
  * blocked while the smoothed tick time is at or above a brake, which is the tighter of {@code hardGateMs}
  * and the adaptive activate threshold so the drain cannot push load back to the level that would re-engage
  * enforcement.
- * {@code maxInFlight} bounds how many linger regenerations run concurrently, and a long dry spell forces one
- * start anyway, which is the floor that guarantees progress on a server that is already lagging. Immediate
- * promotions are deliberately outside all of this: a player action is a player action.</p>
+ * {@code maxInFlight} bounds how many queued regenerations run concurrently, and a long dry spell forces one
+ * start anyway, which is the floor that guarantees progress on a server that is already lagging. Only the
+ * immediate promotions above are outside all of this.</p>
  *
  * <p><b>The queue is a work buffer, not a backlog.</b> Each tick {@link #refill} rebuilds it from the union
  * of what is queued and what just became a candidate, then keeps the nearest {@link State#queueCap}. That
@@ -102,7 +106,16 @@ public final class PromotionManager {
     private static final int MIN_LINGER_TICKS = 20;
     private static final int MAX_LINGER_TICKS_LIMIT = 20 * 600;
     private static final int LINGER_GRACE_TICKS = 40;
-    private static final int MAX_WRITE_LOG = 256;
+    /**
+     * Caller writes pending replay, over all levels and chunks, beyond which the newest is dropped with a WARN.
+     * A {@code /fill} over queued proxies is the normal case since player triggers queue, so the cap is global
+     * rather than per chunk: 16 full vanilla {@code /fill}s (32768 blocks each).
+     */
+    // ponytail: fixed global cap (~64 B/write, ~32 MB at the cap); a config key if a pack ever needs more
+    private static final int MAX_PENDING_WRITES = 1 << 19;
+    /** caller writes logged and not yet replayed, and how many the cap dropped (WARN rate-limited on it). */
+    private static int pendingCallerWrites;
+    private static int droppedWrites;
 
     /**
      * Depth of vanilla-initiated writes on this thread (#16). Set by {@code VanillaChunkWriteMixin} around
@@ -288,6 +301,8 @@ public final class PromotionManager {
 
     public static void shutdown() {
         STATES.clear();
+        pendingCallerWrites = 0;
+        droppedWrites = 0;
     }
 
     private static State state(Level lvl) {
@@ -647,9 +662,10 @@ public final class PromotionManager {
         Long2IntOpenHashMap union = state.unionScratch;
         union.clear();
         // Seed with the queued chunks the refill owns, so a nearer candidate can displace a farther queued
-        // one. A chunk queued by a direct trigger -- a write or right-click whose holder was not loaded, so
-        // promoteImmediate fell back to the queue -- has no linger entry and is deliberately not seeded: it is
-        // a player's action, not the refill's to reorder or drop.
+        // one. A chunk queued by a direct trigger -- touchdown, a write or a refused click -- with no linger entry
+        // is deliberately not seeded: it is a player's action, not the refill's to reorder or drop. One that also
+        // lingered is ranked like linger; touchdown and clicks sit at distance <= 1 so the cut keeps them, and a
+        // write's chunk is kept by its deferred write below.
         if (!players.isEmpty()) {
             for (var entry : state.queue.long2IntEntrySet()) {
                 long pos = entry.getLongKey();
@@ -864,7 +880,7 @@ public final class PromotionManager {
             return;
         }
         if (player.getY() - surface <= landingMargin && player.getDeltaMovement().y <= 0.08) {
-            promoteImmediate(state, chunkPos);
+            enqueue(state, chunkPos); // the clamp holds the player on the proxy surface until it is real
         }
     }
 
@@ -893,25 +909,10 @@ public final class PromotionManager {
      * Runtime block-write guard. Called from {@code Level.setBlock} for every server-side write; returns
      * true when the write must be cancelled because it targets a proxy, a chunk still generating, or a real
      * chunk whose earlier writes are not all replayed yet (so the order is kept). The write is remembered and
-     * replayed under the per-tick budget once the chunk is real. Only a proxy whose promotion has not started
-     * (no holder yet) is capped at {@link #MAX_WRITE_LOG}; once it is promoting nothing is dropped (#5). The
-     * fast bail keeps the dormant case to one state lookup + one volatile flag read.
+     * replayed under the per-tick budget once the chunk is real, and a proxy is queued for the pacer. Caller
+     * writes are capped by {@link #MAX_PENDING_WRITES} over the whole server, not per chunk (#5). The fast bail
+     * keeps the dormant case to one state lookup + one volatile flag read.
      */
-    /**
-     * Server-owner mode: refuse a write into a chunk that is not real terrain (#16), rather than deferring it.
-     * Returns true when the caller must be told the write failed. Promotes the chunk so the next attempt works.
-     */
-    public static boolean refuseStubWrite(ServerLevel serverLevel, BlockPos pos) {
-        if (!enabled || !refuseStubWrites) {
-            return false;
-        }
-        State promotion = state(serverLevel);
-        if (promotion == null || !ProxyChunkGate.mayHaveProxy(serverLevel)) {
-            return false;
-        }
-        return refuseInto(promotion, ChunkPos.asLong(pos));
-    }
-
     public static boolean tryDeferWrite(ServerLevel serverLevel, BlockPos pos, BlockState state, int flags) {
         if (!enabled || refuseStubWrites) {
             return false;
@@ -924,19 +925,40 @@ public final class PromotionManager {
         if ((replaying && chunkPos == replayingPos) || !isStubTarget(promotion, chunkPos)) {
             return false;
         }
-        promoteImmediate(promotion, chunkPos); // no-op once it is generating or real
-        WriteLog log = promotion.deferredWrites.computeIfAbsent(chunkPos, k -> new WriteLog());
+        enqueue(promotion, chunkPos); // no-op once it is queued, generating or real
         // the cap is about the caller's writes: vanilla's own terrain writes are not the caller's to lose
+        if (!isVanillaWrite() && pendingCallerWrites >= MAX_PENDING_WRITES) {
+            if (droppedWrites++ % 4096 == 0) {
+                LOGGER.warn("{} caller writes already wait for promotion; dropping the newest (into {}), {} dropped so far",
+                    MAX_PENDING_WRITES, new ChunkPos(chunkPos), droppedWrites);
+            }
+            return true;
+        }
+        WriteLog log = promotion.deferredWrites.computeIfAbsent(chunkPos, k -> new WriteLog());
         if (isVanillaWrite()) {
             log.vanilla.addLast(new DeferredWrite(pos.immutable(), state, flags));
             log.vanillaCount++;
-        } else if (log.caller.size() < MAX_WRITE_LOG || !ProxyChunkGate.isProxy(serverLevel, chunkPos)) {
+        } else {
             log.caller.addLast(new DeferredWrite(pos.immutable(), state, flags));
             log.callerCount++;
-        } else {
-            LOGGER.warn("proxy chunk {} has more than {} deferred writes; dropping the newest", new ChunkPos(chunkPos), MAX_WRITE_LOG);
+            pendingCallerWrites++;
         }
         return true;
+    }
+
+    /**
+     * Server-owner mode: refuse a write into a chunk that is not real terrain (#16), rather than deferring it.
+     * Returns true when the caller must be told the write failed. Queues the chunk so a later attempt works.
+     */
+    public static boolean refuseStubWrite(ServerLevel serverLevel, BlockPos pos) {
+        if (!enabled || !refuseStubWrites) {
+            return false;
+        }
+        State promotion = state(serverLevel);
+        if (promotion == null || !ProxyChunkGate.mayHaveProxy(serverLevel)) {
+            return false;
+        }
+        return refuseInto(promotion, ChunkPos.asLong(pos));
     }
 
     /**
@@ -944,8 +966,8 @@ public final class PromotionManager {
      * refused rather than deferred (#6): the deferral loses what the caller fills in after {@code setBlock}
      * (block-entity contents, sign text) and the item is already consumed. The caller checks the clicked block
      * (refuse the whole click) and the block on the clicked face (refuse only the item use, i.e. placement, so a
-     * chest at a proxy border still opens). A stub target is promoted at once, so the next click works. Returns
-     * true when the position is a stub target.
+     * chest at a proxy border still opens). A stub target is queued for the pacer, and clicks stay refused until
+     * it is real. Returns true when the position is a stub target.
      */
     public static boolean refusePlayerUse(ServerLevel level, BlockPos pos) {
         State state = state(level);
@@ -959,7 +981,7 @@ public final class PromotionManager {
         if (!isStubTarget(state, chunkPos)) {
             return false;
         }
-        promoteImmediate(state, chunkPos);
+        enqueue(state, chunkPos);
         return true;
     }
 
@@ -1094,6 +1116,24 @@ public final class PromotionManager {
         return log == null ? 0 : log.size();
     }
 
+    /** Dev hook: true while this chunk waits in the queue (queued, not started). */
+    public static boolean debugIsQueued(ServerLevel lvl, long chunkPos) {
+        State state = state(lvl);
+        return state != null && state.queue.containsKey(chunkPos);
+    }
+
+    /** Dev hook: caller writes the global cap has dropped since the server started. */
+    public static int debugDroppedWrites() {
+        return droppedWrites;
+    }
+
+    /** Dev hook: set {@code maxInFlight} without persisting it, so a probe can let the budget bind; returns the old value. */
+    public static int debugSetMaxInFlight(int count) {
+        int old = maxInFlight;
+        maxInFlight = clamp(count, 1, 16);
+        return old;
+    }
+
     /** test hook: queue a chunk as if it had lingered (used by the dev-only headless stress probe). */
     public static void debugEnqueue(ServerLevel lvl, long chunkPos) {
         State state = state(lvl);
@@ -1105,8 +1145,10 @@ public final class PromotionManager {
     }
 
     /**
-     * Queue a chunk, bounded by the soft cap. {@code force} bypasses the "is it still a proxy" check, for a
-     * position the gate has already allowed (a retry after a failed start).
+     * Queue a chunk for the pacer. Not bounded by {@link State#queueCap}: every caller is a player trigger or a
+     * retry, which the refill never drops for capacity (it bounds only what linger admits), and a trigger
+     * dropped here would be lost. {@code force} bypasses the "is it still a proxy" check, for a position the
+     * gate has already allowed (a retry after a failed start).
      */
     private static void enqueue(State state, long chunkPos, boolean force) {
         if (!enabled || state.inFlight.contains(chunkPos) || state.queue.containsKey(chunkPos)) {
@@ -1115,25 +1157,20 @@ public final class PromotionManager {
         if (!force && !ProxyChunkGate.isProxy(state.level, chunkPos)) {
             return; // already real (or the proxy is inactive)
         }
-        if (state.queue.size() >= state.queueCap) {
-            return; // the refill decides what belongs in the queue; do not grow it past the buffer here
-        }
         state.queue.put(chunkPos, state.tickCounter);
     }
 
-    /** queue a chunk for paced linger promotion (the only path that is rate-limited). */
+    /** queue a player trigger (touchdown, write, refused click or stub write) for the pacer. */
     private static void enqueue(State state, long chunkPos) {
         enqueue(state, chunkPos, false);
     }
 
     /**
-     * Start a promotion now, outside the queue and its rate limit. The trigger was a player action (touching
-     * the ground, a block write, a refused right-click, a Sable body hitting the surface), so the chunk goes
-     * to the vanilla generation pipeline immediately: not capped by the budget, the hard gate or
-     * {@code maxInFlight}. The only guard is that the same chunk is not started twice while it is still
-     * generating. If the gate cannot start it yet (no loaded holder), it falls back to the linger queue so the
-     * trigger is not lost. These are the only budget bypasses; linger promotion, including the drain, never
-     * takes this path.
+     * Start a promotion now, outside the queue and its rate limit: a Sable body hitting the surface (no proxy
+     * collider exists, #9) and the server stop. Not capped by the budget, the hard gate or {@code maxInFlight};
+     * the only guard is that the same chunk is not started twice while it is still generating. If the gate
+     * cannot start it yet (no loaded holder), it falls back to the queue so the trigger is not lost. These are
+     * the only budget bypasses.
      */
     private static void promoteImmediate(State state, long chunkPos) {
         if (!enabled || state.inFlight.contains(chunkPos)) {
@@ -1357,7 +1394,7 @@ public final class PromotionManager {
     private static final class WriteLog {
         /** vanilla's own terrain writes; drained first so the caller's always land last. */
         final ArrayDeque<DeferredWrite> vanilla = new ArrayDeque<>();
-        /** the caller's writes — player, piston, mod code. Drained last; this is what the cap applies to. */
+        /** the caller's writes — player, piston, mod code. Drained last; this is what the global cap counts. */
         final ArrayDeque<DeferredWrite> caller = new ArrayDeque<>();
         int replayed;
         int ticks;
@@ -1376,7 +1413,14 @@ public final class PromotionManager {
         /** vanilla first, so a caller write is never overwritten by terrain it was meant to replace. */
         DeferredWrite next() {
             DeferredWrite write = vanilla.pollFirst();
-            return write != null ? write : caller.pollFirst();
+            if (write != null) {
+                return write;
+            }
+            write = caller.pollFirst();
+            if (write != null) {
+                pendingCallerWrites--;
+            }
+            return write;
         }
     }
 
