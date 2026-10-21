@@ -10,6 +10,7 @@ import net.minecraft.server.MinecraftServer;
  *
  * <p>Flags (all optional, all created next to {@code server.properties} in the game directory):
  * {@code aerogel.probe} (gate smoke test), {@code aerogel.promote} (promotion + deferred-write + push-up),
+ * {@code aerogel.refuse} (#19: {@code refuseStubWrites} refuses, promotes on the first attempt, banks nothing),
  * {@code aerogel.promotestress} (25-chunk promotion burst, no in-flight reclaim), {@code aerogel.demote} (#20: a
  * promotion whose holder is demoted is not taken as promoted), {@code aerogel.writesafety} (#6: player placement
  * refused + pending write survives a stop; two starts), {@code aerogel.sablebody} (#9: Sable bodies over proxies),
@@ -30,6 +31,7 @@ public final class DevProbeImpl implements DevProbe {
         Path dir = server.getServerDirectory();
         if (Files.exists(dir.resolve("aerogel.probe"))
             || Files.exists(dir.resolve("aerogel.promote"))
+            || Files.exists(dir.resolve("aerogel.refuse"))
             || Files.exists(dir.resolve("aerogel.promotestress"))
             || Files.exists(dir.resolve("aerogel.demote"))
             || Files.exists(dir.resolve("aerogel.writesafety"))
@@ -45,6 +47,9 @@ public final class DevProbeImpl implements DevProbe {
         }
         if (Files.exists(dir.resolve("aerogel.promote"))) {
             server.execute(() -> PromotionProbe.start(server));
+        }
+        if (Files.exists(dir.resolve("aerogel.refuse"))) {
+            server.execute(() -> RefuseProbe.start(server));
         }
         if (Files.exists(dir.resolve("aerogel.promotestress"))) {
             server.execute(() -> PromotionStressProbe.start(server));
@@ -92,6 +97,7 @@ public final class DevProbeImpl implements DevProbe {
     public void onServerTick(MinecraftServer server) {
         FlightProbe.tick(server); // move the pilot first, so the streamer sees the new position
         PromotionProbe.tick(server);
+        RefuseProbe.tick(server);
         GenerationProbe.tick(server);
         PromotionStressProbe.tick(server);
         DemoteProbe.tick(server);

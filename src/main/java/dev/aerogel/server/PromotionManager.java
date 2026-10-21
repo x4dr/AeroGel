@@ -359,6 +359,11 @@ public final class PromotionManager {
         return refuseStubWrites;
     }
 
+    /** Dev hook: {@link #setRefuseStubWrites} without persisting it, so a probe cannot leave it set. */
+    public static void debugSetRefuseStubWrites(boolean on) {
+        refuseStubWrites = on;
+    }
+
     public static void setRefuseStubWrites(boolean on) {
         refuseStubWrites = on;
         AeroGelConfig.CFG.refuseStubWrites.set(on);
