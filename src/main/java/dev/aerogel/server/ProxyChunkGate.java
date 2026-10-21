@@ -158,8 +158,11 @@ public final class ProxyChunkGate {
     }
 
     /** a promotion that finished on the chunk-task thread; its main-thread work runs on the next tick. */
-    private record Completed(ChunkPos pos, boolean push, Runnable onComplete) {
+    private record Completed(ChunkPos pos, boolean push, int startTick, Runnable onComplete) {
     }
+
+    /** promotions whose FULL future ended without a chunk (an exception, or a demoted holder's error result). */
+    private static int failedPromotions;
 
     /** installs the gate for one level (called from {@link ProxyStreamer#init} for every noise-based level). */
     public static void init(ServerLevel lvl) {
@@ -393,6 +396,11 @@ public final class ProxyChunkGate {
         return isActive(lvl) && !state.real.contains(pos) && !state.allowed.contains(pos) && !loadedNow(state, pos);
     }
 
+    /** test hook (dev probe): promotions that completed without a chunk (see {@link #promote}). */
+    public static int debugFailedPromotions() {
+        return failedPromotions;
+    }
+
     /** test hook (dev probe): forget a position's classification, as if this session never touched it. */
     public static void debugForget(ServerLevel lvl, long pos) {
         State state = state(lvl);
@@ -555,17 +563,26 @@ public final class ProxyChunkGate {
         }
         forcePrepare(holder, state.chunkMap);
         state.promoting.add(p);
+        int startTick = server.getTickCount();
         holder.getFullChunkFuture().whenComplete((result, error) -> server.execute(() -> {
             // This runs inline on the chunk-task completion (main thread). Do NOT read/collide/load chunks
             // here: Level.getChunk would managedBlock the task queue it is running on (watchdog deadlock).
-            // Only enqueue the post-promotion work; ProxyChunkGate.tick runs it as a normal tick task.
+            // Only enqueue the post-promotion work; drainCompletions runs it as a normal tick task.
             state.promoting.remove(p);
+            // a holder demoted mid-generation completes this future with an error RESULT and no exception
+            // (updateFutures), so success is the result, not the absence of an exception (#20)
+            boolean real = error == null && result != null && result.isSuccess();
             if (error != null) {
+                failedPromotions++;
                 LOGGER.error("proxy chunk {} promotion failed", pos, error);
+            } else if (!real) {
+                failedPromotions++;
+                LOGGER.warn("proxy chunk {} promotion ended without a chunk ({}); not pushed or resent", pos,
+                    result == null ? "no result" : result.getError());
             } else {
                 LOGGER.info("promoted proxy chunk {} to real terrain (vanilla pipeline)", pos);
             }
-            state.completedQueue.add(new Completed(pos, error == null, onComplete));
+            state.completedQueue.add(new Completed(pos, real, startTick, onComplete));
         }));
         return true;
     }
@@ -662,13 +679,15 @@ public final class ProxyChunkGate {
 
     // ---- tick ----
 
-    /** drain classification completions/resends and prune the per-level caches; called from the server tick. */
+    /**
+     * drain classification completions/resends and prune the per-level caches; called from the server tick.
+     * Finished promotions are drained separately, by {@link #drainCompletions}, before the promotion tick.
+     */
     public static void tick(MinecraftServer srv) {
         if (!active) {
             return;
         }
         drainDeferred(srv);
-        drainCompletions(srv);
         drainResends(srv);
         for (State state : STATES.values()) {
             if (++state.pruneTicks % RESCUE_INTERVAL_TICKS == 0) {
@@ -763,8 +782,15 @@ public final class ProxyChunkGate {
      * Drain finished promotions on the server tick (a normal main-thread task, not nested inside
      * chunk-task processing): push entities out of the new terrain, replay deferred writes, queue the
      * client resend. {@link #pushOutOfTerrain} additionally guards against unloaded neighbour chunks.
+     *
+     * <p>Must run <b>before</b> {@code PromotionManager.tick}: its {@code retryInFlight} reclaims the slot of
+     * any in-flight chunk that is already real, so draining after it made every promotion read as a lost
+     * callback (#20). Drained first, a reclaim only happens when no completion arrived.</p>
      */
-    private static void drainCompletions(MinecraftServer srv) {
+    public static void drainCompletions(MinecraftServer srv) {
+        if (!active) {
+            return;
+        }
         for (State state : STATES.values()) {
             Completed completed;
             while ((completed = state.completedQueue.poll()) != null) {
@@ -779,6 +805,9 @@ public final class ProxyChunkGate {
                 } catch (Throwable t) {
                     LOGGER.error("post-promotion work failed for {}", completed.pos(), t);
                 } finally {
+                    LOGGER.info("drained promotion of proxy chunk {}: push={}, resend={}, {} tick(s) since start",
+                        completed.pos(), completed.push(), completed.push() && resendEnabled,
+                        srv.getTickCount() - completed.startTick());
                     if (completed.onComplete() != null) {
                         completed.onComplete().run();
                     }

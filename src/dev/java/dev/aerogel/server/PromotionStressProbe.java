@@ -10,6 +10,8 @@ import org.slf4j.LoggerFactory;
  * Headless stress test of {@link PromotionManager} (flag file: &lt;serverDir&gt;/aerogel.promotestress).
  * Force-loads a dense 5x5 of fresh proxy chunks and queues them all at once; the manager must promote them
  * without lag, with no player online (#12). Halts when every chunk is real (PASS) or after a timeout (FAIL).
+ * Every promotion must also clear its own slot through its completion: an in-flight reclaim means the
+ * completion was drained too late or never arrived (#20), so any reclaim FAILS the run.
  */
 final class PromotionStressProbe {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.stressprobe");
@@ -84,8 +86,13 @@ final class PromotionStressProbe {
                 }
             }
         }
-        if (real >= expected) {
-            LOGGER.info("promote stress: VERDICT PASS — all {} chunks real after {} ticks", expected, ticks);
+        int reclaims = PromotionManager.debugInFlightReclaims();
+        if (real >= expected && reclaims > 0) {
+            LOGGER.error("promote stress: VERDICT FAIL — all {} chunks real after {} ticks, but {} in-flight slot(s)"
+                + " were reclaimed without a completion (#20)", expected, ticks, reclaims);
+            finish(server);
+        } else if (real >= expected) {
+            LOGGER.info("promote stress: VERDICT PASS — all {} chunks real after {} ticks, 0 reclaims", expected, ticks);
             finish(server);
         } else if (ticks > MAX_TICKS) {
             LOGGER.error("promote stress: VERDICT FAIL — only {}/{} chunks real after {} ticks", real, expected, ticks);
