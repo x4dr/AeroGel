@@ -22,6 +22,7 @@ import net.minecraft.server.MinecraftServer;
  * {@code aerogel.rate} (the linger drain's rate, the refill's calm-threshold bypass, and the pacer's brake and
  * starvation floor under an injected load),
  * {@code aerogel.footprint} (what one promotion generates: its 5x5 at FULL plus the partial pyramid around it),
+ * {@code aerogel.midgen} (#18: main-thread reads on a promotion's mid-generation neighbours never stall),
  * {@code aerogel.flight} (fast-flight benchmark matrix).
  * Each one deletes its own flag before a normal run.</p>
  */
@@ -87,6 +88,9 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.footprint"))) {
             server.execute(() -> FootprintProbe.start(server));
         }
+        if (Files.exists(dir.resolve("aerogel.midgen"))) {
+            server.execute(() -> MidGenReadProbe.start(server));
+        }
         // the flight harness keeps the REAL adaptive path (no debugAlwaysOn) and waits for a player
         if (Files.exists(dir.resolve("aerogel.flight"))) {
             FlightProbe.start(server);
@@ -111,6 +115,7 @@ public final class DevProbeImpl implements DevProbe {
         TeleportProbe.tick(server);
         RateProbe.tick(server);
         FootprintProbe.tick(server);
+        MidGenReadProbe.tick(server);
     }
 
     @Override

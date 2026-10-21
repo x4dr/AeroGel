@@ -416,15 +416,15 @@ public final class ProxyChunkGate {
     /**
      * Whether vanilla would serve this position from a real chunk right now.
      *
-     * <p><b>Trap, and it is deliberate on NeoForge's side.</b> {@code ServerChunkCache.getChunkNow} is patched
-     * to return {@code chunkHolder.currentlyLoading} when the chunk is merely <i>being</i> generated ("to
-     * prevent a deadlock"), so this answers true for a chunk that has no data yet and would block the main
-     * thread if something asked for it. Callers here treat true as "vanilla will serve it, so it is not a
-     * proxy", which holds for a loaded chunk but not for one mid-generation. It is why a partially generated
-     * neighbour reads as real to a probe (and why the first footprint measurement had to read holder statuses
-     * instead). Tightening it is not a one-line change: {@code isProxy} would start reporting true for a
-     * position whose promotion is in flight, which changes which path serves reads during a promotion — see
-     * {@code TODO.md}, "a mid-generation chunk reads as real".
+     * <p><b>NeoForge's {@code currentlyLoading} bypass.</b> {@code ServerChunkCache.getChunkNow} (and
+     * {@code getChunk}) return {@code chunkHolder.currentlyLoading} "to prevent a deadlock", but NeoForge sets it
+     * only inside {@code ChunkStatusTasks.full}, around {@code runPostLoad}, block-entity registration and
+     * {@code ChunkEvent.Load}: the chunk already holds its data then. A neighbour that is merely partially
+     * generated returns null here, so {@code isProxy} reports it as a proxy and reads get the placeholder.
+     * Measured by the {@code aerogel.midgen} probe (#18): no main-thread read on a promotion's mid-generation
+     * neighbours went through vanilla's future chain. Separate effect: the holder's FULL status completes before
+     * its {@code fullChunkFuture} (which also waits on the 3x3), so {@link #isLoadedReal} can turn true a tick or
+     * more before a promotion's completion callback runs.</p>
      */
     private static boolean loadedNow(State state, long pos) {
         return state != null
