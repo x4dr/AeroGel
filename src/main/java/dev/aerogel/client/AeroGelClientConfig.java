@@ -45,7 +45,8 @@ public final class AeroGelClientConfig {
             .define("sync", true);
         store = b.comment("Store incoming mesh payloads (off: stop accepting new meshes; stored ones keep rendering).")
             .define("store", true);
-        clamp = b.comment("The client-side walking clamp.")
+        clamp = b.comment("The client-side walking clamp: stand on the proxy surface wherever this client has no\n"
+                + "real chunk (missing, empty, or proxy), on a flat y=64 plane until the server's mesh arrives.")
             .define("clamp", true);
         reconcile = b.comment("The per-second missing-mesh reconciliation requests.")
             .define("reconcile", true);

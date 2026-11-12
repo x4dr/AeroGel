@@ -25,6 +25,8 @@ import net.minecraft.server.MinecraftServer;
  * and #17: a void vs a frontier promotion against what the pacer predicts and charges),
  * {@code aerogel.masswrite} (a /fill-sized write over 16 proxies queues them for the pacer and every block lands),
  * {@code aerogel.midgen} (#18: main-thread reads on a promotion's mid-generation neighbours never stall),
+ * {@code aerogel.clamp} (the no-grid through-floor net: a non-rendering client is lifted to the assumed
+ * surface and its chunk is promoted, instead of falling through),
  * {@code aerogel.flight} (fast-flight benchmark matrix).
  * Each one deletes its own flag before a normal run.</p>
  */
@@ -40,7 +42,8 @@ public final class DevProbeImpl implements DevProbe {
             || Files.exists(dir.resolve("aerogel.writesafety"))
             || Files.exists(dir.resolve("aerogel.vanillaclient"))
             || Files.exists(dir.resolve("aerogel.sablebody"))
-            || Files.exists(dir.resolve("aerogel.masswrite"))) {
+            || Files.exists(dir.resolve("aerogel.masswrite"))
+            || Files.exists(dir.resolve("aerogel.clamp"))) {
             AdaptiveMode.debugAlwaysOn(); // headless probes have no players to opt in
         }
         if (Files.exists(dir.resolve("aerogel.writesafety"))) {
@@ -97,6 +100,9 @@ public final class DevProbeImpl implements DevProbe {
         if (Files.exists(dir.resolve("aerogel.midgen"))) {
             server.execute(() -> MidGenReadProbe.start(server));
         }
+        if (Files.exists(dir.resolve("aerogel.clamp"))) {
+            server.execute(() -> ClampProbe.start(server));
+        }
         // the flight harness keeps the REAL adaptive path (no debugAlwaysOn) and waits for a player
         if (Files.exists(dir.resolve("aerogel.flight"))) {
             FlightProbe.start(server);
@@ -123,6 +129,7 @@ public final class DevProbeImpl implements DevProbe {
         FootprintProbe.tick(server);
         MassWriteProbe.tick(server);
         MidGenReadProbe.tick(server);
+        ClampProbe.tick(server);
     }
 
     @Override

@@ -8,10 +8,15 @@
 - `promotion-and-gating-rewrite.md` — the gate model and the disengage model: no opt-out, universal linger,
   the queue as a work buffer rather than a backlog, and why the server must not branch on whether a client
   renders proxies. Living design for the 2026-10-15 rewrite; unverified.
+- `client-seedgen-sampling.md` - investigation + gated plan for the DH SeedGen approach (client samples from
+  seed + local worldgen registries). Off by default; read §3 before building it.
 - `measurements.md` — live sampler/streaming measurements (v4 onward) and the budget model.
 - `target-env.md` — exact MC/NeoForge/Create/Aeronautics/Sable versions, instance paths, install procedure.
 - `work_log.md` — chronological history and rationale (superseded designs, session results). History only.
+- `test-plan-trustclient-and-clamp.md` - the in-game test plan for the `trustClient` and missing-chunk
+  clamp changes, plus the automated-harness TODO.
 - `investigations/` — research reports feeding the design.
+- `open-issues/` - rough working plans for the open GitHub issues (#21, #28, #18), plus the harness gaps they need.
 
 ## Status / next steps
 

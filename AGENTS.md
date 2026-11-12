@@ -161,7 +161,7 @@ the real water surface and does not z-fight it.
 
 **Bisect switches** — `/aerogel switch <feature> [true|false]` (Brigadier `bool`, not `on`/`off`): client
 `proxy`, `travel`, `anim`, `sync`, `store`, `clamp`, `reconcile`, `wireframe`, `neighbors`, `colors`;
-server `movecheck`, `promote`, `gate`, `stream`, `resend`, `adaptive`.
+server `trustClient`, `promote`, `gate`, `stream`, `resend`, `adaptive`.
 
 Next session, priority order:
 
@@ -393,14 +393,27 @@ choke at ~80 chunks/s swept).
   slot only for a real chunk that is no longer promoting — FULL status (`isLoadedReal`) lands ticks before the
   FULL future, which also waits for the 3x3 — so a reclaim (counted, `debugInFlightReclaims`) is an anomaly; a
   lost callback stays promoting and is recovered by the re-drive.
-- **Clamp**: client `ClientTickEvent.Post` owns standing (snap + onGround claim → sprint/jump work); server
-  `PlayerTickEvent.Post` is a through-floor net only (2-block deadzone, skipped over REAL chunks so you can
-  cave underground). Per-tick server teleports caused rubber-banding — don't reintroduce.
-- **Fast-flight move check**: vanilla `ServerGamePacketListenerImpl.handleMovePlayer` rejects moves with
-  `d10 - d9 > 100` (≈10 blocks/packet) and teleports the player back, exempting only the singleplayer owner —
-  on a dedicated server this rubber-bands ~3×/s at speed. `mixin/ServerGamePacketListenerImplMixin` exempts
-  fast creative flight / elytra (`/aerogel switch movecheck`; **off by default** — on a server with untrusted
-  players it is a speed-hack hole, so the admin opts in via `stream.bypassMoveCheck` in `aerogel-common.toml`).
+- **Clamp**: client `ClientTickEvent.Post` owns standing. It applies wherever the client has no real chunk
+  (missing, air stub, or proxy): the mesh surface when the server's mesh has arrived, otherwise a flat
+  `MISSING_CHUNK_FLOOR_Y = 64` plane, so a stalled server (seconds) cannot drop the player into land the
+  client has no data for. It snaps to that surface, zeroes the vertical delta and claims `onGround` (sprint
+  and jump work). The server `PlayerTickEvent.Post` net is only for clients that cannot clamp themselves
+  (no AeroGel, or proxy switch off): a 2-block deadzone, skipped over REAL chunks so you can cave
+  underground, and skipped for rendering clients because two authorities for one position oscillate (that
+  is the `clamp: teleporting` loop). The descent-triggered promotion
+  runs for every player, before the net's skip. Per-tick server teleports caused rubber-banding — don't
+  reintroduce.
+- **Fast-flight move check**: vanilla `ServerGamePacketListenerImpl` polices a client's movement server-side and
+  teleports the client back when a move looks impossible. The speed check is a fixed 10 blocks per server tick
+  with no elapsed-time term, compared against the server position from the start of the tick, so a generation
+  stall of `S` seconds rejects anything faster than `10/S` blocks/s, so a stall of a second or two is enough to
+  reject a walking player. The ridden-vehicle path (`handleMoveVehicle`, brooms/boats/seats) has no packet-count
+  scaling at all. `mixin/ServerGamePacketListenerImplMixin` plus `stream.trustClient`
+  (`/aerogel switch trustClient`) disables **all** of it for every player: "moved too quickly" (player and
+  vehicle), "moved wrongly", the move-into-a-new-block reject, and the "flying is not enabled" kick.
+  **Off by default**: it is a speed-hack and flight-hack hole, so the admin opts in on a trusted server.
+  Verified targets against `neoforge-21.1.252-merged.jar`; the mixin is `required: true`, so a moved target fails
+  the launch rather than silently doing nothing.
 - **Renderer**: `ProxyRenderer` — **one static `VertexBuffer` per chunk** (POSITION_TEX_COLOR), uploaded once on
   mesh arrival and re-uploaded only when its geometry actually changes (grid update, or a neighbour
   gains/loses a proxy so its seam walls change). The "coming up from the bottom" rise / sink is a per-chunk
@@ -450,8 +463,10 @@ choke at ~80 chunks/s swept).
     reconcile + neighbour override), `travel` (request proxy travel from the server), `anim`, `sync`,
     `store`, `clamp`, `reconcile`, `wireframe`, `neighbors` (count a proxy neighbour as an existing chunk for
     vanilla's render visibility graph), `colors` (biome tint on the wire; the block texture is always sent);
-    server `movecheck` (true = exempt fast creative flight/elytra from vanilla's "moved too quickly"
-    rubber-band), `promote`, `gate` (own-task gate + placeholder; false = chunks generate vanilla), `stream`
+    server `trustClient` (true = disable all vanilla server-side movement policing for every player: "moved too
+    quickly" for the player and for the ridden vehicle, "moved wrongly", the move-into-a-new-block reject, and
+    the "flying is not enabled" kick; permits speed and flight cheats, so opt in only on a trusted server),
+    `promote`, `gate` (own-task gate + placeholder; false = chunks generate vanilla), `stream`
     (proxy mesh sampling/sending), `resend` (manual chunk packet on promotion), `adaptive` (adaptive
     enforcement).
   - `/aerogel detail near <5|9|25|81>` (near-tier; default 9), `detail far <tier>` (default 5),

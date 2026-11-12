@@ -6,6 +6,62 @@ Measurements that are still live are in `measurements.md` (v4 onward).
 
 ---
 
+## 2026-11-12 (later) — a missing chunk is a proxy chunk
+
+With the movement checks off, the remaining way to lose the player over ungenerated land is the client's own
+lack of data: a chunk the server gates is never sent, so the client has no collision there at all and
+`LocalPlayer.tick` does not even run. The client clamp used to require a mesh, so between login and the first
+packet, or across a server stall of seconds, there was nothing to stand on.
+
+Rule now: the clamp applies to every position where the client has no real chunk (missing, air stub, or
+proxy), on the mesh surface when that mesh has arrived and on a flat `MISSING_CHUNK_FLOOR_Y = 64` plane until
+it does. Snapping, zeroed vertical delta and the `onGround` claim are unchanged. The clamp is gated by its own
+switch, not by `proxy`: it needs no mesh, no proxy stream and no `proxy=true`. On the transition to a real
+chunk, if the player's box is inside blocks (the plane, or a stale mesh surface, was below the real terrain),
+one lift to the first free y runs, once per transition and with no mesh data. The descent trigger for
+promotion is untouched.
+
+The server's through-floor net is now only for players whose client cannot hold them (no AeroGel, or the
+clamp off). For a client that clamps, the client is the sole authority on its own y, which also removes the
+two-authority oscillation that produced the `clamp: teleporting` loop.
+
+Known gap: the net needs a grid for the chunk and nothing samples a chunk for a player who does not render
+proxies (`ProxyStreamer.tick` skips them before submitting), so such a player is held by nothing until the
+linger refill promotes the chunk. Recorded in the test plan.
+
+Verification: compiles; dev server boots; `aerogel.probe` PASS 5/5 (the fakes keep the old net path, since
+`renders` is false for them). The clamp has no in-repo probe: it is client-side and the probes have no
+renderer.
+
+---
+
+## 2026-11-12 — the movement-check switch is now `trustClient`
+
+Vanilla's speed check compares the client's packet position against the server's position from the start of the
+tick, with a fixed 10 blocks per packet received that tick and no elapsed-time term. A generation stall of `S`
+seconds therefore presents the whole stall's movement as one tick, so anything faster than `10/S` blocks/s is
+rejected; the ridden-vehicle path (`handleMoveVehicle`, brooms/boats/seats) has no packet-count scaling at all,
+and `handleMovePlayer`'s `i > 5 -> i = 1` clamp removes the only scaling the player path has. The rejection is
+a teleport back, which is the rubber-band the mod exists to avoid, and it reproduces with AeroGel absent: the
+check never needed a gated chunk.
+
+`bypassMoveCheck` had been written as "exempt fast creative flight and elytra" and did not even do that: the
+creative arm tested `player.getAbilities().getFlyingSpeed() > 0.1`, which is 0.05 in vanilla (the sprint
+doubling lives in `Player.getFlyingSpeed()`), so only elytra was ever exempt. It also never touched
+`handleMoveVehicle`, so brooms and boats kept the check.
+
+The switch is now `trustClient` and it disables the policing entirely, for every player: "moved too quickly"
+for the player and for the ridden vehicle, "moved wrongly", the move-into-a-new-block reject, and the "flying
+is not enabled" kick. Injection targets were read from the compiled `neoforge-21.1.252-merged.jar` rather than
+guessed, and the mixin stays `required: true` so a moved target is a launch failure. Off by default and
+documented as a speed-hack/flight-hack hole in the config comment and in the switch's own confirmation
+message. No headless probe of the behaviour yet: proving a move is accepted needs a debug setter for the switch
+(probes must not call the config-persisting setter) and a fabricated `ServerboundMovePlayerPacket` against a
+parked fake. The mixin-apply itself is covered by every probe that parks a fake, because `FakePlayer`
+constructs a `FakePlayerNetHandler extends ServerGamePacketListenerImpl`, and `aerogel.probe` PASSes.
+
+---
+
 ## 2026-10-15 — promotion and gating rewrite: no opt-out, universal linger, the disengage model
 
 Design: `plans/promotion-and-gating-rewrite.md`. Rewrite of **local** history (nothing pushed), so this is a

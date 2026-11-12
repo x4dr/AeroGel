@@ -180,7 +180,7 @@ final class GenerationProbe {
                 + stillOnBeforeHold + " offAfter=" + offAfter + " pendingKeepsOn=" + pendingKeepsOn);
     }
 
-    /** #1/#11: a non-op cannot flip a server-wide switch, an op can; movecheck bypass defaults off. */
+    /** #1/#11: a non-op cannot flip a server-wide switch, an op can; trustClient defaults off. */
     private void checkSwitchPermission() {
         net.minecraft.server.MinecraftServer server = this.level.getServer();
         net.minecraft.commands.CommandSourceStack op = server.createCommandSourceStack().withSuppressedOutput();
@@ -191,11 +191,11 @@ final class GenerationProbe {
         server.getCommands().performPrefixedCommand(op, "aerogel switch gate " + !before);
         boolean opAllowed = ProxyChunkGate.gateEnabled() != before;
         server.getCommands().performPrefixedCommand(op, "aerogel switch gate " + before);
-        boolean moveCheckDefaultOff = !dev.aerogel.common.AeroGelConfig.CFG.bypassMoveCheck.getDefault();
-        LOGGER.info(guestBlocked && opAllowed && moveCheckDefaultOff && ProxyChunkGate.gateEnabled() == before
-            ? "VERDICT: PASS — switch permissions (non-op cannot flip gate, op can; bypassMoveCheck default false)"
+        boolean trustClientDefaultOff = !dev.aerogel.common.AeroGelConfig.CFG.trustClient.getDefault();
+        LOGGER.info(guestBlocked && opAllowed && trustClientDefaultOff && ProxyChunkGate.gateEnabled() == before
+            ? "VERDICT: PASS — switch permissions (non-op cannot flip gate, op can; trustClient default false)"
             : "VERDICT: FAIL — switch permissions guestBlocked=" + guestBlocked + " opAllowed=" + opAllowed
-                + " moveCheckDefaultOff=" + moveCheckDefaultOff);
+                + " trustClientDefaultOff=" + trustClientDefaultOff);
     }
 
     /**

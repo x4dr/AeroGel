@@ -46,7 +46,7 @@ public final class ServerHandlers {
     /** client bisect switches plus the server-side toggles, all under {@code /aerogel switch}. */
     private static final String[] SWITCH_FEATURES = {
         "proxy", "travel", "anim", "sync", "store", "clamp", "reconcile", "wireframe", "neighbors",
-        "colors", "movecheck", "promote", "gate", "stream", "resend", "adaptive"
+        "colors", "trustClient", "promote", "gate", "stream", "resend", "adaptive"
     };
 
     private ServerHandlers() {
@@ -408,7 +408,7 @@ public final class ServerHandlers {
     private static int switchFeature(CommandContext<CommandSourceStack> ctx, Boolean requested) throws CommandSyntaxException {
         String feature = StringArgumentType.getString(ctx, "feature");
         boolean client = ClientSwitchPayload.isFeature(feature);
-        boolean known = client || feature.equals("colors") || feature.equals("movecheck")
+        boolean known = client || feature.equals("colors") || feature.equals("trustClient")
             || feature.equals("promote") || feature.equals("gate") || feature.equals("stream")
             || feature.equals("resend") || feature.equals("adaptive");
         if (!known) {
@@ -445,9 +445,15 @@ public final class ServerHandlers {
         } else if (feature.equals("adaptive")) {
             AdaptiveMode.setEnabled(on);
         } else {
-            ProxyStreamer.setBypassMoveCheck(on);
+            ProxyStreamer.setTrustClient(on);
         }
-        ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: " + feature + " = " + (on ? "on" : "off")), false);
+        if (feature.equals("trustClient") && on) {
+            ctx.getSource().sendSuccess(() -> Component.literal(
+                "AeroGel: trustClient = on - vanilla movement checks are off for everyone; "
+                    + "this allows speed and flight cheats"), false);
+        } else {
+            ctx.getSource().sendSuccess(() -> Component.literal("AeroGel: " + feature + " = " + (on ? "on" : "off")), false);
+        }
         return 1;
     }
 
@@ -455,8 +461,8 @@ public final class ServerHandlers {
         if (feature.equals("colors")) {
             return ProxyStreamer.biomeColors();
         }
-        if (feature.equals("movecheck")) {
-            return ProxyStreamer.bypassMoveCheck();
+        if (feature.equals("trustClient")) {
+            return ProxyStreamer.trustClient();
         }
         if (feature.equals("promote")) {
             return PromotionManager.enabled();

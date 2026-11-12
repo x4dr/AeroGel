@@ -58,7 +58,7 @@ public final class AeroGelConfig {
     public final ModConfigSpec.IntValue nearDistance;
     public final ModConfigSpec.BooleanValue biomeColors;
     public final ModConfigSpec.IntValue samplerThreads;
-    public final ModConfigSpec.BooleanValue bypassMoveCheck;
+    public final ModConfigSpec.BooleanValue trustClient;
 
     // gate
     public final ModConfigSpec.BooleanValue gateEnabled;
@@ -177,9 +177,16 @@ public final class AeroGelConfig {
             .define("biomeColors", true);
         samplerThreads = b.comment("Off-thread sampler worker count.")
             .defineInRange("threads", 1, 1, 64);
-        bypassMoveCheck = b.comment("Exempt fast creative flight / elytra from vanilla's 'moved too quickly' rubber-band.\n"
-                + "Off by default: on a server with untrusted players it is a speed-hack hole.")
-            .define("bypassMoveCheck", false);
+        trustClient = b.comment("Trust the client's reported position: disable vanilla's server-side movement policing for\n"
+                + "every player. That is 'moved too quickly' (player and ridden vehicle), 'moved wrongly', the\n"
+                + "move-into-a-new-block reject, and the 'flying is not enabled on this server' kick.\n"
+                + "The vanilla allowance is 10 blocks per server tick with no elapsed-time term, so a stalled server\n"
+                + "rejects anything faster than 10/S blocks/s for a stall of S seconds, and the ridden-vehicle path has\n"
+                + "no packet-count scaling at all. This is what lets fast travel (100+ blocks/s, brooms, jetpacks,\n"
+                + "contraptions) run over land the server is still generating without teleporting back.\n"
+                + "It also permits speed and flight cheats: enable it only on a server whose players you trust.\n"
+                + "Off by default. Same as /aerogel switch trustClient true.")
+            .define("trustClient", false);
         b.pop();
 
         b.comment("The virtual-proxy chunk gate.")

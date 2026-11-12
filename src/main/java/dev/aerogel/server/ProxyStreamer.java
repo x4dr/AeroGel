@@ -59,6 +59,12 @@ import org.slf4j.LoggerFactory;
  */
 public final class ProxyStreamer {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerogel.stream");
+    /** the flat plane a player with no sampled grid is held on; same value as the client's
+     *  {@code MISSING_CHUNK_FLOOR_Y}, so both authorities assume the same surface before a mesh arrives. */
+    private static final double ASSUMED_FLOOR_Y = 64.0;
+    /** dev probes: how many times the through-floor net has fired; the fake-player harness cannot observe
+     *  the teleport itself, because {@code FakePlayer.teleportTo} does not move it. */
+    private static int debugClampTeleports;
     private static final int MIN_RADIUS = 4;
     /** testing knob; the practical ceiling is far lower (see AGENTS radius forecast). */
     private static final int MAX_RADIUS_LIMIT = 1000;
@@ -95,7 +101,7 @@ public final class ProxyStreamer {
     private static boolean biomeColors = true;
     /** bisect switch: when off, proxy meshes are neither sampled nor sent (the gate still runs). */
     private static boolean streamEnabled = true;
-    private static boolean bypassMoveCheck = false;
+    private static boolean trustClient = false;
     private static int samplerThreads = 1;
 
     private static int statTicks;
@@ -137,17 +143,24 @@ public final class ProxyStreamer {
     }
 
     /**
-     * Vanilla rejects a move when {@code d10 - d9 > 100} (10 blocks/packet) and teleports the player back —
-     * which only spares the singleplayer owner. On a dedicated server that rubber-bands every fast-flight
-     * packet. When true we exempt fast creative flight / elytra (see ServerGamePacketListenerImplMixin).
+     * Vanilla polices a client's movement server-side and teleports it back when a move looks impossible:
+     * "moved too quickly", "moved wrongly", a move into a block that was not there before, and the
+     * "flying is not enabled" kick. The speed check is a fixed 10 blocks per server tick with no
+     * elapsed-time term and compares against the position from the start of the tick, so a generation
+     * stall of {@code S} seconds rejects anything faster than {@code 10/S} blocks/s; the ridden-vehicle
+     * path has no packet-count scaling at all. That is the rubber-band this switch removes. See
+     * {@link dev.aerogel.mixin.ServerGamePacketListenerImplMixin} for exactly what is disabled.
+     *
+     * <p>When on it applies to <em>every</em> player on the server and therefore permits speed and flight
+     * cheats. Off by default.</p>
      */
-    public static boolean bypassMoveCheck() {
-        return bypassMoveCheck;
+    public static boolean trustClient() {
+        return trustClient;
     }
 
-    public static void setBypassMoveCheck(boolean on) {
-        bypassMoveCheck = on;
-        AeroGelConfig.CFG.bypassMoveCheck.set(on);
+    public static void setTrustClient(boolean on) {
+        trustClient = on;
+        AeroGelConfig.CFG.trustClient.set(on);
         AeroGelConfig.SPEC.save();
     }
 
@@ -173,7 +186,10 @@ public final class ProxyStreamer {
         nearDistance = cfg.nearDistance.get();
         biomeColors = cfg.biomeColors.get();
         samplerThreads = cfg.samplerThreads.get();
-        bypassMoveCheck = cfg.bypassMoveCheck.get();
+        trustClient = cfg.trustClient.get();
+        // one line at start: this switch silently reverting to false is otherwise invisible until a stall
+        LOGGER.info("aerogel: trustClient {} - vanilla movement checks {}",
+            trustClient ? "on" : "off", trustClient ? "disabled" : "enforced");
 
         int count = 0;
         for (ServerLevel level : srv.getAllLevels()) {
@@ -575,7 +591,12 @@ public final class ProxyStreamer {
         return sentThisTick;
     }
 
-    /** Crude proxy collision: clamp players up onto the sampled surface. */
+    /**
+     * Crude proxy collision: a through-floor net for players whose client cannot hold them (no AeroGel, or the
+     * proxy switch off). A client that renders proxies clamps itself in {@code ClientHandlers.onClientTick},
+     * on the mesh surface or on the flat placeholder while the mesh has not arrived, so it is skipped here.
+     * The descent trigger runs for everyone, before that skip.
+     */
     public static void onPlayerTick(PlayerTickEvent.Post event) {
         if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
@@ -585,29 +606,43 @@ public final class ProxyStreamer {
             return;
         }
         long chunkPos = player.chunkPosition().toLong();
-        Grid grid = state.grids.get(chunkPos);
-        if (grid == null) {
-            return; // no proxy data here -> real (pre-existing) chunk handles it
-        }
         // a promoted/real chunk at the player's position has real collision; clamping there would fight it
         int cx = ChunkPos.getX(chunkPos);
         int cz = ChunkPos.getZ(chunkPos);
         boolean realHere = !ProxyChunkGate.isProxy(state.level, chunkPos)
             && !ProxyChunkGate.isPromoting(state.level, chunkPos); // still generating: no collision yet
-        double surface = MeshMath.surfaceAt(chunkPos, grid.tier(), grid.heights(), player.getX(), player.getZ());
         if (realHere) {
             return;
         }
+        Grid grid = state.grids.get(chunkPos);
+        // A missing grid used to mean "vanilla stands the player", which is only true for a real chunk. A
+        // player the server does not stream to (no AeroGel, or proxy off) never gets a grid, so a gated chunk
+        // left them with nothing and they fell through land that had not generated. Assume the same flat
+        // plane the client clamp uses before a mesh arrives; standing on it trips the descent trigger, which
+        // promotes the chunk and hands standing back to real collision.
+        double surface = grid == null ? ASSUMED_FLOOR_Y
+            : MeshMath.surfaceAt(chunkPos, grid.tier(), grid.heights(), player.getX(), player.getZ());
         // descent trigger: about to reach the proxy surface -> materialise the ground before impact
         PromotionManager.onPlayerNearSurface(player, chunkPos, surface);
-        // the CLIENT clamp owns standing (snaps + claims onGround); a per-tick server teleport would send a
-        // position packet every tick and rubber-band the player (no sprint/jump). Server = through-floor net.
+        // A client that renders proxies owns standing: it snaps to the mesh surface, and to the flat 64
+        // placeholder while it has no mesh yet, so it never needs this and a server teleport on top of it
+        // would be a second authority for the same position (the two oscillate; that is the
+        // "clamp: teleporting" loop). The net is only for players whose client cannot hold them.
+        if (AdaptiveMode.renders(player)) {
+            return;
+        }
         if (player.getY() < surface - 2.0) {
             LOGGER.info("clamp: teleporting {} from y {} to proxy surface {} at chunk ({},{})",
                 player.getGameProfile().getName(), String.format("%.1f", player.getY()), String.format("%.1f", surface), cx, cz);
+            debugClampTeleports++;
             player.teleportTo(player.getX(), surface, player.getZ());
             player.setDeltaMovement(player.getDeltaMovement().x, 0.0, player.getDeltaMovement().z);
         }
+    }
+
+    /** dev probes: see {@code ClampProbe}; the value only ever changes inside {@link #onPlayerTick}. */
+    public static int debugClampTeleports() {
+        return debugClampTeleports;
     }
 
     public static void onPlayerLogout(PlayerEvent.PlayerLoggedOutEvent event) {
